@@ -175,8 +175,35 @@ class BrowserAcceptanceTest {
 
                         page.locator("#question").fill("Where are orbit markers?")
                         page.locator("#query-button").click()
-                        assertThat(page.locator("#query-results")).containsText("restart-note.txt")
-                        assertThat(page.locator("#query-results")).containsText("строки 1")
+                        assertLineOneCitation(page, "restart-note.txt")
+                        val addedSourceFile = temporaryDirectory.resolve("added-note.txt")
+                        Files.writeString(addedSourceFile, "Beacon records remain in the local observatory.\n", UTF_8)
+                        page.locator("#source-files").setInputFiles(addedSourceFile)
+                        page.locator("#upload-button").click()
+                        assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+                        assertThat(page.locator("#source-list")).containsText("restart-note.txt")
+                        assertThat(page.locator("#source-list")).containsText("added-note.txt")
+                        val sourcesAfterImport = Json.parseToJsonElement(get("http://127.0.0.1:${reopened.server.port}/api/sources"))
+                            .jsonArray.map { it.jsonObject }
+                        assertEquals(2, sourcesAfterImport.size)
+                        assertEquals(
+                            sourceId,
+                            sourcesAfterImport.single { it.getValue("name").jsonPrimitive.content == "restart-note.txt" }
+                                .getValue("sourceId").jsonPrimitive.content,
+                        )
+                        assertThat(page.locator("#source-list")).containsText("ожидает индексации")
+                        page.locator("#question").fill("Where are orbit markers?")
+                        page.locator("#query-button").click()
+                        assertLineOneCitation(page, "restart-note.txt")
+                        page.locator("#index-button").click()
+                        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+
+                        page.locator("#question").fill("Where are beacon records?")
+                        page.locator("#query-button").click()
+                        assertLineOneCitation(page, "added-note.txt")
+                        page.locator("#question").fill("Where are orbit markers?")
+                        page.locator("#query-button").click()
+                        assertLineOneCitation(page, "restart-note.txt")
                     } finally {
                         fixture?.close()
                     }
@@ -593,6 +620,16 @@ class BrowserAcceptanceTest {
         )
         assertEquals(200, response.statusCode())
         return response.body()
+    }
+
+    private fun assertLineOneCitation(page: Page, sourceName: String) {
+        val citationItems = page.locator("#query-results .citations li")
+        citationItems.first().waitFor()
+        val citations = citationItems.allInnerTexts()
+        assertTrue(
+            citations.any { "$sourceName · строки 1 ·" in it },
+            "Expected a line 1 citation for $sourceName, got $citations",
+        )
     }
 
     private class BrowserAppFixture(paths: LocalRagPaths, fake: FakeOllama) : AutoCloseable {
