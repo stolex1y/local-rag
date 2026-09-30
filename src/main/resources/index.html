@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Local RAG — локальная коллекция</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172b36;
+      --muted: #526771;
+      --line: #cfdbdf;
+      --surface: #fff;
+      --canvas: #f2f6f6;
+      --accent: #086c68;
+      --accent-dark: #07514e;
+      --accent-soft: #e2f3f0;
+      --warning: #805214;
+      --warning-bg: #fff4d8;
+      --danger: #8b2f2c;
+      --danger-bg: #fff0ef;
+      --success: #205e41;
+      --success-bg: #e7f5ec;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+      color: var(--ink);
+      background: var(--canvas);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; }
+    button, input, select, textarea { font: inherit; }
+    button {
+      min-height: 2.65rem;
+      padding: .55rem .9rem;
+      border: 1px solid var(--accent);
+      border-radius: .55rem;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: var(--accent-dark); border-color: var(--accent-dark); }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    button.secondary { color: var(--accent-dark); background: #fff; }
+    button.secondary:hover:not(:disabled) { background: var(--accent-soft); }
+    button.danger { color: var(--danger); background: #fff; border-color: #c9807b; }
+    button.danger:hover:not(:disabled) { background: var(--danger-bg); }
+    :focus-visible { outline: 3px solid #d66b12; outline-offset: 3px; }
+    .wrap { width: min(1140px, calc(100% - 2rem)); margin: 0 auto; }
+    .hero { padding: 2rem 0 1.4rem; background: #e9f3f2; border-bottom: 1px solid var(--line); }
+    .eyebrow { margin: 0 0 .3rem; color: var(--accent-dark); font-size: .82rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    h1 { margin: 0; max-width: 860px; font-size: clamp(1.8rem, 5vw, 2.7rem); line-height: 1.12; }
+    .intro { max-width: 790px; margin: .75rem 0 0; color: #304b55; }
+    main { padding: 1.2rem 0 3rem; }
+    .panel { margin-bottom: 1rem; padding: clamp(1rem, 2.5vw, 1.5rem); border: 1px solid var(--line); border-radius: .9rem; background: var(--surface); box-shadow: 0 2px 7px rgb(17 48 58 / 4%); }
+    .panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: flex-start; }
+    h2 { margin: 0; font-size: clamp(1.25rem, 3vw, 1.65rem); line-height: 1.25; }
+    h3 { margin: 0 0 .4rem; font-size: 1.05rem; }
+    p { margin: .5rem 0; }
+    .muted { color: var(--muted); }
+    .small { font-size: .9rem; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .65rem; margin-top: 1rem; }
+    .metric { min-width: 0; padding: .8rem; border: 1px solid var(--line); border-radius: .65rem; background: #fbfdfd; }
+    .metric strong { display: block; font-size: 1.05rem; }
+    .metric span { color: var(--muted); font-size: .88rem; }
+    .toolbar, .actions { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin-top: .9rem; }
+    .callout, .notice, .error, .success, .empty, .job { margin-top: .8rem; padding: .75rem .9rem; border-radius: .55rem; }
+    .callout { border-left: 4px solid #d19129; background: var(--warning-bg); color: #51380f; }
+    .notice { border: 1px solid #b6d7d1; background: var(--accent-soft); color: #154f4a; }
+    .error { border: 1px solid #e5b4b1; background: var(--danger-bg); color: var(--danger); }
+    .success { border: 1px solid #b8d9c3; background: var(--success-bg); color: var(--success); }
+    .empty { border: 1px dashed #a9b9bd; background: #f8fbfb; color: var(--muted); }
+    .job { border: 1px solid #b6d7d1; background: #f3fbf9; }
+    [hidden] { display: none !important; }
+    label { display: block; margin-bottom: .3rem; font-weight: 750; }
+    input, select, textarea { width: 100%; min-height: 2.6rem; padding: .55rem .65rem; border: 1px solid #8ea4aa; border-radius: .45rem; background: #fff; color: var(--ink); }
+    textarea { min-height: 7rem; resize: vertical; }
+    .field { min-width: 0; }
+    .field-hint { display: block; margin-top: .25rem; color: var(--muted); font-size: .86rem; }
+    .upload-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .8rem; align-items: end; }
+    progress { width: 100%; height: .8rem; margin-top: .45rem; accent-color: var(--accent); }
+    .source-list { display: grid; gap: .65rem; margin-top: 1rem; }
+    .source-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .8rem; align-items: center; padding: .8rem; border: 1px solid var(--line); border-radius: .65rem; background: #fcfefe; }
+    .source-name { overflow-wrap: anywhere; font-weight: 800; }
+    .source-meta { margin-top: .2rem; color: var(--muted); font-size: .9rem; overflow-wrap: anywhere; }
+    .form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(12rem, .45fr) minmax(9rem, .3fr); gap: .8rem; align-items: end; }
+    .answers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8rem; margin-top: 1rem; }
+    .answer-card { min-width: 0; padding: 1rem; border: 1px solid var(--line); border-radius: .7rem; background: #fcfefe; }
+    .answer-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .citations { margin: .55rem 0 0; padding-left: 1.3rem; }
+    .citations li { margin: .4rem 0; overflow-wrap: anywhere; }
+    .benchmark-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: .6rem; margin-top: .9rem; }
+    .summary-item { padding: .7rem; border-radius: .55rem; background: #f0f6f5; }
+    .summary-item strong { display: block; font-size: 1.1rem; }
+    .question-card { margin-top: .9rem; padding: 1rem; border: 1px solid var(--line); border-radius: .75rem; background: #fbfdfd; }
+    .question-card > h3 { overflow-wrap: anywhere; }
+    .gold { margin: .65rem 0; padding: .7rem; border-radius: .55rem; background: #f0f6f5; }
+    .gold ul { margin: .3rem 0 0; padding-left: 1.3rem; }
+    .strategy-card { margin-top: .7rem; padding: .85rem; border: 1px solid #b9cbd0; border-radius: .65rem; background: #fff; }
+    .strategy-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .35rem .8rem; }
+    .strategy-answers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .65rem; }
+    .strategy-answers .answer-card { padding: .7rem; }
+    .rating-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem; margin-top: .7rem; padding-top: .7rem; border-top: 1px solid var(--line); }
+    .rating-note { grid-column: 1 / -1; }
+    .rating-form button { justify-self: start; }
+    .badge { display: inline-block; margin-left: .3rem; padding: .1rem .45rem; border-radius: 99px; background: var(--accent-soft); color: var(--accent-dark); font-size: .78rem; font-weight: 800; }
+    .rating-PASS { background: var(--success-bg); color: var(--success); }
+    .rating-PARTIAL { background: var(--warning-bg); color: var(--warning); }
+    .rating-FAIL { background: var(--danger-bg); color: var(--danger); }
+    @media (max-width: 720px) {
+      .upload-grid, .form-grid, .answers, .strategy-answers { grid-template-columns: 1fr; }
+      .source-row { grid-template-columns: 1fr; }
+      .source-row button { width: 100%; }
+      .panel-head { align-items: stretch; }
+      .panel-head button { width: 100%; }
+      .toolbar button, .actions button { flex: 1 1 100%; }
+    }
+    @media (max-width: 520px) {
+      .wrap { width: min(100% - 1rem, 1140px); }
+      .hero { padding-top: 1.5rem; }
+      .rating-form { grid-template-columns: 1fr; }
+      .rating-note { grid-column: auto; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Local RAG · только локально</p>
+      <h1>Соберите коллекцию и задавайте вопросы по источникам</h1>
+      <p class="intro">Добавляйте PDF и UTF-8 текстовые файлы, отдельно подтверждайте индексацию, сравнивайте ответы без контекста и по найденным фрагментам. Файлы остаются на этом компьютере.</p>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="panel" aria-labelledby="status-heading">
+      <div class="panel-head">
+        <div><h2 id="status-heading">Состояние коллекции</h2><p class="muted">Embedding и chat выполняются через локальный Ollama.</p></div>
+        <button class="secondary" id="refresh-button" type="button">Обновить</button>
+      </div>
+      <div class="metrics" id="status-metrics" aria-live="polite">
+        <article class="metric"><strong>Загрузка…</strong><span>Источники</span></article>
+      </div>
+      <p class="notice" id="model-note" role="status">Проверяем локальные модели…</p>
+      <p class="error" id="status-error" role="alert" hidden></p>
+      <p class="job" id="job-progress" role="status" aria-live="polite" hidden></p>
+      <progress id="job-meter" max="1" value="0" aria-label="Прогресс текущего задания" hidden></progress>
+    </section>
+
+    <section class="panel" aria-labelledby="sources-heading">
+      <div class="panel-head">
+        <div><h2 id="sources-heading">Источники</h2><p class="muted">PDF без OCR; TXT, Markdown, HTML и текстовый исходный код в UTF-8. Без веб-ссылок и сетевой загрузки. До 256 MiB на файл и 512 MiB ожидающих источников на один запуск индексации.</p></div>
+        <button class="secondary" id="refresh-sources" type="button">Обновить список</button>
+      </div>
+      <form id="upload-form">
+        <div class="upload-grid">
+          <div class="field">
+            <label for="source-files">Добавить файлы</label>
+            <input id="source-files" type="file" multiple accept=".pdf,.txt,.md,.markdown,.html,.htm,.py,.kt,.java,.js,.ts,.tsx,.jsx,.c,.h,.cpp,.cc,.go,.rs,.sh,.css,.json,.yaml,.yml,.toml,.xml,.sql,.rb,.php,.swift,.cs,.scala,.ex,.exs,.lua,.r,.ipynb">
+            <span class="field-hint">Форматы кода принимаются как обычный UTF-8 текст. Исполнять код не требуется.</span>
+          </div>
+          <button id="upload-button" type="submit">Добавить выбранные</button>
+        </div>
+      </form>
+      <div class="callout" id="upload-selection" role="status" aria-live="polite" hidden></div>
+      <progress id="upload-meter" max="1" value="0" aria-label="Прогресс загрузки файлов" hidden></progress>
+      <p class="job" id="upload-progress" role="status" aria-live="polite" hidden></p>
+      <p class="error" id="upload-error" role="alert" hidden></p>
+      <p class="success" id="upload-success" role="status" hidden></p>
+      <div class="source-list" id="source-list" aria-live="polite"><p class="empty">Загружаем список файлов…</p></div>
+    </section>
+
+    <section class="panel" aria-labelledby="index-heading">
+      <h2 id="index-heading">Индексация коллекции</h2>
+      <p>Новые источники индексируются вместе. Перед запуском приложение покажет имена файлов и общий размер; без отдельного подтверждения обработка не начнётся.</p>
+      <div class="callout">Индексируются все ожидающие источники. Страницы PDF без текстового слоя пропускаются без OCR и перечисляются в источнике.</div>
+      <div class="actions"><button id="index-button" type="button">Проверить ожидающие файлы</button></div>
+      <p class="error" id="index-error" role="alert" hidden></p>
+      <p class="success" id="index-success" role="status" hidden></p>
+    </section>
+
+    <section class="panel" aria-labelledby="query-heading">
+      <h2 id="query-heading">Вопрос к коллекции</h2>
+      <p class="muted">Baseline отвечает без найденных материалов. RAG получает только выбранные поиском фрагменты; цитаты строятся отдельно из их метаданных.</p>
+      <form id="query-form">
+        <div class="form-grid">
+          <div class="field">
+            <label for="question">Вопрос</label>
+            <textarea id="question" name="question" required maxlength="4000" placeholder="Например: где описаны маркеры орбиты?"></textarea>
+          </div>
+          <div class="field">
+            <label for="strategy">Стратегия фрагментов</label>
+            <select id="strategy" name="strategy"><option value="FIXED_SIZE">500 слов · overlap 50</option><option value="STRUCTURAL">По разделам · overlap 50</option></select>
+          </div>
+          <div class="field">
+            <label for="top-k">Top-K</label>
+            <input id="top-k" name="topK" type="number" min="1" max="20" step="1" placeholder="По умолчанию">
+          </div>
+        </div>
+        <div class="actions"><button id="query-button" type="submit">Сравнить ответы</button></div>
+      </form>
+      <p class="error" id="query-error" role="alert" hidden></p>
+      <div id="query-results" aria-live="polite"><p class="empty">Ответы появятся после запроса.</p></div>
+    </section>
+
+    <section class="panel" aria-labelledby="benchmark-heading">
+      <div class="panel-head">
+        <div><h2 id="benchmark-heading">Benchmark на своих вопросах</h2><p class="muted">Загрузите JSON ровно с 10 вопросами, ожидаемыми фактами и ссылками на готовые источники.</p></div>
+        <button class="secondary" id="benchmark-refresh" type="button">Обновить вопросы и результаты</button>
+      </div>
+      <div class="upload-grid">
+        <div class="field">
+          <label for="benchmark-file">JSON-файл benchmark</label>
+          <input id="benchmark-file" type="file" accept="application/json,.json">
+          <span class="field-hint">Формат: объект {"questions":[…]}; у каждого вопроса есть id, question, expectedFacts и expectedSources с sourceId и страницей, строками или section.</span>
+        </div>
+        <button class="secondary" id="benchmark-upload" type="button">Проверить и сохранить</button>
+      </div>
+      <p class="notice" id="benchmark-state" role="status" aria-live="polite">Загружаем состояние набора вопросов…</p>
+      <p class="error" id="benchmark-error" role="alert" hidden></p>
+      <div class="actions"><button id="benchmark-run" type="button" disabled>Сравнить 10 вопросов</button></div>
+      <div class="benchmark-summary" id="benchmark-summary" aria-live="polite"></div>
+      <div id="benchmark-results" aria-live="polite"><p class="empty">Сохранённых результатов пока нет.</p></div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const $ = (selector, root = document) => root.querySelector(selector);
+      const state = { modelsAvailable: false, activeJob: null, sources: [], benchmark: null, results: [] };
+      const MAX_FILE_BYTES = 256 * 1024 * 1024;
+      const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
+      const formatter = new Intl.NumberFormat("ru-RU");
+
+      function node(tag, text, className) {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        if (text !== undefined && text !== null) element.textContent = String(text);
+        return element;
+      }
+
+      function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes < 0) return "—";
+        if (bytes < 1024) return `${formatter.format(bytes)} Б`;
+        const units = ["КиБ", "МиБ", "ГиБ"];
+        let value = bytes;
+        let unit = -1;
+        do { value /= 1024; unit++; } while (value >= 1024 && unit < units.length - 1);
+        return `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(value)} ${units[unit]}`;
+      }
+
+      function message(id, text, kind = "error") {
+        const target = $(`#${id}`);
+        target.textContent = text || "";
+        target.hidden = !text;
+        target.className = kind;
+      }
+
+      async function request(path, options = {}) {
+        const response = await fetch(path, { cache: "no-store", ...options });
+        const contentType = response.headers.get("content-type") || "";
+        const body = contentType.includes("application/json") ? await response.json() : await response.text();
+        if (!response.ok) throw new Error(body?.error?.message || `HTTP ${response.status}`);
+        return body;
+      }
+
+      function jsonOptions(method, value) {
+        return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) };
+      }
+
+      function sourceStatusText(source) {
+        const labels = { PENDING: "ожидает индексации", INDEXING: "индексируется", READY: "готов", FAILED: "ошибка", UNSUPPORTED: "формат не поддерживается", DELETING: "удаляется" };
+        return labels[source.status] || source.status;
+      }
+
+      function renderSources(sources) {
+        state.sources = sources;
+        const list = $("#source-list");
+        list.replaceChildren();
+        if (sources.length === 0) {
+          list.append(node("p", "В коллекции пока нет источников.", "empty"));
+          return;
+        }
+        sources.forEach(source => {
+          const row = node("article", undefined, "source-row");
+          const details = node("div");
+          details.append(node("div", source.name, "source-name"));
+          const meta = [`${source.type}`, sourceStatusText(source), formatBytes(source.sizeBytes)];
+          if (source.unsearchablePages?.length) meta.push(`страницы без текста: ${source.unsearchablePages.join(", ")}`);
+          details.append(node("div", meta.join(" · "), "source-meta"));
+          if (source.error) details.append(node("div", source.error, source.status === "UNSUPPORTED" ? "source-meta" : "error small"));
+          row.append(details);
+          const remove = node("button", "Удалить", "danger");
+          remove.type = "button";
+          remove.disabled = state.activeJob !== null || source.status === "INDEXING" || source.status === "DELETING";
+          remove.setAttribute("aria-label", `Удалить источник ${source.name}`);
+          remove.addEventListener("click", () => deleteSource(source));
+          row.append(remove);
+          list.append(row);
+        });
+      }
+
+      function renderStatus(status) {
+        const sourceSummary = status.sources;
+        const metrics = $("#status-metrics");
+        metrics.replaceChildren();
+        [
+          ["Всего источников", sourceSummary.total],
+          ["Готово", sourceSummary.ready],
+          ["Ожидает", sourceSummary.pending],
+          ["Ошибка / формат", sourceSummary.failed],
+          ["Общий размер", formatBytes(sourceSummary.totalBytes)],
+        ].forEach(([label, value]) => {
+          const card = node("article", undefined, "metric");
+          card.append(node("strong", value), node("span", label));
+          metrics.append(card);
+        });
+        const models = status.models;
+        state.modelsAvailable = Boolean(models.available);
+        $("#model-note").textContent = state.modelsAvailable
+          ? `Ollama доступен · embedding: ${models.embedding} · chat: ${models.chat}`
+          : `Локальные модели недоступны. Запустите Ollama и загрузите ${models.embedding} и ${models.chat}.`;
+        $("#model-note").className = state.modelsAvailable ? "success" : "notice";
+        state.activeJob = status.activeJob && status.activeJob.state !== "completed" && status.activeJob.state !== "failed" ? status.activeJob : null;
+        renderJob(state.activeJob);
+        updateControls();
+      }
+
+      function renderJob(job) {
+        const line = $("#job-progress");
+        const meter = $("#job-meter");
+        if (!job) {
+          line.hidden = true;
+          meter.hidden = true;
+          return;
+        }
+        const isBenchmark = job.kind === "BENCHMARK";
+        const total = isBenchmark ? job.filesTotal : job.filesTotal;
+        const done = job.filesDone;
+        const name = job.currentSource ? ` · ${job.currentSource}` : "";
+        const bytes = job.kind === "INDEX" ? ` · ${formatBytes(job.bytesDone)} / ${formatBytes(job.bytesTotal)}` : "";
+        const phase = job.phase === "embedding" ? "Создание embedding" : job.phase === "extracting" ? "Извлечение текста" : job.phase === "benchmark" || job.phase === "rag" || job.phase === "baseline" ? "Сравнение ответов" : job.phase;
+        line.textContent = `${job.kind === "INDEX" ? "Индексация" : "Benchmark"}: ${phase} · ${done} / ${total}${bytes}${name} · готово ${job.succeeded}, ошибок ${job.failed}`;
+        line.hidden = false;
+        meter.max = Math.max(1, total);
+        meter.value = Math.min(done, total);
+        meter.hidden = false;
+      }
+
+      function updateControls() {
+        const busy = state.activeJob !== null;
+        $("#upload-button").disabled = busy;
+        $("#source-files").disabled = busy;
+        $("#index-button").disabled = busy || !state.sources.some(source => source.status === "PENDING");
+        $("#query-button").disabled = busy || !state.modelsAvailable || !state.sources.some(source => source.status === "READY");
+        $("#benchmark-run").disabled = busy || !state.modelsAvailable || !state.benchmark?.runnable;
+        $("#benchmark-upload").disabled = busy;
+      }
+
+      async function refresh() {
+        try {
+          message("status-error", "");
+          const [status, sources, questions, results] = await Promise.all([
+            request("/api/status"), request("/api/sources"), request("/api/benchmark/questions"), request("/api/benchmark/results"),
+          ]);
+          renderStatus(status);
+          renderSources(sources);
+          renderBenchmark(questions, results);
+          if (state.activeJob) await pollJob(state.activeJob.jobId);
+        } catch (error) {
+          message("status-error", error.message);
+        }
+      }
+
+      async function refreshSources() {
+        try {
+          renderSources(await request("/api/sources"));
+          const status = await request("/api/status");
+          renderStatus(status);
+          updateControls();
+        } catch (error) {
+          message("status-error", error.message);
+        }
+      }
+
+      function localFileType(file) {
+        const extension = file.name.split(".").pop().toLowerCase();
+        if (extension === "pdf") return "PDF";
+        if (["txt"].includes(extension)) return "TEXT";
+        if (["md", "markdown"].includes(extension)) return "MARKDOWN";
+        if (["html", "htm"].includes(extension)) return "HTML";
+        return "CODE";
+      }
+      function renderUploadSelection() {
+        const files = Array.from($("#source-files").files || []);
+        const preview = $("#upload-selection");
+        preview.replaceChildren();
+        if (files.length === 0) {
+          preview.hidden = true;
+          return;
+        }
+        const totalBytes = files.reduce((total, file) => total + file.size, 0);
+        preview.append(node("p", `Выбрано файлов: ${files.length}; общий размер: ${formatBytes(totalBytes)}.`, "small"));
+        const list = node("ul");
+        files.forEach(file => list.append(node("li", `${file.name} · ${formatBytes(file.size)}`)));
+        preview.append(list);
+        preview.hidden = false;
+      }
+
+
+      async function uploadSelectedFiles(event) {
+        event.preventDefault();
+        message("upload-error", "");
+        message("upload-success", "", "success");
+        const selected = Array.from($("#source-files").files || []);
+        if (selected.length === 0) return message("upload-error", "Сначала выберите один или несколько файлов.");
+        const skipped = [];
+        const accepted = [];
+        const pendingBytes = state.sources.reduce((total, source) => source.status === "PENDING" ? total + source.sizeBytes : total, 0);
+        let acceptedBytes = 0;
+        for (const file of selected) {
+          if (file.size < 1) { skipped.push(`${file.name}: пустой файл.`); continue; }
+          if (file.size > MAX_FILE_BYTES) { skipped.push(`${file.name}: превышен лимит 256 MiB.`); continue; }
+          if (file.size > MAX_IMPORT_BYTES - pendingBytes - acceptedBytes) {
+            skipped.push(`${file.name}: превышен лимит 512 MiB на один запуск индексации.${pendingBytes ? " Сначала проиндексируйте текущие ожидающие файлы." : ""}`);
+            continue;
+          }
+          accepted.push(file);
+          acceptedBytes += file.size;
+        }
+        if (accepted.length === 0) return message("upload-error", skipped.join("\n") || "Нет файлов, подходящих для загрузки.");
+        const button = $("#upload-button");
+        const input = $("#source-files");
+        button.disabled = true;
+        input.disabled = true;
+        const meter = $("#upload-meter");
+        meter.hidden = false;
+        meter.max = Math.max(1, acceptedBytes);
+        meter.value = 0;
+        const progress = $("#upload-progress");
+        progress.hidden = false;
+        progress.textContent = `Подготовка ${accepted.length} файлов · ${formatBytes(acceptedBytes)}.`;
+        let transferred = 0;
+        const failures = [...skipped];
+        try {
+          const batch = await request("/api/imports", jsonOptions("POST", {
+            files: accepted.map(file => ({ name: file.name, sizeBytes: file.size })),
+          }));
+          for (let slotIndex = 0; slotIndex < batch.files.length; slotIndex++) {
+            const slot = batch.files[slotIndex];
+            const file = accepted[slotIndex];
+            progress.textContent = `Загрузка: ${slot.name} · ${formatBytes(transferred)} / ${formatBytes(acceptedBytes)}.`;
+            try {
+              const result = await request(`/api/imports/${encodeURIComponent(batch.importId)}/files/${encodeURIComponent(slot.fileId)}`, {
+                method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: file,
+              });
+              if (result.source.status === "FAILED" || result.source.status === "UNSUPPORTED") {
+                failures.push(`${result.source.name}: ${result.source.error || "не удалось принять файл"}`);
+              }
+            } catch (error) {
+              failures.push(`${file.name}: ${error.message}`);
+            }
+            transferred += file.size;
+            meter.value = transferred;
+          }
+          const completion = await request(`/api/imports/${encodeURIComponent(batch.importId)}/complete`, jsonOptions("POST", {}));
+          completion.files.forEach(item => {
+            if (["FAILED", "UNSUPPORTED"].includes(item.source.status) && !failures.some(line => line.startsWith(`${item.source.name}:`))) {
+              failures.push(`${item.source.name}: ${item.source.error || "файл не загружен"}`);
+            }
+          });
+          $("#source-files").value = "";
+          renderUploadSelection();
+          await refreshSources();
+          const added = completion.files.filter(item => item.source.status === "PENDING").length;
+          const successText = `${added} файл(ов) добавлено в коллекцию. Новые источники появятся в списке индексации.`;
+          message("upload-success", failures.length ? `${successText}\nНе приняты:\n${failures.join("\n")}` : successText, failures.length ? "notice" : "success");
+        } catch (error) {
+          message("upload-error", `${error.message}${failures.length ? `\n${failures.join("\n")}` : ""}`);
+        } finally {
+          meter.hidden = true;
+          progress.hidden = true;
+          button.disabled = false;
+          input.disabled = false;
+          updateControls();
+        }
+      }
+
+      async function deleteSource(source) {
+        if (!window.confirm(`Удалить «${source.name}» из коллекции? Будут удалены локальная копия, индексные фрагменты и связанные результаты benchmark.`)) return;
+        try {
+          await request(`/api/sources/${encodeURIComponent(source.sourceId)}`, jsonOptions("DELETE", { confirm: true }));
+          await refresh();
+        } catch (error) {
+          message("status-error", error.message);
+        }
+      }
+
+      async function startIndex() {
+        message("index-error", "");
+        message("index-success", "", "success");
+        try {
+          const pending = await request("/api/index/pending");
+          if (pending.files.length === 0) return message("index-error", "Нет новых файлов для индексации.");
+          const names = pending.files.map(file => `• ${file.name} (${formatBytes(file.sizeBytes)})`).join("\n");
+          const confirmed = window.confirm(`Начать индексацию ${pending.files.length} файлов (${formatBytes(pending.totalBytes)})?\n\n${names}`);
+          if (!confirmed) return;
+          const job = await request("/api/index", jsonOptions("POST", {
+            confirm: true, sourceIds: pending.files.map(file => file.sourceId), totalBytes: pending.totalBytes,
+          }));
+          state.activeJob = job;
+          renderJob(job);
+          updateControls();
+          await pollJob(job.jobId);
+        } catch (error) {
+          message("index-error", error.message);
+        }
+      }
+
+      async function pollJob(jobId) {
+        const deadline = Date.now() + 15 * 60 * 1000;
+        while (Date.now() < deadline) {
+          const job = await request(`/api/jobs/${encodeURIComponent(jobId)}`);
+          if (job.state === "completed" || job.state === "failed") {
+            state.activeJob = null;
+            renderJob(null);
+            if (job.kind === "INDEX") {
+              const text = `Индексация завершена: готово ${job.succeeded}, ошибок ${job.failed}.`;
+              message(job.state === "completed" ? "index-success" : "index-error", job.error ? `${text} ${job.error}` : text, job.state === "completed" ? "success" : "error");
+            }
+            await refresh();
+            return;
+          }
+          state.activeJob = job;
+          renderJob(job);
+          updateControls();
+          await new Promise(resolve => setTimeout(resolve, 700));
+        }
+        state.activeJob = null;
+        renderJob(null);
+        message("status-error", "Срок ожидания обновления задания истёк. Обновите состояние; само задание может продолжаться.");
+        await refresh();
+      }
+
+      function renderCitations(sources) {
+        const list = node("ul", undefined, "citations");
+        if (!sources?.length) {
+          list.append(node("li", "По этому ответу нет проверенных цитат."));
+          return list;
+        }
+        sources.forEach(source => {
+          const location = source.location || {};
+          let where = location.pageStart ? `стр. ${location.pageStart}${location.pageEnd !== location.pageStart ? `–${location.pageEnd}` : ""}`
+            : location.lineStart ? `строки ${location.lineStart}${location.lineEnd !== location.lineStart ? `–${location.lineEnd}` : ""}`
+              : "место не указано";
+          if (source.section) where += ` · ${source.section}`;
+          const item = node("li", `${source.source} · ${where} · фрагмент ${source.chunkId}`);
+          list.append(item);
+        });
+        return list;
+      }
+
+      async function askQuestion(event) {
+        event.preventDefault();
+        message("query-error", "");
+        const body = { question: $("#question").value, strategy: $("#strategy").value };
+        const topK = $("#top-k").value.trim();
+        if (topK) body.topK = Number(topK);
+        $("#query-button").disabled = true;
+        const results = $("#query-results");
+        results.replaceChildren(node("p", "Выполняется запрос; предыдущие результаты скрыты.", "empty"));
+        try {
+          const result = await request("/api/query", jsonOptions("POST", body));
+          results.replaceChildren();
+          const answers = node("div", undefined, "answers");
+          const baseline = node("article", undefined, "answer-card");
+          baseline.append(node("h3", "Baseline · без коллекции"), node("div", result.baseline.answer, "answer-text"));
+          const rag = node("article", undefined, "answer-card");
+          rag.append(node("h3", "RAG · с найденными фрагментами"), node("div", result.rag.answer, "answer-text"), node("h4", "Источники"), renderCitations(result.rag.sources));
+          answers.append(baseline, rag);
+          results.append(answers);
+        } catch (error) {
+          results.replaceChildren(node("p", "Ответы предыдущего запроса скрыты; нового ответа нет.", "empty"));
+          message("query-error", error.message);
+        } finally {
+          updateControls();
+        }
+      }
+
+      function renderBenchmark(questionSet, resultSet) {
+        state.benchmark = questionSet;
+        state.results = resultSet.results || [];
+        const status = $("#benchmark-state");
+        status.textContent = questionSet.runnable
+          ? `Проверено: ${questionSet.questions.length} вопросов; ссылки на источники и места найдены.`
+          : questionSet.questions.length === 0
+            ? "Набор не загружен. Выберите JSON из 10 вопросов и ожидаемых ссылок."
+            : `Набор пока нельзя запускать: ${questionSet.errors.join(" ")}`;
+        status.className = questionSet.runnable ? "success" : "notice";
+        const run = $("#benchmark-run");
+        run.disabled = !questionSet.runnable || !state.modelsAvailable || state.activeJob !== null;
+        renderBenchmarkResults(state.results, resultSet.summary || {});
+        updateControls();
+      }
+
+      function renderBenchmarkResults(rows, summary) {
+        const summaryRoot = $("#benchmark-summary");
+        summaryRoot.replaceChildren();
+        if (rows.length) {
+          [
+            ["Baseline PASS", summary.baselinePass], ["Baseline PARTIAL", summary.baselinePartial], ["Baseline FAIL", summary.baselineFail],
+            ["RAG PASS", summary.ragPass], ["RAG PARTIAL", summary.ragPartial], ["RAG FAIL", summary.ragFail],
+            ["Найдены ожидаемые источники", summary.expectedSourceHits],
+          ].forEach(([label, value]) => {
+            const item = node("div", undefined, "summary-item");
+            item.append(node("strong", value ?? 0), node("span", label));
+            summaryRoot.append(item);
+          });
+        }
+        const root = $("#benchmark-results");
+        root.replaceChildren();
+        if (!rows.length) {
+          root.append(node("p", "Сохранённых результатов пока нет.", "empty"));
+          return;
+        }
+        const grouped = new Map();
+        rows.forEach(row => {
+          if (!grouped.has(row.questionId)) grouped.set(row.questionId, []);
+          grouped.get(row.questionId).push(row);
+        });
+        grouped.forEach(strategyRows => {
+          const question = strategyRows[0];
+          const card = node("article", undefined, "question-card");
+          card.append(node("h3", `${question.questionId} · ${question.question}`));
+          const gold = node("div", undefined, "gold");
+          gold.append(node("strong", "Ожидаемые факты"));
+          const facts = node("ul");
+          question.expectedFacts.forEach(fact => facts.append(node("li", fact)));
+          gold.append(facts);
+          gold.append(node("p", `Ожидаемые источники: ${question.expectedSources.map(ref => {
+            const location = ref.location || {};
+            const where = location.pageStart ? `стр. ${location.pageStart}–${location.pageEnd}` : location.lineStart ? `строки ${location.lineStart}–${location.lineEnd}` : ref.section;
+            return `${ref.sourceId} · ${where || "раздел"}`;
+          }).join("; ")}`));
+          card.append(gold);
+          strategyRows.forEach(row => card.append(renderStrategy(row)));
+          root.append(card);
+        });
+      }
+
+      function renderStrategy(row) {
+        const strategy = node("section", undefined, "strategy-card");
+        const heading = row.strategy === "FIXED_SIZE" ? "Фрагменты 500/50" : "Структурные фрагменты";
+        const head = node("div", undefined, "strategy-head");
+        head.append(node("h3", heading));
+        const hit = node("span", row.expectedSourceHit ? "Ожидаемый источник найден" : "Ожидаемый источник не найден", `badge ${row.expectedSourceHit ? "rating-PASS" : "rating-FAIL"}`);
+        head.append(hit);
+        strategy.append(head);
+        const answers = node("div", undefined, "strategy-answers");
+        const baseline = node("article", undefined, "answer-card");
+        baseline.append(node("h4", `Baseline${ratingBadge(row.baselineRating)}`), node("div", row.baselineAnswer, "answer-text"));
+        const rag = node("article", undefined, "answer-card");
+        rag.append(node("h4", `RAG${ratingBadge(row.ragRating)}`), node("div", row.ragAnswer, "answer-text"), node("h4", "Полученные источники"), renderCitations(row.retrievedSources));
+        answers.append(baseline, rag);
+        strategy.append(answers);
+        const form = node("form", undefined, "rating-form");
+        form.append(ratingField("Оценка baseline", "baselineRating", row.baselineRating), ratingField("Оценка RAG", "ragRating", row.ragRating));
+        const noteField = node("div", undefined, "field rating-note");
+        const noteLabel = node("label", "Заметка к оценке");
+        const note = node("input");
+        note.type = "text";
+        note.maxLength = 2000;
+        note.value = row.note || "";
+        note.name = "note";
+        noteLabel.htmlFor = `note-${row.questionId}-${row.strategy}`;
+        note.id = noteLabel.htmlFor;
+        noteField.append(noteLabel, note);
+        form.append(noteField);
+        const save = node("button", "Сохранить оценки");
+        save.type = "submit";
+        form.append(save);
+        form.addEventListener("submit", async event => {
+          event.preventDefault();
+          const payload = {
+            questionId: row.questionId,
+            strategy: row.strategy,
+            baselineRating: form.elements.baselineRating.value,
+            ragRating: form.elements.ragRating.value,
+            note: note.value,
+          };
+          save.disabled = true;
+          try {
+            await request("/api/benchmark/review", jsonOptions("POST", payload));
+            await refresh();
+          } catch (error) {
+            message("benchmark-error", error.message);
+          } finally {
+            save.disabled = false;
+          }
+        });
+        strategy.append(form);
+        return strategy;
+      }
+
+      function ratingBadge(rating) {
+        return rating ? ` · ${rating}` : " · не оценён";
+      }
+
+      function ratingField(labelText, name, selected) {
+        const field = node("div", undefined, "field");
+        const label = node("label", labelText);
+        const select = node("select");
+        select.name = name;
+        select.required = true;
+        const prompt = node("option", "Выберите оценку");
+        prompt.value = "";
+        prompt.disabled = true;
+        prompt.selected = !selected;
+        select.append(prompt);
+        ["PASS", "PARTIAL", "FAIL"].forEach(value => {
+          const option = node("option", value);
+          option.value = value;
+          option.selected = value === selected;
+          select.append(option);
+        });
+        label.htmlFor = `${name}-${Math.random().toString(16).slice(2)}`;
+        select.id = label.htmlFor;
+        field.append(label, select);
+        return field;
+      }
+
+      async function uploadBenchmark() {
+        message("benchmark-error", "");
+        const file = $("#benchmark-file").files?.[0];
+        if (!file) return message("benchmark-error", "Выберите JSON-файл с 10 вопросами.");
+        try {
+          const parsed = JSON.parse(await file.text());
+          if (!parsed || !Array.isArray(parsed.questions)) throw new Error("Ожидается JSON-объект с массивом questions.");
+          const saved = await request("/api/benchmark/questions", jsonOptions("PUT", { questions: parsed.questions }));
+          renderBenchmark(saved, await request("/api/benchmark/results"));
+          message("benchmark-error", saved.errors?.join(" ") || "Набор сохранён.", saved.runnable ? "success" : "notice");
+        } catch (error) {
+          message("benchmark-error", error.message);
+        }
+      }
+
+      async function runBenchmark() {
+        message("benchmark-error", "");
+        try {
+          const job = await request("/api/benchmark/run", jsonOptions("POST", {}));
+          state.activeJob = job;
+          renderJob(job);
+          updateControls();
+          await pollJob(job.jobId);
+        } catch (error) {
+          message("benchmark-error", error.message);
+        }
+      }
+
+      $("#refresh-button").addEventListener("click", refresh);
+      $("#refresh-sources").addEventListener("click", refreshSources);
+      $("#source-files").addEventListener("change", renderUploadSelection);
+      $("#upload-form").addEventListener("submit", uploadSelectedFiles);
+      $("#index-button").addEventListener("click", startIndex);
+      $("#query-form").addEventListener("submit", askQuestion);
+      $("#benchmark-upload").addEventListener("click", uploadBenchmark);
+      $("#benchmark-run").addEventListener("click", runBenchmark);
+      $("#benchmark-refresh").addEventListener("click", refresh);
+      refresh();
+    })();
+  </script>
+</body>
+</html>
