@@ -5,6 +5,9 @@ interface IndexRepository : AutoCloseable {
     fun source(sourceId: String): SourceRecord?
     fun storedSource(sourceId: String): StoredSource?
     fun storedSources(): List<StoredSource>
+    fun sourceByContentSha256(hash: String): StoredSource?
+    fun updateSourceContentSha256(sourceId: String, hash: String)
+    fun unhashedSourcesOfSize(sizeBytes: Long): List<StoredSource>
     fun sources(): List<SourceRecord>
     fun sources(status: SourceStatus): List<StoredSource>
     fun pendingSources(): List<StoredSource>

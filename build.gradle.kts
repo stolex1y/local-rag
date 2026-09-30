@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.gradle.api.tasks.testing.Test
 
 plugins {
     kotlin("jvm") version "2.2.21"
@@ -30,8 +31,19 @@ dependencies {
 
     testImplementation(kotlin("test-junit5"))
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.10.2")
+    testImplementation("com.microsoft.playwright:playwright:1.62.0")
 }
 
 tasks.test {
-    useJUnitPlatform()
+    useJUnitPlatform { excludeTags("browser") }
+}
+
+tasks.register<Test>("browserTest") {
+    group = "verification"
+    description = "Runs isolated Playwright acceptance tests."
+    dependsOn("testClasses")
+    testClassesDirs = sourceSets["test"].output.classesDirs
+    classpath = sourceSets["test"].runtimeClasspath
+    outputs.upToDateWhen { false }
+    useJUnitPlatform { includeTags("browser") }
 }

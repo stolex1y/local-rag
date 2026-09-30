@@ -48,9 +48,19 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
                     error TEXT,
                     created_at TEXT NOT NULL,
                     storage_key TEXT,
-                    unsearchable_pages_json TEXT NOT NULL DEFAULT '[]'
+                    unsearchable_pages_json TEXT NOT NULL DEFAULT '[]',
+                    content_sha256 TEXT
                 )""".trimIndent(),
             )
+            val sourceColumns = connection.createStatement().use { schema ->
+                schema.executeQuery("PRAGMA table_info(sources)").use { rows ->
+                    buildSet { while (rows.next()) add(rows.getString("name")) }
+                }
+            }
+            if ("content_sha256" !in sourceColumns) {
+                statement.execute("ALTER TABLE sources ADD COLUMN content_sha256 TEXT")
+            }
+            statement.execute("CREATE INDEX IF NOT EXISTS sources_content_sha256_idx ON sources(content_sha256) WHERE content_sha256 IS NOT NULL")
             statement.execute(
                 """CREATE TABLE IF NOT EXISTS chunks (
                     chunk_id TEXT PRIMARY KEY,
@@ -75,7 +85,7 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
             )
             statement.execute("CREATE INDEX IF NOT EXISTS chunks_search_idx ON chunks(strategy, embedding_model, source_id)")
             statement.execute("CREATE INDEX IF NOT EXISTS sources_status_idx ON sources(status, created_at)")
-            statement.execute("PRAGMA user_version=11")
+            statement.execute("PRAGMA user_version=12")
         }
     }
 
@@ -89,9 +99,12 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
         require(source.storageKey == null || source.storageKey == "${record.sourceId}.source") {
             "Source storage key must be generated from its ID."
         }
+        require(source.contentSha256 == null || SHA256_PATTERN.matches(source.contentSha256)) {
+            "Source content hash must be lowercase SHA-256."
+        }
         connection.prepareStatement(
-            """INSERT INTO sources(source_id,name,type,size_bytes,status,error,created_at,storage_key,unsearchable_pages_json)
-                VALUES (?,?,?,?,?,?,?,?,?)""".trimIndent(),
+            """INSERT INTO sources(source_id,name,type,size_bytes,status,error,created_at,storage_key,unsearchable_pages_json,content_sha256)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""".trimIndent(),
         ).use { statement ->
             statement.setString(1, record.sourceId)
             statement.setString(2, record.name)
@@ -102,6 +115,7 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
             statement.setString(7, record.createdAt)
             statement.setString(8, source.storageKey)
             statement.setString(9, Json.encodeToString(record.unsearchablePages))
+            statement.setString(10, source.contentSha256)
             statement.executeUpdate()
         }
     }
@@ -116,17 +130,52 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
 
     @Synchronized
     override fun storedSource(sourceId: String): StoredSource? = connection.prepareStatement(
-        "SELECT source_id,name,type,size_bytes,status,error,created_at,unsearchable_pages_json,storage_key FROM sources WHERE source_id=?",
+        "SELECT source_id,name,type,size_bytes,status,error,created_at,unsearchable_pages_json,storage_key,content_sha256 FROM sources WHERE source_id=?",
     ).use { statement ->
         statement.setString(1, sourceId)
         statement.executeQuery().use { rows -> if (rows.next()) rows.toStoredSource() else null }
     }
     @Synchronized
     override fun storedSources(): List<StoredSource> = connection.prepareStatement(
-        "SELECT source_id,name,type,size_bytes,status,error,created_at,unsearchable_pages_json,storage_key FROM sources ORDER BY created_at,source_id",
+        "SELECT source_id,name,type,size_bytes,status,error,created_at,unsearchable_pages_json,storage_key,content_sha256 FROM sources ORDER BY created_at,source_id",
     ).use { statement ->
         statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.toStoredSource()) } }
     }
+    @Synchronized
+    override fun sourceByContentSha256(hash: String): StoredSource? {
+        require(SHA256_PATTERN.matches(hash)) { "Source content hash must be lowercase SHA-256." }
+        return connection.prepareStatement(
+            "SELECT source_id,name,type,size_bytes,status,error,created_at,unsearchable_pages_json,storage_key,content_sha256 FROM sources WHERE content_sha256=? AND status<>'DELETING' ORDER BY created_at,source_id LIMIT 1",
+        ).use { statement ->
+            statement.setString(1, hash)
+            statement.executeQuery().use { rows -> if (rows.next()) rows.toStoredSource() else null }
+        }
+    }
+
+    @Synchronized
+    override fun updateSourceContentSha256(sourceId: String, hash: String) {
+        require(SHA256_PATTERN.matches(hash)) { "Source content hash must be lowercase SHA-256." }
+        val updated = connection.prepareStatement(
+            "UPDATE sources SET content_sha256=? WHERE source_id=? AND content_sha256 IS NULL",
+        ).use { statement ->
+            statement.setString(1, hash)
+            statement.setString(2, sourceId)
+            statement.executeUpdate()
+        }
+        if (updated == 0) {
+            val current = storedSource(sourceId) ?: throw IllegalArgumentException("Source does not exist.")
+            require(current.contentSha256 == hash) { "Source content hash is immutable." }
+        }
+    }
+    @Synchronized
+    override fun unhashedSourcesOfSize(sizeBytes: Long): List<StoredSource> = connection.prepareStatement(
+        "SELECT source_id,name,type,size_bytes,status,error,created_at,unsearchable_pages_json,storage_key,content_sha256 FROM sources WHERE size_bytes=? AND content_sha256 IS NULL AND storage_key IS NOT NULL AND status<>'DELETING' ORDER BY created_at,source_id",
+    ).use { statement ->
+        statement.setLong(1, sizeBytes)
+        statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.toStoredSource()) } }
+    }
+
+
 
 
     @Synchronized
@@ -138,7 +187,7 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
 
     @Synchronized
     override fun sources(status: SourceStatus): List<StoredSource> = connection.prepareStatement(
-        "SELECT source_id,name,type,size_bytes,status,error,created_at,unsearchable_pages_json,storage_key FROM sources WHERE status=? ORDER BY created_at,source_id",
+        "SELECT source_id,name,type,size_bytes,status,error,created_at,unsearchable_pages_json,storage_key,content_sha256 FROM sources WHERE status=? ORDER BY created_at,source_id",
     ).use { statement ->
         statement.setString(1, status.name)
         statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.toStoredSource()) } }
@@ -195,7 +244,8 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
             SourceStatus.READY -> "'INDEXING'"
             SourceStatus.FAILED -> "'PENDING','INDEXING'"
             SourceStatus.DELETING -> "'PENDING','READY','FAILED','UNSUPPORTED','DELETING'"
-            SourceStatus.PENDING, SourceStatus.UNSUPPORTED -> "''"
+            SourceStatus.PENDING -> "'FAILED'"
+            SourceStatus.UNSUPPORTED -> "''"
         }
         connection.prepareStatement(
             "UPDATE sources SET status=?,error=?,unsearchable_pages_json=? WHERE source_id=? AND status IN ($allowedPrevious)",
@@ -382,7 +432,7 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
         unsearchablePages = Json.decodeFromString<List<Int>>(getString(8)),
     )
 
-    private fun ResultSet.toStoredSource(): StoredSource = StoredSource(toSourceRecord(), getString(9))
+    private fun ResultSet.toStoredSource(): StoredSource = StoredSource(toSourceRecord(), getString(9), getString(10))
 
     private fun ResultSet.toScoredChunk(score: Double, vectorBytes: ByteArray): ScoredChunk {
         val location = SourceLocation(
@@ -427,6 +477,7 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
         private const val MAX_ERROR_LENGTH = 240
         private val TOKEN_UNIT = Regex("\\S+")
         private val INITIAL_SOURCE_STATUSES = setOf(SourceStatus.PENDING, SourceStatus.FAILED, SourceStatus.UNSUPPORTED)
+        private val SHA256_PATTERN = Regex("[0-9a-f]{64}")
 
         fun defaultDatabasePath(): Path = LocalRagPaths.current().database
     }

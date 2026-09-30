@@ -8,6 +8,7 @@ import dev.localrag.domain.StoredSource
 import kotlinx.serialization.Serializable
 import java.io.IOException
 import java.io.InputStream
+import java.security.MessageDigest
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.nio.file.AtomicMoveNotSupportedException
@@ -146,6 +147,7 @@ class SourceCatalog(
         val stored = pathFor(slot.sourceId, SOURCE_SUFFIX)
         return try {
             var copied = 0L
+            val digest = MessageDigest.getInstance(SHA256_ALGORITHM)
             input.use { source ->
                 PrivateLocalStorage.createPrivateFile(temporary)
                 Files.newOutputStream(temporary, StandardOpenOption.WRITE).use { output ->
@@ -158,6 +160,7 @@ class SourceCatalog(
                         if (copied > slot.sizeBytes || copied > MAX_FILE_BYTES) {
                             throw SourceFileException("Размер фактических данных превысил объявленный лимит.", SourceStatus.FAILED)
                         }
+                        digest.update(buffer, 0, count)
                         output.write(buffer, 0, count)
                     }
                 }
@@ -165,23 +168,46 @@ class SourceCatalog(
             if (copied != slot.sizeBytes) {
                 throw SourceFileException("Файл передан не полностью: ожидалось ${slot.sizeBytes} байт, получено $copied.", SourceStatus.FAILED)
             }
+            val contentHash = HEX_FORMAT.formatHex(digest.digest())
             val type = sourceType(slot.name, temporary)
-            moveAtomically(temporary, stored)
-            val record = SourceRecord(
-                sourceId = slot.sourceId,
-                name = slot.name,
-                type = type,
-                sizeBytes = copied,
-                status = SourceStatus.PENDING,
-                createdAt = Instant.now().toString(),
-            )
-            try {
-                repository.registerSource(StoredSource(record, slot.sourceId + SOURCE_SUFFIX))
-            } catch (error: Exception) {
-                Files.deleteIfExists(stored)
-                throw error
+            synchronized(lock) {
+                val existing = sourceWithContentHash(contentHash, copied)
+
+                if (existing != null) {
+                    if (existing.record.status == SourceStatus.FAILED) {
+                        val storedCopy = pathForKey(requireNotNull(existing.storageKey))
+                        if (Files.isRegularFile(storedCopy)) {
+                            Files.deleteIfExists(temporary)
+                        } else {
+                            moveAtomically(temporary, storedCopy)
+                        }
+                        repository.markSourceStatus(existing.record.sourceId, SourceStatus.PENDING)
+                        val requeued = repository.source(existing.record.sourceId)
+                            ?: throw IllegalStateException("The matched source no longer exists.")
+                        complete(importId, slot.fileId, ImportFileResult(slot.fileId, requeued))
+                    } else {
+                        Files.deleteIfExists(temporary)
+                        complete(importId, slot.fileId, ImportFileResult(slot.fileId, existing.record))
+                    }
+                } else {
+                    moveAtomically(temporary, stored)
+                    val record = SourceRecord(
+                        sourceId = slot.sourceId,
+                        name = slot.name,
+                        type = type,
+                        sizeBytes = copied,
+                        status = SourceStatus.PENDING,
+                        createdAt = Instant.now().toString(),
+                    )
+                    try {
+                        repository.registerSource(StoredSource(record, slot.sourceId + SOURCE_SUFFIX, contentHash))
+                    } catch (error: Exception) {
+                        Files.deleteIfExists(stored)
+                        throw error
+                    }
+                    complete(importId, slot.fileId, ImportFileResult(slot.fileId, record))
+                }
             }
-            complete(importId, slot.fileId, ImportFileResult(slot.fileId, record))
         } catch (error: SourceFileException) {
             Files.deleteIfExists(temporary)
             failedResult(importId, slot, error.status, error.message ?: "Не удалось принять файл.")
@@ -193,6 +219,29 @@ class SourceCatalog(
             synchronized(lock) { batches[importId]?.slots?.get(slot.fileId)?.writing = false }
             throw error
         }
+
+    }
+    private fun sourceWithContentHash(hash: String, sizeBytes: Long): StoredSource? {
+        repository.sourceByContentSha256(hash)?.let { return it }
+        for (source in repository.unhashedSourcesOfSize(sizeBytes)) {
+            val path = pathForKey(source.storageKey!!)
+            if (!Files.isRegularFile(path)) continue
+            val existingHash = sha256(path)
+            repository.updateSourceContentSha256(source.record.sourceId, existingHash)
+            if (existingHash == hash) return source.copy(contentSha256 = existingHash)
+        }
+        return repository.sourceByContentSha256(hash)
+    }
+
+    private fun sha256(path: Path): String = Files.newInputStream(path).use { input ->
+        val digest = MessageDigest.getInstance(SHA256_ALGORITHM)
+        val buffer = ByteArray(COPY_BUFFER_BYTES)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            if (count > 0) digest.update(buffer, 0, count)
+        }
+        HEX_FORMAT.formatHex(digest.digest())
     }
 
     fun failImportedFile(importId: String, fileId: String, message: String): ImportFileResult {
@@ -227,14 +276,16 @@ class SourceCatalog(
     fun sourceEntries(status: SourceStatus): List<StoredSource> = repository.sources(status)
 
     fun deleteSource(sourceId: String, confirmed: Boolean) {
-        require(confirmed) { "Удаление источника требует отдельного подтверждения." }
-        require(isGeneratedId(sourceId)) { "Идентификатор источника некорректен." }
-        val source = repository.storedSource(sourceId) ?: throw SourceNotFoundException()
-        if (source.record.status == SourceStatus.INDEXING) throw SourceBusyException()
-        repository.markSourceStatus(sourceId, SourceStatus.DELETING)
-        source.storageKey?.let { key -> Files.deleteIfExists(pathForKey(key)) }
-        removeBenchmarkReferences(sourceId)
-        repository.deleteSource(sourceId)
+        synchronized(lock) {
+            require(confirmed) { "Удаление источника требует отдельного подтверждения." }
+            require(isGeneratedId(sourceId)) { "Идентификатор источника некорректен." }
+            val source = repository.storedSource(sourceId) ?: throw SourceNotFoundException()
+            if (source.record.status == SourceStatus.INDEXING) throw SourceBusyException()
+            repository.markSourceStatus(sourceId, SourceStatus.DELETING)
+            source.storageKey?.let { key -> Files.deleteIfExists(pathForKey(key)) }
+            removeBenchmarkReferences(sourceId)
+            repository.deleteSource(sourceId)
+        }
     }
     private fun validateUtf8(path: Path) {
         val decoder = StandardCharsets.UTF_8.newDecoder()
@@ -408,6 +459,8 @@ class SourceCatalog(
         private const val SESSION_TTL_MILLIS = 30 * 60 * 1000L
         private const val SOURCE_SUFFIX = ".source"
         private const val TEMP_SUFFIX = ".partial"
+        private const val SHA256_ALGORITHM = "SHA-256"
+        private val HEX_FORMAT = java.util.HexFormat.of()
         private val PDF_SIGNATURE = "%PDF-".toByteArray(StandardCharsets.US_ASCII)
         private val ALLOWED_CONTROLS = setOf('\n', '\r', '\t', '\u000c')
         private val STORAGE_KEY_PATTERN = Regex("[0-9a-fA-F-]{36}\\.(?:source|partial)")

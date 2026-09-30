@@ -116,6 +116,7 @@ interface ChatPort {
 data class StoredSource(
     val record: SourceRecord,
     val storageKey: String?,
+    val contentSha256: String? = null,
 )
 
 data class IndexProgressUpdate(

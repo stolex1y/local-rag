@@ -232,6 +232,8 @@
       const state = { modelsAvailable: false, activeJob: null, sources: [], benchmark: null, results: [] };
       const MAX_FILE_BYTES = 256 * 1024 * 1024;
       const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
+      const MAX_BENCHMARK_FILE_BYTES = 1024 * 1024;
+      const LAST_BENCHMARK_JOB_KEY = "local-rag.last-benchmark-job.v1";
       const formatter = new Intl.NumberFormat("ru-RU");
 
       function node(tag, text, className) {
@@ -256,6 +258,68 @@
         target.textContent = text || "";
         target.hidden = !text;
         target.className = kind;
+      }
+
+      function rememberBenchmarkJob(job) {
+        if (!job || job.kind !== "BENCHMARK") return;
+        const snapshot = {
+          jobId: job.jobId, kind: job.kind, state: job.state,
+          filesDone: job.filesDone, filesTotal: job.filesTotal, error: job.error || null,
+        };
+        try { window.localStorage.setItem(LAST_BENCHMARK_JOB_KEY, JSON.stringify(snapshot)); } catch { }
+      }
+
+      function readLastBenchmarkJob() {
+        try {
+          const saved = window.localStorage.getItem(LAST_BENCHMARK_JOB_KEY);
+          if (!saved || saved.length > 4096) return null;
+          const job = JSON.parse(saved);
+          return job && typeof job.jobId === "string" && job.kind === "BENCHMARK"
+            && ["queued", "running", "completed", "failed"].includes(job.state)
+            ? job : null;
+        } catch {
+          return null;
+        }
+      }
+
+      function clearLastBenchmarkJob() {
+        try { window.localStorage.removeItem(LAST_BENCHMARK_JOB_KEY); } catch { }
+      }
+
+      function showBenchmarkJob(job) {
+        if (job.state === "failed") {
+          const reason = job.error || "Задание не выполнено.";
+          message("benchmark-error", `Benchmark не завершён: ${reason} Проверок завершено ${job.filesDone} из ${job.filesTotal}; ниже могут оставаться результаты предыдущих запусков.`);
+        } else if (job.state === "completed") {
+          message("benchmark-error", `Benchmark завершён: проверок выполнено ${job.filesDone} из ${job.filesTotal}.`, "success");
+        }
+      }
+
+      async function restoreLastBenchmarkJob() {
+        const saved = readLastBenchmarkJob();
+        if (!saved) return;
+        try {
+          const job = await request(`/api/jobs/${encodeURIComponent(saved.jobId)}`);
+          if (job.kind !== "BENCHMARK") {
+            clearLastBenchmarkJob();
+            return;
+          }
+          rememberBenchmarkJob(job);
+          if (job.state === "completed" || job.state === "failed") {
+            showBenchmarkJob(job);
+            return;
+          }
+          state.activeJob = job;
+          renderJob(job);
+          await pollJob(job.jobId);
+        } catch (error) {
+          if (error.message === "Задание не найдено или его состояние уже удалено.") {
+            if (saved.state === "completed" || saved.state === "failed") showBenchmarkJob(saved);
+            else message("benchmark-error", "Состояние последнего запуска Benchmark недоступно. Сохранённые результаты могут быть неполными.", "notice");
+            return;
+          }
+          throw error;
+        }
       }
 
       async function request(path, options = {}) {
@@ -287,7 +351,8 @@
           const row = node("article", undefined, "source-row");
           const details = node("div");
           details.append(node("div", source.name, "source-name"));
-          const meta = [`${source.type}`, sourceStatusText(source), formatBytes(source.sizeBytes)];
+          const sourceVersion = `ID ${source.sourceId.slice(0, 12)}`;
+          const meta = [sourceVersion, `${source.type}`, sourceStatusText(source), formatBytes(source.sizeBytes)];
           if (source.unsearchablePages?.length) meta.push(`страницы без текста: ${source.unsearchablePages.join(", ")}`);
           details.append(node("div", meta.join(" · "), "source-meta"));
           if (source.error) details.append(node("div", source.error, source.status === "UNSUPPORTED" ? "source-meta" : "error small"));
@@ -295,7 +360,7 @@
           const remove = node("button", "Удалить", "danger");
           remove.type = "button";
           remove.disabled = state.activeJob !== null || source.status === "INDEXING" || source.status === "DELETING";
-          remove.setAttribute("aria-label", `Удалить источник ${source.name}`);
+          remove.setAttribute("aria-label", `Удалить источник ${source.name} (ID ${source.sourceId.slice(0, 12)})`);
           remove.addEventListener("click", () => deleteSource(source));
           row.append(remove);
           list.append(row);
@@ -368,7 +433,12 @@
           renderStatus(status);
           renderSources(sources);
           renderBenchmark(questions, results);
-          if (state.activeJob) await pollJob(state.activeJob.jobId);
+          if (state.activeJob) {
+            if (state.activeJob.kind === "BENCHMARK") rememberBenchmarkJob(state.activeJob);
+            await pollJob(state.activeJob.jobId);
+          } else {
+            await restoreLastBenchmarkJob();
+          }
         } catch (error) {
           message("status-error", error.message);
         }
@@ -444,6 +514,7 @@
         progress.textContent = `Подготовка ${accepted.length} файлов · ${formatBytes(acceptedBytes)}.`;
         let transferred = 0;
         const failures = [...skipped];
+        const existingSourceIds = new Set(state.sources.map(source => source.sourceId));
         try {
           const batch = await request("/api/imports", jsonOptions("POST", {
             files: accepted.map(file => ({ name: file.name, sizeBytes: file.size })),
@@ -474,7 +545,9 @@
           $("#source-files").value = "";
           renderUploadSelection();
           await refreshSources();
-          const added = completion.files.filter(item => item.source.status === "PENDING").length;
+          const added = new Set(completion.files
+            .filter(item => item.source.status === "PENDING" && !existingSourceIds.has(item.source.sourceId))
+            .map(item => item.source.sourceId)).size;
           const successText = `${added} файл(ов) добавлено в коллекцию. Новые источники появятся в списке индексации.`;
           message("upload-success", failures.length ? `${successText}\nНе приняты:\n${failures.join("\n")}` : successText, failures.length ? "notice" : "success");
         } catch (error) {
@@ -489,7 +562,7 @@
       }
 
       async function deleteSource(source) {
-        if (!window.confirm(`Удалить «${source.name}» из коллекции? Будут удалены локальная копия, индексные фрагменты и связанные результаты benchmark.`)) return;
+        if (!window.confirm(`Удалить «${source.name}» (ID ${source.sourceId}) из коллекции? Будут удалены локальная копия, индексные фрагменты и связанные результаты benchmark.`)) return;
         try {
           await request(`/api/sources/${encodeURIComponent(source.sourceId)}`, jsonOptions("DELETE", { confirm: true }));
           await refresh();
@@ -529,6 +602,9 @@
             if (job.kind === "INDEX") {
               const text = `Индексация завершена: готово ${job.succeeded}, ошибок ${job.failed}.`;
               message(job.state === "completed" ? "index-success" : "index-error", job.error ? `${text} ${job.error}` : text, job.state === "completed" ? "success" : "error");
+            } else if (job.kind === "BENCHMARK") {
+              rememberBenchmarkJob(job);
+              showBenchmarkJob(job);
             }
             await refresh();
             return;
@@ -642,7 +718,11 @@
           gold.append(node("p", `Ожидаемые источники: ${question.expectedSources.map(ref => {
             const location = ref.location || {};
             const where = location.pageStart ? `стр. ${location.pageStart}–${location.pageEnd}` : location.lineStart ? `строки ${location.lineStart}–${location.lineEnd}` : ref.section;
-            return `${ref.sourceId} · ${where || "раздел"}`;
+            const source = state.sources.find(item => item.sourceId === ref.sourceId);
+            const identity = source
+              ? `${source.name} [${source.sourceId.slice(0, 12)}]`
+              : `Источник ${ref.sourceId.slice(0, 12)} (отсутствует)`;
+            return `${identity} · ${where || "раздел"}`;
           }).join("; ")}`));
           card.append(gold);
           strategyRows.forEach(row => card.append(renderStrategy(row)));
@@ -735,10 +815,12 @@
         message("benchmark-error", "");
         const file = $("#benchmark-file").files?.[0];
         if (!file) return message("benchmark-error", "Выберите JSON-файл с 10 вопросами.");
+        if (file.size > MAX_BENCHMARK_FILE_BYTES) return message("benchmark-error", "JSON-файл превышает допустимый размер 1 МиБ.");
         try {
           const parsed = JSON.parse(await file.text());
           if (!parsed || !Array.isArray(parsed.questions)) throw new Error("Ожидается JSON-объект с массивом questions.");
           const saved = await request("/api/benchmark/questions", jsonOptions("PUT", { questions: parsed.questions }));
+          clearLastBenchmarkJob();
           renderBenchmark(saved, await request("/api/benchmark/results"));
           message("benchmark-error", saved.errors?.join(" ") || "Набор сохранён.", saved.runnable ? "success" : "notice");
         } catch (error) {
@@ -751,6 +833,7 @@
         try {
           const job = await request("/api/benchmark/run", jsonOptions("POST", {}));
           state.activeJob = job;
+          rememberBenchmarkJob(job);
           renderJob(job);
           updateControls();
           await pollJob(job.jobId);
