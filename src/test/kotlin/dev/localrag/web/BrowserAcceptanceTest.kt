@@ -30,6 +30,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -99,6 +100,95 @@ class BrowserAcceptanceTest {
         }
     }
 
+    @Test
+    fun applicationRestartRestoresSourcesAndBenchmarkReviewsInBrowser() {
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("restart-app-data"))
+            val sourceFile = temporaryDirectory.resolve("restart-note.txt")
+            Files.writeString(sourceFile, "Orbit markers follow a stable route.\n", UTF_8)
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    page.setDefaultTimeout(30_000.0)
+                    var fixture: BrowserAppFixture? = BrowserAppFixture(paths, fake)
+                    try {
+                        val first = fixture!!
+                        page.navigate("http://127.0.0.1:${first.server.port}/")
+                        assertThat(page.locator("#model-note")).containsText("Ollama доступен")
+                        page.onDialog { it.accept() }
+
+                        page.locator("#source-files").setInputFiles(sourceFile)
+                        page.locator("#upload-button").click()
+                        assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+                        assertThat(page.locator("#source-list")).containsText("restart-note.txt")
+                        val firstSource = Json.parseToJsonElement(get("http://127.0.0.1:${first.server.port}/api/sources"))
+                            .jsonArray.single().jsonObject
+                        val sourceId = firstSource.getValue("sourceId").jsonPrimitive.content
+
+                        page.locator("#index-button").click()
+                        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+                        val questionsFile = temporaryDirectory.resolve("restart-questions.json")
+                        Files.writeString(
+                            questionsFile,
+                            benchmarkQuestions(sourceId, 1, "Orbit markers follow a stable route."),
+                            UTF_8,
+                        )
+                        page.locator("#benchmark-file").setInputFiles(questionsFile)
+                        page.locator("#benchmark-upload").click()
+                        assertThat(page.locator("#benchmark-error")).containsText("Набор сохранён")
+                        page.locator("#benchmark-run").click()
+                        assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
+                        assertEquals(20, page.locator("#benchmark-results .strategy-card").count())
+
+                        val rating = page.locator("#benchmark-results .rating-form").first()
+                        rating.locator("select[name=\"baselineRating\"]").selectOption("FAIL")
+                        rating.locator("select[name=\"ragRating\"]").selectOption("PASS")
+                        rating.locator("input[name=\"note\"]").fill("Restart survives.")
+                        page.waitForResponse("**/api/benchmark/review") {
+                            rating.locator("button[type=\"submit\"]").click()
+                        }
+                        assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
+                        assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
+
+                        first.close()
+                        fixture = null
+                        fixture = BrowserAppFixture(paths, fake)
+                        val reopened = fixture!!
+                        page.navigate("http://127.0.0.1:${reopened.server.port}/")
+                        assertThat(page.locator("#source-list")).containsText("restart-note.txt")
+                        assertEquals(1, page.locator("#source-list .source-row").count())
+                        val restoredSource = Json.parseToJsonElement(get("http://127.0.0.1:${reopened.server.port}/api/sources"))
+                            .jsonArray.single().jsonObject
+                        assertEquals(sourceId, restoredSource.getValue("sourceId").jsonPrimitive.content)
+                        Files.list(paths.sources).use { assertEquals(1L, it.count()) }
+                        assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
+                        assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
+                        assertEquals(
+                            "Restart survives.",
+                            page.locator("#benchmark-results .rating-form").first()
+                                .locator("input[name=\"note\"]").inputValue(),
+                        )
+
+                        page.locator("#question").fill("Where are orbit markers?")
+                        page.locator("#query-button").click()
+                        assertThat(page.locator("#query-results")).containsText("restart-note.txt")
+                        assertThat(page.locator("#query-results")).containsText("строки 1")
+                    } finally {
+                        fixture?.close()
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
+
     private fun exerciseUserJourney(fake: FakeOllama, probe: RequestProbe, port: Int, sourcesDirectory: Path) {
         val firstDuplicate = temporaryDirectory.resolve("first/version-note.txt")
         val secondDuplicate = temporaryDirectory.resolve("second/version-note.txt")
@@ -145,6 +235,7 @@ class BrowserAcceptanceTest {
                 page.setDefaultTimeout(30_000.0)
                 page.navigate(origin)
                 assertThat(page.locator("#model-note")).containsText("Ollama доступен")
+                assertFalse(page.locator("body").innerText().contains("LTE", ignoreCase = true))
 
                 val acceptNextDialog = AtomicBoolean(false)
                 val dialogMessages = CopyOnWriteArrayList<String>()
@@ -217,6 +308,39 @@ class BrowserAcceptanceTest {
                 assertTrue(pdfMessages.last().any { "conductivity is 21 units" in it })
                 assertEquals(0, probe.requests.get())
 
+                page.locator("#top-k").fill("10")
+                for (strategy in listOf("FIXED_SIZE", "STRUCTURAL")) {
+                    page.locator("#strategy").selectOption(strategy)
+                    val codeChatStart = fake.chatMessages.size
+                    page.locator("#question").fill("What copper calibration limit is recorded?")
+                    page.locator("#query-button").click()
+                    assertThat(queryResults).containsText("copper-calibration.kt")
+                    assertThat(queryResults).containsText("строки 1")
+                    val codeMessages = fake.chatMessages.drop(codeChatStart)
+                    assertEquals(2, codeMessages.size)
+                    assertTrue(codeMessages.last().any { "LIMIT = 19" in it })
+
+                    val textChatStart = fake.chatMessages.size
+                    page.locator("#question").fill("What beacon threshold is recorded in the note?")
+                    page.locator("#query-button").click()
+                    assertThat(queryResults).containsText("version-note.txt")
+                    assertThat(queryResults).containsText("строки 1")
+                    val textMessages = fake.chatMessages.drop(textChatStart)
+                    assertEquals(2, textMessages.size)
+                    assertTrue(textMessages.last().any { "beacon threshold" in it })
+                }
+                assertEquals(0, probe.requests.get())
+                val emptyContextChatStart = fake.chatMessages.size
+                page.locator("#question").fill("What are penguin breeding habits?")
+                page.locator("#query-button").click()
+                assertThat(queryResults).containsText("По этому ответу нет проверенных цитат.")
+                assertThat(queryResults).containsText("В коллекции не найдено подходящих фрагментов.")
+                val emptyContextMessages = fake.chatMessages.drop(emptyContextChatStart)
+                assertEquals(2, emptyContextMessages.size)
+                assertTrue(emptyContextMessages.last().first().contains("Локальные фрагменты не переданы для подтверждения ответа"))
+                assertTrue(emptyContextMessages.last().first().contains("не выдумывай цитаты"))
+                assertTrue(emptyContextMessages.last().last().contains("penguin"))
+
                 page.locator("button[aria-label^=\"Удалить источник version-note.txt\"]").first().click()
                 assertTrue(awaitDialog(page, dialogMessages).contains(duplicateIds.first()))
                 assertEquals(2, page.locator("#source-list .source-row").all().count { it.locator(".source-name").textContent() == "version-note.txt" })
@@ -252,6 +376,41 @@ class BrowserAcceptanceTest {
                 rating.locator("button[type=\"submit\"]").click()
                 assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
                 assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
+                val nineQuestionFile = temporaryDirectory.resolve("nine-questions.json")
+                Files.writeString(
+                    nineQuestionFile,
+                    benchmarkQuestions(referenceId, referenceLine, "ORBIT-017 threshold is $threshold", questionCount = 9),
+                    UTF_8,
+                )
+                page.locator("#benchmark-file").setInputFiles(nineQuestionFile)
+                page.locator("#benchmark-upload").click()
+                assertThat(page.locator("#benchmark-error")).containsText("ровно 10 вопросов")
+                assertTrue(page.locator("#benchmark-run").isEnabled())
+                assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
+                assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
+
+                val malformedFile = temporaryDirectory.resolve("malformed-questions.json")
+                Files.writeString(malformedFile, """{"questions":[{"id":"q01"}]}""", UTF_8)
+                page.locator("#benchmark-file").setInputFiles(malformedFile)
+                page.waitForResponse("**/api/benchmark/questions") {
+                    page.locator("#benchmark-upload").click()
+                }
+                assertThat(page.locator("#benchmark-error")).not().hasText("")
+                assertTrue(page.locator("#benchmark-run").isEnabled())
+                val malformedSyntaxFile = temporaryDirectory.resolve("malformed-syntax.json")
+                Files.writeString(malformedSyntaxFile, "{\"questions\":[", UTF_8)
+                page.locator("#benchmark-file").setInputFiles(malformedSyntaxFile)
+                page.locator("#benchmark-upload").click()
+                assertThat(page.locator("#benchmark-error")).not().hasText("")
+                assertTrue(page.locator("#benchmark-run").isEnabled())
+                val acceptedQuestions = Json.parseToJsonElement(get("$origin/api/benchmark/questions")).jsonObject
+                assertTrue(acceptedQuestions.getValue("runnable").jsonPrimitive.content.toBoolean())
+                assertEquals(10, acceptedQuestions.getValue("questions").jsonArray.size)
+                assertTrue(page.locator("#query-button").isEnabled())
+                page.locator("#question").fill("What is the greenhouse humidity target?")
+                page.locator("#query-button").click()
+                assertThat(page.locator("#query-results")).containsText("greenhouse.html")
+
 
                 fake.failChat.set(true)
                 page.locator("#benchmark-run").click()
@@ -264,6 +423,34 @@ class BrowserAcceptanceTest {
                 assertThat(page.locator("#benchmark-error")).containsText("результаты предыдущих запусков")
                 assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
                 assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
+
+                fake.failChat.set(false)
+                val noEvidenceFile = temporaryDirectory.resolve("questions-no-evidence.json")
+                Files.writeString(
+                    noEvidenceFile,
+                    benchmarkQuestions(
+                        referenceId,
+                        referenceLine,
+                        "The synthetic collection contains no penguin facts.",
+                        questionText = "What are penguin breeding habits?",
+                    ),
+                    UTF_8,
+                )
+                page.locator("#benchmark-file").setInputFiles(noEvidenceFile)
+                page.locator("#benchmark-upload").click()
+                assertThat(page.locator("#benchmark-error")).containsText("Набор сохранён")
+                page.locator("#benchmark-run").click()
+                assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
+                assertThat(page.locator("#benchmark-results"))
+                    .containsText("В коллекции не найдено подходящих фрагментов.")
+                val noEvidenceRows = Json.parseToJsonElement(get("$origin/api/benchmark/results"))
+                    .jsonObject.getValue("results").jsonArray
+                assertEquals(20, noEvidenceRows.size)
+                assertTrue(noEvidenceRows.all {
+                    it.jsonObject.getValue("retrievedSources").jsonArray.isEmpty() &&
+                        it.jsonObject.getValue("ragAnswer").jsonPrimitive.content
+                            .startsWith("В коллекции не найдено подходящих фрагментов.")
+                })
                 assertThat(page.locator("#source-list")).containsText("greenhouse.html")
                 assertTrue(!page.locator("#source-list").textContent().orEmpty().contains("same-bytes-copy.txt"))
                 acceptNextDialog.set(true)
@@ -288,6 +475,14 @@ class BrowserAcceptanceTest {
                     persistedReferenceIds,
                     "Deleting a referenced source must not rewrite benchmark question references.",
                 )
+                val completedChatCount = fake.chatMessages.size
+                val completedEmbeddingCalls = fake.embeddingCalls.get()
+                fake.missingChatModel.set(true)
+                page.reload()
+                assertThat(page.locator("#model-note")).containsText("Локальные модели недоступны")
+                assertTrue(page.locator("#query-button").isDisabled())
+                assertEquals(completedChatCount, fake.chatMessages.size)
+                assertEquals(completedEmbeddingCalls, fake.embeddingCalls.get())
             } finally {
                 browser.close()
             }
@@ -303,10 +498,16 @@ class BrowserAcceptanceTest {
         return messages.last()
     }
 
-    private fun benchmarkQuestions(sourceId: String, line: Int, expectedFact: String): String {
-        val questions = (1..10).joinToString(",") { number ->
+    private fun benchmarkQuestions(
+        sourceId: String,
+        line: Int,
+        expectedFact: String,
+        questionText: String = "What threshold is recorded for ORBIT-017?",
+        questionCount: Int = 10,
+    ): String {
+        val questions = (1..questionCount).joinToString(",") { number ->
             val id = "q${number.toString().padStart(2, '0')}"
-            """{"id":"$id","question":"Question $number: What threshold is recorded for ORBIT-017?","expectedFacts":["$expectedFact"],"expectedSources":[{"sourceId":"$sourceId","location":{"lineStart":$line,"lineEnd":$line}}]}"""
+            """{"id":"$id","question":"Question $number: $questionText","expectedFacts":["$expectedFact"],"expectedSources":[{"sourceId":"$sourceId","location":{"lineStart":$line,"lineEnd":$line}}]}"""
         }
         return "{\"questions\":[$questions]}"
     }
@@ -355,15 +556,52 @@ class BrowserAcceptanceTest {
         return response.body()
     }
 
+    private class BrowserAppFixture(paths: LocalRagPaths, fake: FakeOllama) : AutoCloseable {
+        private val index = SqliteIndexRepository(paths.database)
+        private val benchmarkStore = BenchmarkStore(paths.database)
+        private val jobs = JobManager()
+        private val ollama = OllamaApi(fake.uri)
+        private val embeddings = OllamaEmbeddingPort(ollama)
+        private val rag = RagService(index, embeddings, OllamaChatPort(ollama))
+        private val catalog = SourceCatalog(paths.sources, index, benchmarkStore::deleteSourceReferences)
+        private val indexing = IndexWorkflow(
+            extractor = SourceExtractorRegistry(),
+            chunkers = listOf(FixedSizeChunker(), StructuralChunker()),
+            embeddings = embeddings,
+            index = index,
+            sourcesDirectory = paths.sources,
+        )
+        private val benchmark = BenchmarkRunner(rag, benchmarkStore, index)
+        private val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama)
+        val server = LocalHttpServer(application, 0)
+
+        init {
+            server.start()
+        }
+
+        override fun close() {
+            server.close()
+            jobs.close()
+            benchmarkStore.close()
+            index.close()
+        }
+    }
+
     private class FakeOllama : AutoCloseable {
         val failChat = AtomicBoolean(false)
+        val missingChatModel = AtomicBoolean(false)
         val embeddingCalls = AtomicInteger()
         val chatMessages = CopyOnWriteArrayList<List<String>>()
         private val executor = Executors.newCachedThreadPool()
         private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             this.executor = this@FakeOllama.executor
             createContext("/api/tags") { exchange ->
-                respond(exchange, 200, """{"models":[{"name":"embeddinggemma:300m"},{"name":"qwen2.5:0.5b-instruct"}]}""")
+                val models = if (missingChatModel.get()) {
+                    """{"models":[{"name":"embeddinggemma:300m"}]}"""
+                } else {
+                    """{"models":[{"name":"embeddinggemma:300m"},{"name":"qwen2.5:0.5b-instruct"}]}"""
+                }
+                respond(exchange, 200, models)
             }
             createContext("/api/embed") { exchange ->
                 val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
@@ -372,10 +610,11 @@ class BrowserAcceptanceTest {
                 val embeddings = buildJsonArray {
                     inputs.forEach { input ->
                         val vector = when {
-                            "orbit" in input.lowercase() -> listOf(1.0, 0.0, 0.0)
-                            "greenhouse" in input.lowercase() -> listOf(0.0, 1.0, 0.0)
-                            "pdf" in input.lowercase() -> listOf(0.0, 0.0, 1.0)
-                            else -> listOf(1.0, 1.0, 0.0)
+                            "penguin" in input.lowercase() -> listOf(0.0, 0.0, 0.0, 1.0)
+                            "orbit" in input.lowercase() -> listOf(1.0, 0.0, 0.0, 0.0)
+                            "greenhouse" in input.lowercase() -> listOf(0.0, 1.0, 0.0, 0.0)
+                            "pdf" in input.lowercase() -> listOf(0.0, 0.0, 1.0, 0.0)
+                            else -> listOf(1.0, 1.0, 0.0, 0.0)
                         }
                         add(buildJsonArray { vector.forEach { add(JsonPrimitive(it)) } })
                     }

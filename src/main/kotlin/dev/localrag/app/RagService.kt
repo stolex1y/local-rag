@@ -43,10 +43,10 @@ class RagService(
         val count = validateTopK(topK)
         val baseline = baseline(question)
         val retrieved = retrieve(question, strategy, count)
-        requireRetrieved(retrieved)
+        val ragAnswer = ragAnswer(question, retrieved)
         return QueryResponse(
             baseline = AnswerEnvelope(baseline),
-            rag = QueryAnswer(chat.answer(question, retrieved), retrieved.map { it.toCitation() }),
+            rag = QueryAnswer(ragAnswer, retrieved.map { it.toCitation() }),
         )
     }
 
@@ -62,9 +62,8 @@ class RagService(
         val queryEmbedding = embeddings.embed(listOf(question)).singleOrNull()
             ?: throw IllegalStateException("Embedding-сервис должен вернуть один вектор запроса.")
         val results = ChunkStrategy.entries.associateWith { strategy ->
-            index.search(strategy, queryEmbedding, embeddings.modelName, count)
+            filterRelevant(index.search(strategy, queryEmbedding, embeddings.modelName, count))
         }
-        results.values.forEach(::requireRetrieved)
         return results
     }
 
@@ -74,12 +73,13 @@ class RagService(
         val count = validateTopK(topK)
         val queryEmbedding = embeddings.embed(listOf(question)).singleOrNull()
             ?: throw IllegalStateException("Embedding-сервис должен вернуть один вектор запроса.")
-        return index.search(strategy, queryEmbedding, embeddings.modelName, count).also(::requireRetrieved)
+        return filterRelevant(index.search(strategy, queryEmbedding, embeddings.modelName, count))
     }
 
     fun ragAnswer(question: String, sources: List<ScoredChunk>): String {
         validateQuestion(question)
-        return chat.answer(question, sources)
+        val answer = chat.answer(question, sources)
+        return if (sources.isEmpty()) "$NO_CONTEXT_NOTICE\n\n$answer" else answer
     }
 
     private fun validateQuestion(question: String) {
@@ -99,11 +99,9 @@ class RagService(
             throw IndexNotReadyException("В коллекции пока нет готовых источников. Добавьте файлы и подтвердите индексацию.")
         }
     }
-    private fun requireRetrieved(sources: List<ScoredChunk>) {
-        if (sources.isEmpty()) {
-            throw IndexNotReadyException("Для текущей embedding-модели нет совместимых индексных фрагментов.")
-        }
-    }
+    private fun filterRelevant(chunks: List<ScoredChunk>) =
+        chunks.filter { it.cosineScore >= MIN_RETRIEVAL_SCORE }
+
 
     private fun ScoredChunk.toCitation() = SourceCitation(
         sourceId = chunk.draft.sourceId,
@@ -116,5 +114,8 @@ class RagService(
 
     companion object {
         const val MAX_QUESTION_LENGTH = 4_000
+        private const val MIN_RETRIEVAL_SCORE = 0.20
+        private const val NO_CONTEXT_NOTICE =
+            "В коллекции не найдено подходящих фрагментов. Ответ не подтверждён локальными источниками."
     }
 }

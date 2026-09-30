@@ -36,6 +36,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -166,6 +168,15 @@ class ApplicationServiceTest {
                 assertEquals(20, api.awaitCompleted(benchmarkJobId).getValue("filesDone").jsonPrimitive.content.toInt())
                 val resultsResponse = json(api.get("/api/benchmark/results").body()).jsonObject
                 assertEquals(20, resultsResponse.getValue("results").jsonArray.size)
+                val benchmarkRows = resultsResponse.getValue("results").jsonArray.map { it.jsonObject }
+                val fixedQuestionIds = benchmarkRows.filter {
+                    it.getValue("strategy").jsonPrimitive.content == "FIXED_SIZE"
+                }.map { it.getValue("questionId").jsonPrimitive.content }.toSet()
+                val structuralQuestionIds = benchmarkRows.filter {
+                    it.getValue("strategy").jsonPrimitive.content == "STRUCTURAL"
+                }.map { it.getValue("questionId").jsonPrimitive.content }.toSet()
+                assertEquals((1..10).map { "q${it.toString().padStart(2, '0')}" }.toSet(), fixedQuestionIds)
+                assertEquals(fixedQuestionIds, structuralQuestionIds)
                 assertEquals(20, resultsResponse.getValue("summary").jsonObject.getValue("expectedSourceHits").jsonPrimitive.content.toInt())
 
                 val review = api.postJson(
@@ -300,6 +311,296 @@ class ApplicationServiceTest {
                 assertTrue(checked.getValue("errors").jsonArray.any { "ожидаемая страница" in it.jsonPrimitive.content })
             } finally {
                 fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `HTTP benchmark rejects malformed datasets without replacing accepted questions or blocking search`() {
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                val bytes = "Orbit markers follow a stable route.\n".toByteArray()
+                val source = importBatch(api, listOf("guide.txt" to bytes)).getValue("guide.txt")
+                val sourceId = source.getValue("sourceId").jsonPrimitive.content
+                val pending = json(api.get("/api/index/pending").body()).jsonObject
+                val totalBytes = pending.getValue("totalBytes").jsonPrimitive.content.toLong()
+                val indexStart = api.postJson("/api/index", indexPayload(true, listOf(sourceId), totalBytes))
+                assertEquals(202, indexStart.statusCode())
+                val indexJobId = json(indexStart.body()).jsonObject.getValue("jobId").jsonPrimitive.content
+                api.awaitCompleted(indexJobId)
+
+                fun question(id: String) = BenchmarkQuestion(
+                    id = id,
+                    question = "Where are orbit markers?",
+                    expectedFacts = listOf("The route is described."),
+                    expectedSources = listOf(
+                        BenchmarkExpectedSource(
+                            sourceId = sourceId,
+                            location = SourceLocation(lineStart = 1, lineEnd = 1),
+                            section = "Document body",
+                        ),
+                    ),
+                )
+
+                val accepted = (1..10).map { question("q${it.toString().padStart(2, '0')}") }
+                val saved = api.putJson("/api/benchmark/questions", """{"questions":${Json.encodeToString(accepted)}}""")
+                assertEquals(200, saved.statusCode(), saved.body())
+                assertTrue(json(saved.body()).jsonObject.getValue("runnable").jsonPrimitive.content.toBoolean())
+
+                val nineQuestions = api.putJson(
+                    "/api/benchmark/questions",
+                    """{"questions":${Json.encodeToString(accepted.take(9))}}""",
+                )
+                assertEquals(400, nineQuestions.statusCode())
+                assertTrue(nineQuestions.body().contains("invalid_benchmark"))
+                assertTrue(nineQuestions.body().contains("ровно 10 вопросов"))
+
+                val duplicateIds = api.putJson(
+                    "/api/benchmark/questions",
+                    """{"questions":${Json.encodeToString(accepted.map { it.copy(id = "q01") })}}""",
+                )
+                assertEquals(400, duplicateIds.statusCode())
+                assertTrue(duplicateIds.body().contains("ID вопросов должны быть уникальными"))
+
+                val malformedSyntax = api.putJson("/api/benchmark/questions", "{")
+                assertEquals(400, malformedSyntax.statusCode())
+                assertTrue(malformedSyntax.body().contains("invalid_json"))
+
+                val incomplete = api.putJson("/api/benchmark/questions", """{"questions":[{"id":"q01"}]}""")
+                assertEquals(400, incomplete.statusCode())
+                assertTrue(incomplete.body().contains("invalid_json"))
+
+                val persisted = json(api.get("/api/benchmark/questions").body()).jsonObject
+                assertTrue(persisted.getValue("runnable").jsonPrimitive.content.toBoolean())
+                assertEquals(
+                    accepted.map(BenchmarkQuestion::id),
+                    persisted.getValue("questions").jsonArray.map { it.jsonObject.getValue("id").jsonPrimitive.content },
+                )
+                val query = api.postJson(
+                    "/api/query",
+                    """{"question":"Where are orbit markers?","strategy":"FIXED_SIZE","topK":1}""",
+                )
+                assertEquals(200, query.statusCode(), query.body())
+                assertEquals(sourceId, json(query.body()).jsonObject.getValue("rag").jsonObject
+                    .getValue("sources").jsonArray.single().jsonObject.getValue("sourceId").jsonPrimitive.content)
+                val noMatch = api.postJson(
+                    "/api/query",
+                    """{"question":"What are penguin breeding habits?","strategy":"FIXED_SIZE","topK":1}""",
+                )
+                assertEquals(200, noMatch.statusCode(), noMatch.body())
+                val ragNoMatch = json(noMatch.body()).jsonObject.getValue("rag").jsonObject
+                assertTrue(ragNoMatch.getValue("sources").jsonArray.isEmpty())
+                assertTrue(ragNoMatch.getValue("answer").jsonPrimitive.content
+                    .startsWith("В коллекции не найдено подходящих фрагментов."))
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `HTTP retrieval includes threshold boundary and excludes lower scores for both strategies`() {
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                val boundary = "Boundary calibration document.\n".toByteArray()
+                val below = "Subthreshold calibration document.\n".toByteArray()
+                val imported = importBatch(api, listOf("boundary.txt" to boundary, "below.txt" to below))
+                val sourceIds = listOf(
+                    imported.getValue("boundary.txt").getValue("sourceId").jsonPrimitive.content,
+                    imported.getValue("below.txt").getValue("sourceId").jsonPrimitive.content,
+                )
+                val indexed = api.postJson(
+                    "/api/index",
+                    indexPayload(true, sourceIds, (boundary.size + below.size).toLong()),
+                )
+                assertEquals(202, indexed.statusCode(), indexed.body())
+                val jobId = json(indexed.body()).jsonObject.getValue("jobId").jsonPrimitive.content
+                assertEquals(2, api.awaitCompleted(jobId).getValue("succeeded").jsonPrimitive.content.toInt())
+
+                for (strategy in listOf("FIXED_SIZE", "STRUCTURAL")) {
+                    val response = api.postJson(
+                        "/api/query",
+                        """{"question":"Calibration axis direction?","strategy":"$strategy","topK":20}""",
+                    )
+                    assertEquals(200, response.statusCode(), response.body())
+                    val sources = json(response.body()).jsonObject.getValue("rag").jsonObject
+                        .getValue("sources").jsonArray
+                    assertEquals(
+                        listOf("boundary.txt"),
+                        sources.map { it.jsonObject.getValue("source").jsonPrimitive.content },
+                    )
+                    assertEquals(0.2, sources.single().jsonObject.getValue("score").jsonPrimitive.content.toDouble())
+                }
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `HTTP benchmark labels answers when both strategies retrieve no evidence`() {
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                val guide = "Orbit markers follow a stable route.\n".toByteArray()
+                val guideRecord = importBatch(api, listOf("guide.txt" to guide)).getValue("guide.txt")
+                val guideId = guideRecord.getValue("sourceId").jsonPrimitive.content
+                val indexed = api.postJson(
+                    "/api/index",
+                    indexPayload(true, listOf(guideId), guide.size.toLong()),
+                )
+                assertEquals(202, indexed.statusCode(), indexed.body())
+                val jobId = json(indexed.body()).jsonObject.getValue("jobId").jsonPrimitive.content
+                assertEquals(1, api.awaitCompleted(jobId).getValue("succeeded").jsonPrimitive.content.toInt())
+
+                val questions = (1..10).map { number ->
+                    BenchmarkQuestion(
+                        id = "q${number.toString().padStart(2, '0')}",
+                        question = "What are penguin breeding habits?",
+                        expectedFacts = listOf("No penguin facts are in the indexed guide."),
+                        expectedSources = listOf(
+                            BenchmarkExpectedSource(
+                                sourceId = guideId,
+                                location = SourceLocation(lineStart = 1, lineEnd = 1),
+                                section = "Document body",
+                            ),
+                        ),
+                    )
+                }
+                val saved = api.putJson(
+                    "/api/benchmark/questions",
+                    """{"questions":${Json.encodeToString(questions)}}""",
+                )
+                assertEquals(200, saved.statusCode(), saved.body())
+                assertTrue(json(saved.body()).jsonObject.getValue("runnable").jsonPrimitive.content.toBoolean())
+                val started = api.postJson("/api/benchmark/run", "{}")
+                assertEquals(202, started.statusCode(), started.body())
+                val benchmarkJobId = json(started.body()).jsonObject.getValue("jobId").jsonPrimitive.content
+                assertEquals(20, api.awaitCompleted(benchmarkJobId).getValue("filesDone").jsonPrimitive.content.toInt())
+
+                val rows = json(api.get("/api/benchmark/results").body()).jsonObject
+                    .getValue("results").jsonArray.map { it.jsonObject }
+                assertEquals(20, rows.size)
+                assertTrue(rows.all { it.getValue("retrievedSources").jsonArray.isEmpty() })
+                assertTrue(rows.all {
+                    it.getValue("ragAnswer").jsonPrimitive.content
+                        .startsWith("В коллекции не найдено подходящих фрагментов.")
+                })
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `HTTP reports missing local chat model without calling a fallback`() {
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                ollama.missingChatModel.set(true)
+
+                val status = json(api.get("/api/status").body()).jsonObject
+                assertFalse(status.getValue("models").jsonObject.getValue("available").jsonPrimitive.content.toBoolean())
+                val response = api.postJson(
+                    "/api/query",
+                    """{"question":"Answer without a local chat model.","strategy":"FIXED_SIZE"}""",
+                )
+                assertEquals(503, response.statusCode())
+                assertTrue(response.body().contains("models_unavailable"))
+                assertEquals(0, ollama.embeddingCalls.get())
+                assertEquals(0, ollama.chatCalls.get())
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `HTTP application restart preserves source benchmark results and ratings`() {
+        FakeOllama().use { ollama ->
+            val sourceBytes = "Orbit markers follow a stable route.\n".toByteArray()
+            val first = LocalRagFixture(temporaryDirectory, ollama)
+            val sourceId: String
+            try {
+                first.server.start()
+                val api = ApiClient(first.server.port)
+                val source = importBatch(api, listOf("guide.txt" to sourceBytes)).getValue("guide.txt")
+                sourceId = source.getValue("sourceId").jsonPrimitive.content
+                val pending = json(api.get("/api/index/pending").body()).jsonObject
+                val indexStart = api.postJson(
+                    "/api/index",
+                    indexPayload(true, listOf(sourceId), pending.getValue("totalBytes").jsonPrimitive.content.toLong()),
+                )
+                val indexJobId = json(indexStart.body()).jsonObject.getValue("jobId").jsonPrimitive.content
+                api.awaitCompleted(indexJobId)
+
+                val questions = (1..10).map { number ->
+                    BenchmarkQuestion(
+                        id = "q${number.toString().padStart(2, '0')}",
+                        question = "Where are orbit markers? Case $number",
+                        expectedFacts = listOf("The route is described."),
+                        expectedSources = listOf(
+                            BenchmarkExpectedSource(
+                                sourceId = sourceId,
+                                location = SourceLocation(lineStart = 1, lineEnd = 1),
+                                section = "Document body",
+                            ),
+                        ),
+                    )
+                }
+                assertEquals(200, api.putJson(
+                    "/api/benchmark/questions",
+                    """{"questions":${Json.encodeToString(questions)}}""",
+                ).statusCode())
+                val benchmarkStart = api.postJson("/api/benchmark/run", "{}")
+                val benchmarkJobId = json(benchmarkStart.body()).jsonObject.getValue("jobId").jsonPrimitive.content
+                assertEquals(20, api.awaitCompleted(benchmarkJobId).getValue("filesDone").jsonPrimitive.content.toInt())
+                assertEquals(200, api.postJson(
+                    "/api/benchmark/review",
+                    """{"questionId":"q01","strategy":"FIXED_SIZE","baselineRating":"FAIL","ragRating":"PASS","note":"Persisted review."}""",
+                ).statusCode())
+            } finally {
+                first.close()
+            }
+
+            val reopened = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                reopened.server.start()
+                val api = ApiClient(reopened.server.port)
+                val status = json(api.get("/api/status").body()).jsonObject
+                assertEquals(1, status.getValue("sources").jsonObject.getValue("ready").jsonPrimitive.content.toInt())
+                assertEquals(sourceId, json(api.get("/api/sources").body()).jsonArray.single()
+                    .jsonObject.getValue("sourceId").jsonPrimitive.content)
+                val questions = json(api.get("/api/benchmark/questions").body()).jsonObject
+                assertTrue(questions.getValue("runnable").jsonPrimitive.content.toBoolean())
+                val results = json(api.get("/api/benchmark/results").body()).jsonObject
+                assertEquals(20, results.getValue("results").jsonArray.size)
+                val review = results.getValue("results").jsonArray.map { it.jsonObject }.single {
+                    it.getValue("questionId").jsonPrimitive.content == "q01" &&
+                        it.getValue("strategy").jsonPrimitive.content == "FIXED_SIZE"
+                }
+                assertEquals("FAIL", review.getValue("baselineRating").jsonPrimitive.content)
+                assertEquals("PASS", review.getValue("ragRating").jsonPrimitive.content)
+                assertEquals("Persisted review.", review.getValue("note").jsonPrimitive.content)
+                val query = api.postJson(
+                    "/api/query",
+                    """{"question":"Where are orbit markers?","strategy":"FIXED_SIZE","topK":1}""",
+                )
+                assertEquals(200, query.statusCode(), query.body())
+                assertEquals(sourceId, json(query.body()).jsonObject.getValue("rag").jsonObject
+                    .getValue("sources").jsonArray.single().jsonObject.getValue("sourceId").jsonPrimitive.content)
+            } finally {
+                reopened.close()
             }
         }
     }
@@ -470,25 +771,35 @@ class ApplicationServiceTest {
     private class FakeOllama : AutoCloseable {
         private val executor: ExecutorService = Executors.newCachedThreadPool()
 
+        val missingChatModel = AtomicBoolean(false)
+        val embeddingCalls = AtomicInteger()
+        val chatCalls = AtomicInteger()
         private val tagsGate = AtomicReference<Gate?>()
         private val embeddingGate = AtomicReference<Gate?>()
         private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             this.executor = this@FakeOllama.executor
             createContext("/api/tags") { exchange ->
                 waitForGate(tagsGate)
+                val names = if (missingChatModel.get()) {
+                    listOf("embeddinggemma:300m")
+                } else {
+                    listOf("embeddinggemma:300m", "qwen2.5:0.5b-instruct")
+                }
                 respond(exchange, buildJsonObject {
-                    put("models", JsonArray(listOf("embeddinggemma:300m", "qwen2.5:0.5b-instruct").map { name ->
-                        buildJsonObject { put("name", JsonPrimitive(name)) }
-                    }))
+                    put("models", JsonArray(names.map { name -> buildJsonObject { put("name", JsonPrimitive(name)) } }))
                 }.toString())
             }
             createContext("/api/embed") { exchange ->
                 waitForGate(embeddingGate)
                 val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader().use { it.readText() }).jsonObject
                 val input = request.getValue("input").jsonArray.map { it.jsonPrimitive.content }
+                embeddingCalls.addAndGet(input.size)
                 val vectors = input.map { text ->
                     val normalized = text.lowercase()
                     val values = when {
+                        "calibration axis direction" in normalized -> listOf(1.0) + List(24) { 0.0 }
+                        "boundary calibration document" in normalized -> List(25) { 0.2 }
+                        "subthreshold calibration document" in normalized -> listOf(0.19) + List(24) { 0.2 }
                         "orbit" in normalized -> listOf(1.0, 0.0, 0.0)
                         "copper" in normalized -> listOf(0.0, 1.0, 0.0)
                         else -> listOf(0.0, 0.0, 1.0)
@@ -499,6 +810,7 @@ class ApplicationServiceTest {
             }
             createContext("/api/chat") { exchange ->
                 val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader().use { it.readText() }).jsonObject
+                chatCalls.incrementAndGet()
                 val userContent = request.getValue("messages").jsonArray.last().jsonObject.getValue("content").jsonPrimitive.content
                 val answer = if ("Найденные фрагменты" in userContent) {
                     "RAG answer grounded in imported context."
