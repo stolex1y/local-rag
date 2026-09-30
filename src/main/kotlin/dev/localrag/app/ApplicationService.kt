@@ -169,17 +169,22 @@ class ApplicationService(
 
     fun job(jobId: String): JobSnapshot? = jobs.get(jobId)
 
-    fun saveBenchmarkQuestions(questions: List<BenchmarkQuestion>): BenchmarkQuestionSet {
+    fun saveBenchmarkQuestions(questions: List<BenchmarkQuestion>): BenchmarkQuestionSet = synchronized(operationLock) {
+        val candidate = benchmarkQuestionSet(questions)
+        if (questions.size == BenchmarkStore.EXPECTED_QUESTION_COUNT && !candidate.runnable) {
+            throw ApiException(400, "invalid_benchmark", candidate.errors.joinToString(" "))
+        }
         try {
             store.saveQuestions(questions)
         } catch (error: IllegalArgumentException) {
             throw ApiException(400, "invalid_benchmark", error.message ?: "Проверьте JSON-набор вопросов.")
         }
-        return benchmarkQuestions()
+        benchmarkQuestions()
     }
 
-    fun benchmarkQuestions(): BenchmarkQuestionSet {
-        val questions = store.questions()
+    fun benchmarkQuestions(): BenchmarkQuestionSet = benchmarkQuestionSet(store.questions())
+
+    private fun benchmarkQuestionSet(questions: List<BenchmarkQuestion>): BenchmarkQuestionSet {
         val errors = mutableListOf<String>()
         if (questions.size != BenchmarkStore.EXPECTED_QUESTION_COUNT) {
             errors += "Нужно загрузить JSON ровно с ${BenchmarkStore.EXPECTED_QUESTION_COUNT} вопросами."

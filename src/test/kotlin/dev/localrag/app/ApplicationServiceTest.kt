@@ -284,7 +284,7 @@ class ApplicationServiceTest {
     }
 
     @Test
-    fun `benchmark rejects a PDF page marked without searchable text`() {
+    fun `benchmark rejects a PDF page marked without searchable text before saving`() {
         FakeOllama().use { ollama ->
             val fixture = LocalRagFixture(temporaryDirectory, ollama)
             try {
@@ -305,10 +305,12 @@ class ApplicationServiceTest {
                     "/api/benchmark/questions",
                     """{"questions":${Json.encodeToString(questions)}}""",
                 )
-                assertEquals(200, saved.statusCode(), saved.body())
+                assertEquals(400, saved.statusCode(), saved.body())
+                assertTrue(saved.body().contains("invalid_benchmark"))
+                assertTrue(saved.body().contains("ожидаемая страница"))
                 val checked = json(api.get("/api/benchmark/questions").body()).jsonObject
+                assertTrue(checked.getValue("questions").jsonArray.isEmpty())
                 assertFalse(checked.getValue("runnable").jsonPrimitive.content.toBoolean())
-                assertTrue(checked.getValue("errors").jsonArray.any { "ожидаемая страница" in it.jsonPrimitive.content })
             } finally {
                 fixture.close()
             }
@@ -350,6 +352,16 @@ class ApplicationServiceTest {
                 assertEquals(200, saved.statusCode(), saved.body())
                 assertTrue(json(saved.body()).jsonObject.getValue("runnable").jsonPrimitive.content.toBoolean())
 
+                val benchmarkStart = api.postJson("/api/benchmark/run", "{}")
+                assertEquals(202, benchmarkStart.statusCode(), benchmarkStart.body())
+                val benchmarkJobId = json(benchmarkStart.body()).jsonObject.getValue("jobId").jsonPrimitive.content
+                assertEquals(20, api.awaitCompleted(benchmarkJobId).getValue("filesDone").jsonPrimitive.content.toInt())
+                val review = api.postJson(
+                    "/api/benchmark/review",
+                    """{"questionId":"q01","strategy":"FIXED_SIZE","baselineRating":"FAIL","ragRating":"PASS","note":"Keep this review."}""",
+                )
+                assertEquals(200, review.statusCode(), review.body())
+
                 val nineQuestions = api.putJson(
                     "/api/benchmark/questions",
                     """{"questions":${Json.encodeToString(accepted.take(9))}}""",
@@ -373,12 +385,76 @@ class ApplicationServiceTest {
                 assertEquals(400, incomplete.statusCode())
                 assertTrue(incomplete.body().contains("invalid_json"))
 
+                val missingSourceId = java.util.UUID.randomUUID().toString()
+                val unresolved = accepted.map { question ->
+                    question.copy(expectedSources = question.expectedSources.map { it.copy(sourceId = missingSourceId) })
+                }
+                val unresolvedSources = api.putJson(
+                    "/api/benchmark/questions",
+                    """{"questions":${Json.encodeToString(unresolved)}}""",
+                )
+                assertEquals(400, unresolvedSources.statusCode())
+                assertTrue(unresolvedSources.body().contains("invalid_benchmark"))
+                assertTrue(unresolvedSources.body().contains("отсутствует"))
+
+                val pendingSourceId = importBatch(
+                    api,
+                    listOf("pending.txt" to "Unindexed source content.\n".toByteArray()),
+                ).getValue("pending.txt").getValue("sourceId").jsonPrimitive.content
+                val unindexed = accepted.map { question ->
+                    question.copy(expectedSources = question.expectedSources.map { it.copy(sourceId = pendingSourceId) })
+                }
+                val unindexedResponse = api.putJson(
+                    "/api/benchmark/questions",
+                    """{"questions":${Json.encodeToString(unindexed)}}""",
+                )
+                assertEquals(400, unindexedResponse.statusCode())
+                assertTrue(unindexedResponse.body().contains("ещё не проиндексирован"))
+
+                val invalidLocation = accepted.map { question ->
+                    question.copy(
+                        expectedSources = question.expectedSources.map {
+                            it.copy(location = SourceLocation(lineStart = 999, lineEnd = 999))
+                        },
+                    )
+                }
+                val invalidLocationResponse = api.putJson(
+                    "/api/benchmark/questions",
+                    """{"questions":${Json.encodeToString(invalidLocation)}}""",
+                )
+                assertEquals(400, invalidLocationResponse.statusCode())
+                assertTrue(invalidLocationResponse.body().contains("ожидаемая страница"))
+                val incompatibleType = accepted.map { question ->
+                    question.copy(
+                        expectedSources = question.expectedSources.map {
+                            it.copy(location = SourceLocation(pageStart = 1, pageEnd = 1), section = null)
+                        },
+                    )
+                }
+                val incompatibleTypeResponse = api.putJson(
+                    "/api/benchmark/questions",
+                    """{"questions":${Json.encodeToString(incompatibleType)}}""",
+                )
+                assertEquals(400, incompatibleTypeResponse.statusCode())
+                assertTrue(incompatibleTypeResponse.body().contains("не соответствует типу источника"))
+
                 val persisted = json(api.get("/api/benchmark/questions").body()).jsonObject
                 assertTrue(persisted.getValue("runnable").jsonPrimitive.content.toBoolean())
                 assertEquals(
                     accepted.map(BenchmarkQuestion::id),
                     persisted.getValue("questions").jsonArray.map { it.jsonObject.getValue("id").jsonPrimitive.content },
                 )
+
+                val preservedRows = json(api.get("/api/benchmark/results").body()).jsonObject
+                    .getValue("results").jsonArray.map { it.jsonObject }
+                assertEquals(20, preservedRows.size)
+                val preservedReview = preservedRows.single {
+                    it.getValue("questionId").jsonPrimitive.content == "q01" &&
+                        it.getValue("strategy").jsonPrimitive.content == "FIXED_SIZE"
+                }
+                assertEquals("FAIL", preservedReview.getValue("baselineRating").jsonPrimitive.content)
+                assertEquals("PASS", preservedReview.getValue("ragRating").jsonPrimitive.content)
+                assertEquals("Keep this review.", preservedReview.getValue("note").jsonPrimitive.content)
                 val query = api.postJson(
                     "/api/query",
                     """{"question":"Where are orbit markers?","strategy":"FIXED_SIZE","topK":1}""",

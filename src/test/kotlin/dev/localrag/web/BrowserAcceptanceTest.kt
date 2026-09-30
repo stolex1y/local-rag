@@ -376,6 +376,45 @@ class BrowserAcceptanceTest {
                 rating.locator("button[type=\"submit\"]").click()
                 assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
                 assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
+                val missingSourceId = "00000000-0000-4000-8000-000000000000"
+                val unresolvedSourceFile = temporaryDirectory.resolve("questions-missing-source.json")
+                Files.writeString(
+                    unresolvedSourceFile,
+                    benchmarkQuestions(
+                        missingSourceId,
+                        referenceLine,
+                        "The referenced source is unavailable.",
+                        questionText = "What is in the missing source?",
+                    ),
+                    UTF_8,
+                )
+                page.locator("#benchmark-file").setInputFiles(unresolvedSourceFile)
+                page.waitForResponse("**/api/benchmark/questions") {
+                    page.locator("#benchmark-upload").click()
+                }
+                assertThat(page.locator("#benchmark-error")).containsText("отсутствует")
+                assertTrue(page.locator("#benchmark-run").isEnabled())
+                assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
+                assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
+                val unresolvedQuestionsState = Json.parseToJsonElement(get("$origin/api/benchmark/questions")).jsonObject
+                assertTrue(unresolvedQuestionsState.getValue("runnable").jsonPrimitive.content.toBoolean())
+                assertEquals(10, unresolvedQuestionsState.getValue("questions").jsonArray.size)
+                assertEquals(
+                    referenceId,
+                    unresolvedQuestionsState.getValue("questions").jsonArray.first().jsonObject
+                        .getValue("expectedSources").jsonArray.first().jsonObject
+                        .getValue("sourceId").jsonPrimitive.content,
+                )
+                val preservedRows = Json.parseToJsonElement(get("$origin/api/benchmark/results")).jsonObject
+                    .getValue("results").jsonArray
+                assertEquals(20, preservedRows.size)
+                val preservedReview = preservedRows.single {
+                    it.jsonObject.getValue("questionId").jsonPrimitive.content == "q01" &&
+                        it.jsonObject.getValue("strategy").jsonPrimitive.content == "FIXED_SIZE"
+                }.jsonObject
+                assertEquals("FAIL", preservedReview.getValue("baselineRating").jsonPrimitive.content)
+                assertEquals("PASS", preservedReview.getValue("ragRating").jsonPrimitive.content)
+                assertEquals("Synthetic review.", preservedReview.getValue("note").jsonPrimitive.content)
                 val nineQuestionFile = temporaryDirectory.resolve("nine-questions.json")
                 Files.writeString(
                     nineQuestionFile,
