@@ -1,6 +1,7 @@
 package dev.localrag.benchmark
 
 import dev.localrag.domain.ChunkStrategy
+import dev.localrag.domain.ModelSelection
 import dev.localrag.domain.ScoredChunk
 import dev.localrag.domain.SourceCitation
 import dev.localrag.domain.SourceLocation
@@ -46,6 +47,8 @@ data class BenchmarkResult(
     val expectedSourceHit: Boolean,
     val baselineAnswer: String,
     val ragAnswer: String,
+    val providerId: String? = null,
+    val modelId: String? = null,
     val baselineRating: String? = null,
     val ragRating: String? = null,
     val note: String? = null,
@@ -72,6 +75,8 @@ class BenchmarkStore(databasePath: Path) : AutoCloseable {
                 """CREATE TABLE IF NOT EXISTS benchmark_results (
                     question_id TEXT NOT NULL REFERENCES benchmark_questions(question_id) ON DELETE CASCADE,
                     strategy TEXT NOT NULL CHECK(strategy IN ('FIXED_SIZE','STRUCTURAL')),
+                    provider_id TEXT,
+                    model_id TEXT,
                     question TEXT NOT NULL,
                     expected_facts_json TEXT NOT NULL,
                     expected_sources_json TEXT NOT NULL,
@@ -96,6 +101,21 @@ class BenchmarkStore(databasePath: Path) : AutoCloseable {
                 )""".trimIndent(),
             )
             statement.execute("CREATE INDEX IF NOT EXISTS benchmark_source_refs_idx ON benchmark_result_sources(source_id)")
+        }
+        ensureModelColumns()
+    }
+
+    private fun ensureModelColumns() {
+        val columns = connection.createStatement().use { statement ->
+            statement.executeQuery("PRAGMA table_info(benchmark_results)").use { rows ->
+                buildSet {
+                    while (rows.next()) add(rows.getString("name"))
+                }
+            }
+        }
+        connection.createStatement().use { statement ->
+            if ("provider_id" !in columns) statement.execute("ALTER TABLE benchmark_results ADD COLUMN provider_id TEXT")
+            if ("model_id" !in columns) statement.execute("ALTER TABLE benchmark_results ADD COLUMN model_id TEXT")
         }
     }
 
@@ -148,6 +168,7 @@ class BenchmarkStore(databasePath: Path) : AutoCloseable {
         baselineAnswer: String,
         ragAnswer: String,
         referenceHit: Boolean,
+        selection: ModelSelection,
     ) {
         val citations = sources.map { it.toCitation() }
         val hit = referenceHit
@@ -159,10 +180,12 @@ class BenchmarkStore(databasePath: Path) : AutoCloseable {
             }
             connection.prepareStatement(
                 """INSERT INTO benchmark_results(
-                    question_id,strategy,question,expected_facts_json,expected_sources_json,retrieved_sources_json,
+                    question_id,strategy,provider_id,model_id,question,expected_facts_json,expected_sources_json,retrieved_sources_json,
                     expected_source_hit,baseline_answer,rag_answer,baseline_rating,rag_rating,note,updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,CURRENT_TIMESTAMP)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,CURRENT_TIMESTAMP)
                 ON CONFLICT(question_id,strategy) DO UPDATE SET
+                    provider_id=excluded.provider_id,
+                    model_id=excluded.model_id,
                     question=excluded.question,
                     expected_facts_json=excluded.expected_facts_json,
                     expected_sources_json=excluded.expected_sources_json,
@@ -177,13 +200,15 @@ class BenchmarkStore(databasePath: Path) : AutoCloseable {
             ).use { statement ->
                 statement.setString(1, question.id)
                 statement.setString(2, strategy.name)
-                statement.setString(3, question.question)
-                statement.setString(4, Json.encodeToString(question.expectedFacts))
-                statement.setString(5, Json.encodeToString(question.expectedSources))
-                statement.setString(6, Json.encodeToString(citations))
-                statement.setInt(7, if (hit) 1 else 0)
-                statement.setString(8, baselineAnswer)
-                statement.setString(9, ragAnswer)
+                statement.setString(3, selection.providerId)
+                statement.setString(4, selection.modelId)
+                statement.setString(5, question.question)
+                statement.setString(6, Json.encodeToString(question.expectedFacts))
+                statement.setString(7, Json.encodeToString(question.expectedSources))
+                statement.setString(8, Json.encodeToString(citations))
+                statement.setInt(9, if (hit) 1 else 0)
+                statement.setString(10, baselineAnswer)
+                statement.setString(11, ragAnswer)
                 statement.executeUpdate()
             }
             val sourceIds = (question.expectedSources.map(BenchmarkExpectedSource::sourceId) + citations.map(SourceCitation::sourceId)).distinct()
@@ -201,7 +226,7 @@ class BenchmarkStore(databasePath: Path) : AutoCloseable {
 
     @Synchronized
     fun results(): List<BenchmarkResult> = connection.prepareStatement(
-        """SELECT question_id,question,expected_facts_json,expected_sources_json,strategy,retrieved_sources_json,
+        """SELECT question_id,question,expected_facts_json,expected_sources_json,strategy,provider_id,model_id,retrieved_sources_json,
             expected_source_hit,baseline_answer,rag_answer,baseline_rating,rag_rating,note
             FROM benchmark_results ORDER BY question_id,CASE strategy WHEN 'FIXED_SIZE' THEN 0 ELSE 1 END""".trimIndent(),
     ).use { statement ->
@@ -215,13 +240,15 @@ class BenchmarkStore(databasePath: Path) : AutoCloseable {
                             expectedFacts = Json.decodeFromString(rows.getString(3)),
                             expectedSources = Json.decodeFromString(rows.getString(4)),
                             strategy = ChunkStrategy.valueOf(rows.getString(5)),
-                            retrievedSources = Json.decodeFromString(rows.getString(6)),
-                            expectedSourceHit = rows.getInt(7) == 1,
-                            baselineAnswer = rows.getString(8),
-                            ragAnswer = rows.getString(9),
-                            baselineRating = rows.getString(10),
-                            ragRating = rows.getString(11),
-                            note = rows.getString(12),
+                            providerId = rows.getString(6),
+                            modelId = rows.getString(7),
+                            retrievedSources = Json.decodeFromString(rows.getString(8)),
+                            expectedSourceHit = rows.getInt(9) == 1,
+                            baselineAnswer = rows.getString(10),
+                            ragAnswer = rows.getString(11),
+                            baselineRating = rows.getString(12),
+                            ragRating = rows.getString(13),
+                            note = rows.getString(14),
                         ),
                     )
                 }

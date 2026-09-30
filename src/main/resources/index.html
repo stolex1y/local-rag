@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Local RAG — локальная коллекция</title>
+  <title>Local RAG — локальная коллекция с облачной генерацией</title>
   <style>
     :root {
       color-scheme: light;
@@ -127,21 +127,32 @@
 <body>
   <header class="hero">
     <div class="wrap">
-      <p class="eyebrow">Local RAG · только локально</p>
+      <p class="eyebrow">Local RAG · локальные источники, облачная генерация</p>
       <h1>Соберите коллекцию и задавайте вопросы по источникам</h1>
-      <p class="intro">Добавляйте PDF и UTF-8 текстовые файлы, отдельно подтверждайте индексацию, сравнивайте ответы без контекста и по найденным фрагментам. Файлы остаются на этом компьютере.</p>
+      <p class="intro">Файлы, извлечение текста, embeddings, поиск, индекс и SQLite остаются на этом компьютере. Для baseline выбранный облачный провайдер получает только вопрос; для RAG — вопрос и текст только локально найденных фрагментов. Исходные файлы, имена и метаданные источников, embeddings и benchmark expected facts не отправляются.</p>
     </div>
   </header>
   <main class="wrap">
     <section class="panel" aria-labelledby="status-heading">
       <div class="panel-head">
-        <div><h2 id="status-heading">Состояние коллекции</h2><p class="muted">Embedding и chat выполняются через локальный Ollama.</p></div>
+        <div><h2 id="status-heading">Состояние коллекции и модели</h2><p class="muted">Ollama используется только локально для embedding-модели.</p></div>
         <button class="secondary" id="refresh-button" type="button">Обновить</button>
       </div>
       <div class="metrics" id="status-metrics" aria-live="polite">
         <article class="metric"><strong>Загрузка…</strong><span>Источники</span></article>
       </div>
-      <p class="notice" id="model-note" role="status">Проверяем локальные модели…</p>
+      <div class="form-grid">
+        <div class="field">
+          <label for="provider-select">Облачный провайдер</label>
+          <select id="provider-select"></select>
+        </div>
+        <div class="field">
+          <label for="model-select">Модель генерации</label>
+          <select id="model-select"></select>
+        </div>
+      </div>
+      <p class="notice" id="model-note" role="status">Проверяем локальную embedding-модель и облачные настройки…</p>
+      <p class="muted" id="model-selection-note" role="status"></p>
       <p class="error" id="status-error" role="alert" hidden></p>
       <p class="job" id="job-progress" role="status" aria-live="polite" hidden></p>
       <progress id="job-meter" max="1" value="0" aria-label="Прогресс текущего задания" hidden></progress>
@@ -208,6 +219,7 @@
         <div><h2 id="benchmark-heading">Benchmark на своих вопросах</h2><p class="muted">Загрузите JSON ровно с 10 вопросами, ожидаемыми фактами и ссылками на готовые источники.</p></div>
         <button class="secondary" id="benchmark-refresh" type="button">Обновить вопросы и результаты</button>
       </div>
+      <div class="callout">Один запуск отправляет выбранному провайдеру 10 baseline-вопросов и 20 RAG-запросов. Для каждого результата сохраняются provider ID и model ID. Фактические расходы зависят от тарифа провайдера; запускайте benchmark только если принимаете эти запросы и возможные расходы. Выбранная пара фиксируется на весь запуск; изменение выбора повлияет на следующий.</div>
       <div class="upload-grid">
         <div class="field">
           <label for="benchmark-file">JSON-файл benchmark</label>
@@ -229,7 +241,7 @@
       "use strict";
 
       const $ = (selector, root = document) => root.querySelector(selector);
-      const state = { modelsAvailable: false, activeJob: null, sources: [], benchmark: null, results: [] };
+      const state = { modelsAvailable: false, embeddingAvailable: false, modelConfiguration: null, activeJob: null, sources: [], benchmark: null, results: [] };
       const MAX_FILE_BYTES = 256 * 1024 * 1024;
       const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
       const MAX_BENCHMARK_FILE_BYTES = 1024 * 1024;
@@ -367,7 +379,50 @@
         });
       }
 
+      function renderModelConfiguration(configuration) {
+        state.modelConfiguration = configuration;
+        const providerSelect = $("#provider-select");
+        providerSelect.replaceChildren();
+        configuration.providers.forEach(provider => providerSelect.append(
+          Object.assign(node("option", provider.displayName), { value: provider.id }),
+        ));
+        providerSelect.value = configuration.selectedProviderId;
+        const modelSelect = $("#model-select");
+        modelSelect.replaceChildren();
+        const provider = configuration.providers.find(item => item.id === configuration.selectedProviderId);
+        (provider?.models || []).forEach(model => modelSelect.append(
+          Object.assign(node("option", model.displayName), { value: model.id }),
+        ));
+        modelSelect.value = configuration.selectedModelId;
+        const model = provider?.models.find(item => item.id === configuration.selectedModelId);
+        $("#model-selection-note").textContent =
+          `Выбрано: ${provider?.displayName || configuration.selectedProviderId} · ${model?.displayName || configuration.selectedModelId} (${configuration.selectedProviderId}/${configuration.selectedModelId}). Настройка выбора хранится локально.`;
+      }
+
+      async function saveModelSelection(providerId, modelId) {
+        try {
+          const configuration = await request("/api/models/selection", jsonOptions("PUT", { providerId, modelId }));
+          renderModelConfiguration(configuration);
+          renderStatus({ ...state.lastStatus, models: state.lastStatus.models });
+          updateControls();
+          message("status-error", "");
+        } catch (error) {
+          message("status-error", error.message);
+          await refresh();
+        }
+      }
+
+      async function chooseProvider() {
+        const provider = state.modelConfiguration?.providers.find(item => item.id === $("#provider-select").value);
+        if (!provider?.models.length) return;
+        await saveModelSelection(provider.id, provider.models[0].id);
+      }
+
+      async function chooseModel() {
+        await saveModelSelection($("#provider-select").value, $("#model-select").value);
+      }
       function renderStatus(status) {
+        state.lastStatus = status;
         const sourceSummary = status.sources;
         const metrics = $("#status-metrics");
         metrics.replaceChildren();
@@ -383,11 +438,18 @@
           metrics.append(card);
         });
         const models = status.models;
-        state.modelsAvailable = Boolean(models.available);
-        $("#model-note").textContent = state.modelsAvailable
-          ? `Ollama доступен · embedding: ${models.embedding} · chat: ${models.chat}`
-          : `Локальные модели недоступны. Запустите Ollama и загрузите ${models.embedding} и ${models.chat}.`;
-        $("#model-note").className = state.modelsAvailable ? "success" : "notice";
+        const configuration = state.modelConfiguration;
+        state.embeddingAvailable = Boolean(models.available);
+        state.modelsAvailable = state.embeddingAvailable && Boolean(configuration?.credentialConfigured);
+        const note = $("#model-note");
+        if (!state.embeddingAvailable) {
+          note.textContent = `Локальная embedding-модель недоступна. Запустите Ollama и загрузите ${models.embedding}.`;
+        } else if (!configuration?.credentialConfigured) {
+          note.textContent = `Ollama embedding ${models.embedding} доступен. Для облачной генерации задайте ${configuration?.credentialEnv || "DEEPSEEK_API_KEY"} и перезапустите приложение. Ключ хранится только в окружении.`;
+        } else {
+          note.textContent = `Ollama embedding ${models.embedding} доступен; генерация использует ${configuration.selectedProviderId}/${configuration.selectedModelId}. Провайдер получает вопрос baseline либо вопрос и найденный текст RAG.`;
+        }
+        note.className = state.modelsAvailable ? "success" : "notice";
         state.activeJob = status.activeJob && status.activeJob.state !== "completed" && status.activeJob.state !== "failed" ? status.activeJob : null;
         renderJob(state.activeJob);
         updateControls();
@@ -427,9 +489,10 @@
       async function refresh() {
         try {
           message("status-error", "");
-          const [status, sources, questions, results] = await Promise.all([
-            request("/api/status"), request("/api/sources"), request("/api/benchmark/questions"), request("/api/benchmark/results"),
+          const [status, modelConfiguration, sources, questions, results] = await Promise.all([
+            request("/api/status"), request("/api/models"), request("/api/sources"), request("/api/benchmark/questions"), request("/api/benchmark/results"),
           ]);
+          renderModelConfiguration(modelConfiguration);
           renderStatus(status);
           renderSources(sources);
           renderBenchmark(questions, results);
@@ -446,10 +509,12 @@
 
       async function refreshSources() {
         try {
-          renderSources(await request("/api/sources"));
-          const status = await request("/api/status");
+          const [sources, modelConfiguration, status] = await Promise.all([
+            request("/api/sources"), request("/api/models"), request("/api/status"),
+          ]);
+          renderModelConfiguration(modelConfiguration);
+          renderSources(sources);
           renderStatus(status);
-          updateControls();
         } catch (error) {
           message("status-error", error.message);
         }
@@ -652,9 +717,11 @@
           results.replaceChildren();
           const answers = node("div", undefined, "answers");
           const baseline = node("article", undefined, "answer-card");
-          baseline.append(node("h3", "Baseline · без коллекции"), node("div", result.baseline.answer, "answer-text"));
+          const selection = result.modelSelection || {};
+          const modelLabel = `${selection.providerId || "?"}/${selection.modelId || "?"}`;
+          baseline.append(node("h3", `Baseline · без коллекции · ${modelLabel}`), node("div", result.baseline.answer, "answer-text"));
           const rag = node("article", undefined, "answer-card");
-          rag.append(node("h3", "RAG · с найденными фрагментами"), node("div", result.rag.answer, "answer-text"), node("h4", "Источники"), renderCitations(result.rag.sources));
+          rag.append(node("h3", `RAG · с найденными фрагментами · ${modelLabel}`), node("div", result.rag.answer, "answer-text"), node("h4", "Источники"), renderCitations(result.rag.sources));
           answers.append(baseline, rag);
           results.append(answers);
         } catch (error) {
@@ -735,6 +802,10 @@
         const heading = row.strategy === "FIXED_SIZE" ? "Фрагменты 500/50" : "Структурные фрагменты";
         const head = node("div", undefined, "strategy-head");
         head.append(node("h3", heading));
+        const modelLabel = row.providerId && row.modelId
+          ? `${row.providerId}/${row.modelId}`
+          : "Модель не записана (исторический результат)";
+        head.append(node("span", modelLabel, "muted"));
         const hit = node("span", row.expectedSourceHit ? "Ожидаемый источник найден" : "Ожидаемый источник не найден", `badge ${row.expectedSourceHit ? "rating-PASS" : "rating-FAIL"}`);
         head.append(hit);
         strategy.append(head);
@@ -848,6 +919,8 @@
       $("#upload-form").addEventListener("submit", uploadSelectedFiles);
       $("#index-button").addEventListener("click", startIndex);
       $("#query-form").addEventListener("submit", askQuestion);
+      $("#provider-select").addEventListener("change", chooseProvider);
+      $("#model-select").addEventListener("change", chooseModel);
       $("#benchmark-upload").addEventListener("click", uploadBenchmark);
       $("#benchmark-run").addEventListener("click", runBenchmark);
       $("#benchmark-refresh").addEventListener("click", refresh);

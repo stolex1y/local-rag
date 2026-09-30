@@ -10,13 +10,18 @@ import dev.localrag.index.IndexWorkflow
 import dev.localrag.index.SourceExtractorRegistry
 import dev.localrag.index.SqliteIndexRepository
 import dev.localrag.index.StructuralChunker
+import dev.localrag.generation.ChatCompletionsApi
+import dev.localrag.generation.EnvironmentProviderCredentials
+import dev.localrag.generation.ModelConfiguration
+import dev.localrag.generation.ModelSelectionStore
+import dev.localrag.generation.ProviderCatalog
 import dev.localrag.ollama.OllamaApi
-import dev.localrag.ollama.OllamaChatPort
 import dev.localrag.ollama.OllamaEmbeddingPort
 import dev.localrag.source.LocalRagPaths
 import dev.localrag.source.SourceCatalog
 import dev.localrag.web.LocalHttpServer
 import java.net.URI
+import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 
 fun main() {
@@ -30,8 +35,10 @@ fun main() {
             try {
                 val ollamaAddress = System.getenv("LOCAL_RAG_OLLAMA_URL")
                 val ollama = if (ollamaAddress.isNullOrBlank()) OllamaApi() else OllamaApi(URI.create(ollamaAddress))
+                val modelCatalog = ProviderCatalog.load(Path.of("config/providers.json"), Path.of("config/agent.json"))
+                val modelConfiguration = ModelConfiguration(modelCatalog, ModelSelectionStore(paths.modelSelection, modelCatalog), EnvironmentProviderCredentials)
                 val embeddings = OllamaEmbeddingPort(ollama)
-                val chat = OllamaChatPort(ollama)
+                val chat = ChatCompletionsApi(modelConfiguration)
                 val rag = RagService(index, embeddings, chat)
                 val indexing = IndexWorkflow(
                     extractor = SourceExtractorRegistry(),
@@ -41,7 +48,7 @@ fun main() {
                     sourcesDirectory = paths.sources,
                 )
                 val benchmark = BenchmarkRunner(rag, benchmarkStore, index)
-                val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama)
+                val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration)
                 val port = System.getenv("LOCAL_RAG_PORT")?.toIntOrNull() ?: 8765
                 LocalHttpServer(application, port).use { server ->
                     server.start()

@@ -5,13 +5,14 @@ import dev.localrag.domain.ChunkStrategy
 import dev.localrag.domain.IndexProgressUpdate
 import dev.localrag.domain.IndexRepository
 import dev.localrag.domain.ScoredChunk
+import dev.localrag.domain.ModelSelection
 
 class BenchmarkRunner(
     private val rag: RagService,
     private val store: BenchmarkStore,
     private val index: IndexRepository,
 ) {
-    fun run(questions: List<BenchmarkQuestion>, progress: (IndexProgressUpdate) -> Unit) {
+    fun run(questions: List<BenchmarkQuestion>, selection: ModelSelection, progress: (IndexProgressUpdate) -> Unit) {
         require(questions.size == BenchmarkStore.EXPECTED_QUESTION_COUNT) {
             "Benchmark должен содержать ровно ${BenchmarkStore.EXPECTED_QUESTION_COUNT} вопросов."
         }
@@ -19,7 +20,7 @@ class BenchmarkRunner(
         var completed = 0
         questions.forEach { question ->
             progress(IndexProgressUpdate("baseline", completed, totalCases, 0, 0, question.question, 0, 0))
-            val baseline = rag.baseline(question.question)
+            val baseline = rag.baseline(question.question, selection)
             val sourcesByStrategy = rag.retrieveForStrategies(question.question)
             ChunkStrategy.entries.forEach { strategy ->
                 progress(IndexProgressUpdate("rag", completed, totalCases, 0, 0, question.question, 0, 0))
@@ -29,8 +30,9 @@ class BenchmarkRunner(
                     strategy = strategy,
                     sources = sources,
                     baselineAnswer = baseline,
-                    ragAnswer = rag.ragAnswer(question.question, sources),
+                    ragAnswer = rag.ragAnswer(question.question, sources, selection),
                     referenceHit = hasExpectedSourceHit(question, sources),
+                    selection = selection,
                 )
                 completed++
                 progress(IndexProgressUpdate("benchmark", completed, totalCases, 0, 0, null, 0, 0))

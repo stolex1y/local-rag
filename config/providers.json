@@ -1,0 +1,21 @@
+{
+  "providers": [
+    {
+      "id": "deepseek",
+      "display_name": "DeepSeek",
+      "base_url": "https://api.deepseek.com",
+      "chat_completions_path": "/chat/completions",
+      "credential_env": "DEEPSEEK_API_KEY",
+      "models": [
+        {
+          "id": "deepseek-flash",
+          "display_name": "DeepSeek V4.1 Flash"
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "display_name": "DeepSeek V4 Pro 0813"
+        }
+      ]
+    }
+  ]
+}

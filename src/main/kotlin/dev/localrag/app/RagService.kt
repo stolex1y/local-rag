@@ -1,6 +1,7 @@
 package dev.localrag.app
 
 import dev.localrag.domain.ChatPort
+import dev.localrag.domain.ModelSelection
 import dev.localrag.domain.ChunkStrategy
 import dev.localrag.domain.EmbeddingPort
 import dev.localrag.domain.IndexRepository
@@ -24,6 +25,7 @@ data class QueryAnswer(
 data class QueryResponse(
     val baseline: AnswerEnvelope,
     val rag: QueryAnswer,
+    val modelSelection: ModelSelection,
 )
 
 class RagService(
@@ -37,22 +39,23 @@ class RagService(
         require(defaultTopK in 1..maxTopK)
     }
 
-    fun answer(question: String, strategy: ChunkStrategy, topK: Int?): QueryResponse {
+    fun answer(question: String, strategy: ChunkStrategy, topK: Int?, selection: ModelSelection): QueryResponse {
         validateQuestion(question)
         requireReadySources()
         val count = validateTopK(topK)
-        val baseline = baseline(question)
+        val baseline = baseline(question, selection)
         val retrieved = retrieve(question, strategy, count)
-        val ragAnswer = ragAnswer(question, retrieved)
+        val ragAnswer = ragAnswer(question, retrieved, selection)
         return QueryResponse(
             baseline = AnswerEnvelope(baseline),
             rag = QueryAnswer(ragAnswer, retrieved.map { it.toCitation() }),
+            modelSelection = selection,
         )
     }
 
-    fun baseline(question: String): String {
+    fun baseline(question: String, selection: ModelSelection): String {
         validateQuestion(question)
-        return chat.answer(question)
+        return chat.answer(selection, question)
     }
 
     fun retrieveForStrategies(question: String, topK: Int = defaultTopK): Map<ChunkStrategy, List<ScoredChunk>> {
@@ -76,9 +79,9 @@ class RagService(
         return filterRelevant(index.search(strategy, queryEmbedding, embeddings.modelName, count))
     }
 
-    fun ragAnswer(question: String, sources: List<ScoredChunk>): String {
+    fun ragAnswer(question: String, sources: List<ScoredChunk>, selection: ModelSelection): String {
         validateQuestion(question)
-        val answer = chat.answer(question, sources)
+        val answer = chat.answer(selection, question, sources)
         return if (sources.isEmpty()) "$NO_CONTEXT_NOTICE\n\n$answer" else answer
     }
 

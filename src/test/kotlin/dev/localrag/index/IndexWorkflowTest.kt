@@ -6,6 +6,7 @@ import dev.localrag.domain.ChunkStrategy
 import dev.localrag.domain.EmbeddingPort
 import dev.localrag.domain.IndexProgressUpdate
 import dev.localrag.domain.ScoredChunk
+import dev.localrag.domain.ModelSelection
 import dev.localrag.domain.SourceLocation
 import dev.localrag.domain.SourceRecord
 import dev.localrag.domain.SourceSegment
@@ -75,7 +76,12 @@ class IndexWorkflowTest {
             assertTrue(repository.chunkCount(copperId, ChunkStrategy.STRUCTURAL) > 0)
 
             val rag = RagService(repository, FixtureEmbeddings(), EvidenceChat())
-            val response = rag.answer("Where are orbit markers?", ChunkStrategy.FIXED_SIZE, topK = 1)
+            val response = rag.answer(
+                "Where are orbit markers?",
+                ChunkStrategy.FIXED_SIZE,
+                topK = 1,
+                selection = ModelSelection("fixture", "fixture-chat"),
+            )
             assertEquals("Baseline has no collection evidence.", response.baseline.answer)
             assertEquals("The indexed orbit fragment supports the route.", response.rag.answer)
             assertEquals(orbitId, response.rag.sources.single().sourceId)
@@ -123,9 +129,7 @@ class IndexWorkflowTest {
     }
 
     private class EvidenceChat : ChatPort {
-        override val modelName = "fixture-chat"
-
-        override fun answer(question: String, context: List<ScoredChunk>): String = when {
+        override fun answer(selection: ModelSelection, question: String, context: List<ScoredChunk>): String = when {
             context.isEmpty() -> "Baseline has no collection evidence."
             context.any { "ORBIT_EVIDENCE" in it.chunk.draft.text } -> "The indexed orbit fragment supports the route."
             else -> "The retrieved collection has no orbit evidence."

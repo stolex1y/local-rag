@@ -9,6 +9,8 @@ import dev.localrag.app.JobBusyException
 import dev.localrag.app.JobNotFoundException
 import dev.localrag.benchmark.BenchmarkQuestion
 import dev.localrag.domain.ChunkStrategy
+import dev.localrag.domain.ModelSelection
+import dev.localrag.generation.CloudModelException
 import dev.localrag.ollama.LocalModelException
 import dev.localrag.source.ImportInProgressException
 import dev.localrag.source.ImportNotFoundException
@@ -62,6 +64,8 @@ private data class ReviewRequest(
     val ragRating: String,
     val note: String? = null,
 )
+@Serializable
+private data class ModelSelectionRequest(val providerId: String, val modelId: String)
 
 @Serializable
 private data class SavedResponse(val saved: Boolean)
@@ -112,6 +116,8 @@ class LocalHttpServer(
             sendError(exchange, 404, "source_not_found", error.message ?: "Источник не найден.")
         } catch (error: LocalModelException) {
             sendError(exchange, 503, "local_model_unavailable", error.message ?: "Локальная модель недоступна.")
+        } catch (error: CloudModelException) {
+            sendError(exchange, 502, "cloud_model_unavailable", error.message ?: "Облачная модель недоступна.")
         } catch (error: IllegalArgumentException) {
             sendError(exchange, 400, "invalid_request", error.message ?: "Проверьте параметры запроса.")
         } catch (_: Exception) {
@@ -125,6 +131,12 @@ class LocalHttpServer(
         val method = exchange.requestMethod.uppercase()
         val parts = path.split('/').filter(String::isNotEmpty)
         when {
+            path == "/api/models" && method == "GET" -> sendJson(exchange, 200, application.models())
+            path == "/api/models/selection" && method == "PUT" -> {
+                requireJsonContentType(exchange)
+                val request = readJson<ModelSelectionRequest>(exchange)
+                sendJson(exchange, 200, application.selectModel(ModelSelection(request.providerId, request.modelId)))
+            }
             path == "/api/status" && method == "GET" -> sendJson(exchange, 200, application.status())
             path == "/api/sources" && method == "GET" -> sendJson(exchange, 200, application.sources())
             path == "/api/imports" && method == "POST" -> {

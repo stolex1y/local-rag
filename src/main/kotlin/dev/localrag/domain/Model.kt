@@ -108,9 +108,14 @@ interface EmbeddingPort {
     fun embed(texts: List<String>): List<List<Float>>
 }
 
+@Serializable
+data class ModelSelection(
+    val providerId: String,
+    val modelId: String,
+)
+
 interface ChatPort {
-    val modelName: String
-    fun answer(question: String, context: List<ScoredChunk> = emptyList()): String
+    fun answer(selection: ModelSelection, question: String, context: List<ScoredChunk> = emptyList()): String
 }
 
 data class StoredSource(

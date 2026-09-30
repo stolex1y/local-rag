@@ -12,9 +12,10 @@ import dev.localrag.domain.SourceStatus
 import dev.localrag.domain.SourceType
 import dev.localrag.domain.StoredSource
 import dev.localrag.index.IndexWorkflow
-import dev.localrag.ollama.CHAT_MODEL
+import dev.localrag.domain.ModelSelection
+import dev.localrag.generation.ModelConfiguration
+import dev.localrag.generation.ModelConfigurationResponse
 import dev.localrag.ollama.EMBEDDING_MODEL
-import dev.localrag.ollama.LocalModelException
 import dev.localrag.ollama.OllamaApi
 import dev.localrag.source.ImportBatch
 import dev.localrag.source.ImportCompletion
@@ -28,7 +29,6 @@ import java.io.InputStream
 @Serializable
 data class ModelStatus(
     val embedding: String,
-    val chat: String,
     val available: Boolean,
 )
 
@@ -81,6 +81,7 @@ class ApplicationService(
     private val rag: RagService,
     private val benchmark: BenchmarkRunner,
     private val ollama: OllamaApi,
+    private val modelConfiguration: ModelConfiguration,
 ) {
 
     private val operationLock = Any()
@@ -88,7 +89,7 @@ class ApplicationService(
         val sources = catalog.sources()
         val availableModels = availableModels()
         return StatusResponse(
-            models = ModelStatus(EMBEDDING_MODEL, CHAT_MODEL, EMBEDDING_MODEL in availableModels && CHAT_MODEL in availableModels),
+            models = ModelStatus(EMBEDDING_MODEL, EMBEDDING_MODEL in availableModels),
             sources = SourceSummary(
                 total = sources.size,
                 pending = sources.count { it.status == SourceStatus.PENDING },
@@ -102,6 +103,17 @@ class ApplicationService(
     }
 
     fun sources(): List<SourceRecord> = catalog.sources()
+
+    fun models(): ModelConfigurationResponse = modelConfiguration.options()
+
+    fun selectModel(selection: ModelSelection): ModelConfigurationResponse {
+        try {
+            modelConfiguration.select(selection)
+        } catch (error: IllegalArgumentException) {
+            throw ApiException(400, "invalid_model_selection", error.message ?: "Выберите модель из каталога.")
+        }
+        return modelConfiguration.options()
+    }
 
     fun beginImport(files: List<ImportFileMetadata>): ImportBatch = catalog.beginImport(files)
 
@@ -159,9 +171,11 @@ class ApplicationService(
     }
 
     fun query(question: String, strategy: ChunkStrategy, topK: Int?): QueryResponse {
-        requireModels(CHAT_MODEL, EMBEDDING_MODEL)
+        val selection = modelConfiguration.currentSelection()
+        requireModels(EMBEDDING_MODEL)
+        modelConfiguration.requireCredential(selection)
         return try {
-            rag.answer(question, strategy, topK)
+            rag.answer(question, strategy, topK, selection)
         } catch (error: IllegalArgumentException) {
             throw ApiException(400, "invalid_query", error.message ?: "Проверьте вопрос и Top-K.")
         }
@@ -205,7 +219,9 @@ class ApplicationService(
     }
 
     fun startBenchmark(): JobSnapshot = synchronized(operationLock) {
-        requireModels(CHAT_MODEL, EMBEDDING_MODEL)
+        val selection = modelConfiguration.currentSelection()
+        requireModels(EMBEDDING_MODEL)
+        modelConfiguration.requireCredential(selection)
         val questionSet = benchmarkQuestions()
         if (!questionSet.runnable) {
             throw ApiException(409, "benchmark_not_ready", questionSet.errors.joinToString(" "))
@@ -216,7 +232,7 @@ class ApplicationService(
         val questions = questionSet.questions
         val cases = questions.size * ChunkStrategy.entries.size
         jobs.submit("BENCHMARK", cases, 0) { progress ->
-            benchmark.run(questions) { update -> progress.update(update) }
+            benchmark.run(questions, selection) { update -> progress.update(update) }
         }
     }
 

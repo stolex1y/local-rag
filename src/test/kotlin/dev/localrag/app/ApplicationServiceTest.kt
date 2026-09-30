@@ -13,6 +13,9 @@ import dev.localrag.domain.SourceRecord
 import dev.localrag.domain.SourceStatus
 import dev.localrag.domain.SourceType
 import dev.localrag.domain.StoredChunk
+import dev.localrag.domain.ChatPort
+import dev.localrag.domain.ModelSelection
+import dev.localrag.domain.ScoredChunk
 import dev.localrag.domain.StoredSource
 import dev.localrag.index.FixedSizeChunker
 import dev.localrag.index.IndexWorkflow
@@ -20,10 +23,15 @@ import dev.localrag.index.SourceExtractorRegistry
 import dev.localrag.index.SqliteIndexRepository
 import dev.localrag.index.StructuralChunker
 import dev.localrag.ollama.OllamaApi
-import dev.localrag.ollama.OllamaChatPort
 import dev.localrag.ollama.OllamaEmbeddingPort
 import dev.localrag.source.SourceCatalog
 import dev.localrag.web.LocalHttpServer
+import dev.localrag.generation.ModelConfiguration
+import dev.localrag.generation.ModelSelectionStore
+import dev.localrag.generation.ProviderCatalog
+import dev.localrag.generation.ProviderCredentialSource
+import dev.localrag.generation.ProviderDefinition
+import dev.localrag.generation.ProviderModelDefinition
 import java.net.InetSocketAddress
 import java.net.URI
 import java.net.http.HttpClient
@@ -33,6 +41,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -557,14 +566,28 @@ class ApplicationServiceTest {
                 )
                 assertEquals(200, saved.statusCode(), saved.body())
                 assertTrue(json(saved.body()).jsonObject.getValue("runnable").jsonPrimitive.content.toBoolean())
+                val generationGate = fixture.holdNextGeneration()
                 val started = api.postJson("/api/benchmark/run", "{}")
                 assertEquals(202, started.statusCode(), started.body())
                 val benchmarkJobId = json(started.body()).jsonObject.getValue("jobId").jsonPrimitive.content
+                assertTrue(generationGate.entered.await(5, TimeUnit.SECONDS))
+                val changedSelection = api.putJson(
+                    "/api/models/selection",
+                    """{"providerId":"fixture","modelId":"fixture-chat-alt"}""",
+                )
+                assertEquals(200, changedSelection.statusCode(), changedSelection.body())
+                generationGate.release.countDown()
                 assertEquals(20, api.awaitCompleted(benchmarkJobId).getValue("filesDone").jsonPrimitive.content.toInt())
 
                 val rows = json(api.get("/api/benchmark/results").body()).jsonObject
                     .getValue("results").jsonArray.map { it.jsonObject }
                 assertEquals(20, rows.size)
+                assertEquals(30, fixture.generationCalls.get())
+                assertTrue(rows.all {
+                    it.getValue("providerId").jsonPrimitive.content == "fixture" &&
+                        it.getValue("modelId").jsonPrimitive.content == "fixture-chat"
+                })
+                assertTrue(fixture.generationSelections.all { it == ModelSelection("fixture", "fixture-chat") })
                 assertTrue(rows.all { it.getValue("retrievedSources").jsonArray.isEmpty() })
                 assertTrue(rows.all {
                     it.getValue("ragAnswer").jsonPrimitive.content
@@ -577,24 +600,24 @@ class ApplicationServiceTest {
     }
 
     @Test
-    fun `HTTP reports missing local chat model without calling a fallback`() {
+    fun `HTTP rejects missing cloud credential without calling a generation fallback`() {
         FakeOllama().use { ollama ->
             val fixture = LocalRagFixture(temporaryDirectory, ollama)
             try {
                 fixture.server.start()
                 val api = ApiClient(fixture.server.port)
-                ollama.missingChatModel.set(true)
+                fixture.credentialConfigured.set(false)
 
                 val status = json(api.get("/api/status").body()).jsonObject
-                assertFalse(status.getValue("models").jsonObject.getValue("available").jsonPrimitive.content.toBoolean())
+                assertTrue(status.getValue("models").jsonObject.getValue("available").jsonPrimitive.content.toBoolean())
                 val response = api.postJson(
                     "/api/query",
-                    """{"question":"Answer without a local chat model.","strategy":"FIXED_SIZE"}""",
+                    """{"question":"Answer without a cloud credential.","strategy":"FIXED_SIZE"}""",
                 )
-                assertEquals(503, response.statusCode())
-                assertTrue(response.body().contains("models_unavailable"))
+                assertEquals(502, response.statusCode())
+                assertTrue(response.body().contains("cloud_model_unavailable"))
                 assertEquals(0, ollama.embeddingCalls.get())
-                assertEquals(0, ollama.chatCalls.get())
+                assertEquals(0, fixture.generationCalls.get())
             } finally {
                 fixture.close()
             }
@@ -713,12 +736,39 @@ class ApplicationServiceTest {
     private class LocalRagFixture(directory: Path, ollama: FakeOllama) : AutoCloseable {
         val database = directory.resolve("v11.sqlite")
         val sourcesDirectory = directory.resolve("sources")
+        val credentialConfigured = AtomicBoolean(true)
+        val generationCalls = AtomicInteger()
         val index = SqliteIndexRepository(database)
         private val store = BenchmarkStore(database)
         private val jobs = JobManager()
         private val api = ollama.client()
         private val embeddings = OllamaEmbeddingPort(api)
-        private val rag = RagService(index, embeddings, OllamaChatPort(api))
+        private val selection = ModelSelection("fixture", "fixture-chat")
+        private val providers = ProviderCatalog.create(
+            listOf(
+                ProviderDefinition(
+                    "fixture",
+                    "Fixture provider",
+                    "https://api.deepseek.com",
+                    "/chat/completions",
+                    "FIXTURE_API_KEY",
+                    listOf(
+                        ProviderModelDefinition("fixture-chat", "Fixture chat"),
+                        ProviderModelDefinition("fixture-chat-alt", "Fixture chat alternate"),
+                    ),
+                ),
+            ),
+            selection,
+        )
+        private val modelConfiguration = ModelConfiguration(
+            providers,
+            ModelSelectionStore(directory.resolve("model-selection.json"), providers),
+            ProviderCredentialSource { if (credentialConfigured.get()) "fixture-secret" else null },
+        )
+        private val chat = FixtureChat(generationCalls)
+        val generationSelections: List<ModelSelection> get() = chat.selections.toList()
+        fun holdNextGeneration() = chat.holdNext()
+        private val rag = RagService(index, embeddings, chat)
         private val catalog = SourceCatalog(sourcesDirectory, index, store::deleteSourceReferences)
         private val indexing = IndexWorkflow(
             extractor = SourceExtractorRegistry(),
@@ -728,7 +778,7 @@ class ApplicationServiceTest {
             sourcesDirectory = sourcesDirectory,
         )
         private val benchmark = BenchmarkRunner(rag, store, index)
-        private val application = ApplicationService(index, store, catalog, jobs, indexing, rag, benchmark, api)
+        private val application = ApplicationService(index, store, catalog, jobs, indexing, rag, benchmark, api, modelConfiguration)
         val server = LocalHttpServer(application, port = 0)
         fun seedSparsePdf(): String {
             val record = SourceRecord(
@@ -844,23 +894,35 @@ class ApplicationServiceTest {
         }
     }
 
+    private class FixtureChat(private val calls: AtomicInteger) : ChatPort {
+        val selections = CopyOnWriteArrayList<ModelSelection>()
+        private val nextGate = AtomicReference<Gate?>()
+
+        fun holdNext() = Gate().also(nextGate::set)
+
+        override fun answer(selection: ModelSelection, question: String, context: List<ScoredChunk>): String {
+            calls.incrementAndGet()
+            selections += selection
+            val gate = nextGate.getAndSet(null)
+            if (gate != null) {
+                gate.entered.countDown()
+                check(gate.release.await(10, TimeUnit.SECONDS)) { "The test did not release generation." }
+            }
+            return if (context.isEmpty()) "Baseline answer without indexed sources."
+            else "RAG answer grounded in imported context."
+        }
+    }
     private class FakeOllama : AutoCloseable {
         private val executor: ExecutorService = Executors.newCachedThreadPool()
 
-        val missingChatModel = AtomicBoolean(false)
         val embeddingCalls = AtomicInteger()
-        val chatCalls = AtomicInteger()
         private val tagsGate = AtomicReference<Gate?>()
         private val embeddingGate = AtomicReference<Gate?>()
         private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             this.executor = this@FakeOllama.executor
             createContext("/api/tags") { exchange ->
                 waitForGate(tagsGate)
-                val names = if (missingChatModel.get()) {
-                    listOf("embeddinggemma:300m")
-                } else {
-                    listOf("embeddinggemma:300m", "qwen2.5:0.5b-instruct")
-                }
+                val names = listOf("embeddinggemma:300m")
                 respond(exchange, buildJsonObject {
                     put("models", JsonArray(names.map { name -> buildJsonObject { put("name", JsonPrimitive(name)) } }))
                 }.toString())
@@ -883,19 +945,6 @@ class ApplicationServiceTest {
                     buildJsonArray { values.forEach { add(JsonPrimitive(it)) } }
                 }
                 respond(exchange, buildJsonObject { put("embeddings", JsonArray(vectors)) }.toString())
-            }
-            createContext("/api/chat") { exchange ->
-                val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader().use { it.readText() }).jsonObject
-                chatCalls.incrementAndGet()
-                val userContent = request.getValue("messages").jsonArray.last().jsonObject.getValue("content").jsonPrimitive.content
-                val answer = if ("Найденные фрагменты" in userContent) {
-                    "RAG answer grounded in imported context."
-                } else {
-                    "Baseline answer without indexed sources."
-                }
-                respond(exchange, buildJsonObject {
-                    put("message", buildJsonObject { put("content", JsonPrimitive(answer)) })
-                }.toString())
             }
         }
 

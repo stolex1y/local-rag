@@ -5,6 +5,7 @@ import java.nio.file.Path
  data class LocalRagPaths(val dataDirectory: Path) {
     val database: Path get() = dataDirectory.resolve("local-rag-v11.sqlite")
     val sources: Path get() = dataDirectory.resolve("sources")
+    val modelSelection: Path get() = dataDirectory.resolve("model-selection.json")
 
     companion object {
         fun current(): LocalRagPaths {

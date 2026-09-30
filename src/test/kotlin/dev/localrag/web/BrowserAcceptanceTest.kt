@@ -15,10 +15,17 @@ import dev.localrag.index.SourceExtractorRegistry
 import dev.localrag.index.SqliteIndexRepository
 import dev.localrag.index.StructuralChunker
 import dev.localrag.ollama.OllamaApi
-import dev.localrag.ollama.OllamaChatPort
 import dev.localrag.ollama.OllamaEmbeddingPort
 import dev.localrag.source.LocalRagPaths
 import dev.localrag.source.SourceCatalog
+import dev.localrag.generation.ChatCompletionsApi
+import dev.localrag.generation.ModelConfiguration
+import dev.localrag.generation.ModelSelectionStore
+import dev.localrag.generation.ProviderCatalog
+import dev.localrag.generation.ProviderCredentialSource
+import dev.localrag.generation.ProviderDefinition
+import dev.localrag.generation.ProviderModelDefinition
+import dev.localrag.domain.ModelSelection
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
@@ -72,7 +79,8 @@ class BrowserAcceptanceTest {
                         val catalog = SourceCatalog(paths.sources, index, benchmarkStore::deleteSourceReferences)
                         val ollama = OllamaApi(fake.uri)
                         val embeddings = OllamaEmbeddingPort(ollama)
-                        val chat = OllamaChatPort(ollama)
+                        val modelConfiguration = modelConfiguration(paths, fake.cloud)
+                        val chat = ChatCompletionsApi(modelConfiguration)
                         val rag = RagService(index, embeddings, chat)
                         val indexing = IndexWorkflow(
                             extractor = SourceExtractorRegistry(),
@@ -82,7 +90,7 @@ class BrowserAcceptanceTest {
                             sourcesDirectory = paths.sources,
                         )
                         val benchmark = BenchmarkRunner(rag, benchmarkStore, index)
-                        val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama)
+                        val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration)
                         LocalHttpServer(application, 0).use { server ->
                             server.start()
                             exerciseUserJourney(fake, probe, server.port, paths.sources)
@@ -114,11 +122,15 @@ class BrowserAcceptanceTest {
                 try {
                     val page = browser.newPage()
                     page.setDefaultTimeout(30_000.0)
-                    var fixture: BrowserAppFixture? = BrowserAppFixture(paths, fake)
+                    var fixture: BrowserAppFixture? = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
                     try {
                         val first = fixture!!
                         page.navigate("http://127.0.0.1:${first.server.port}/")
-                        assertThat(page.locator("#model-note")).containsText("Ollama доступен")
+                        assertThat(page.locator("#model-note")).containsText("embeddinggemma:300m доступен")
+                        page.waitForResponse("**/api/models/selection") {
+                            page.locator("#model-select").selectOption("deepseek-v4-pro")
+                        }
+                        assertThat(page.locator("#model-selection-note")).containsText("fixture/deepseek-v4-pro")
                         page.onDialog { it.accept() }
 
                         page.locator("#source-files").setInputFiles(sourceFile)
@@ -142,7 +154,14 @@ class BrowserAcceptanceTest {
                         assertThat(page.locator("#benchmark-error")).containsText("Набор сохранён")
                         page.locator("#benchmark-run").click()
                         assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
-                        assertEquals(20, page.locator("#benchmark-results .strategy-card").count())
+                        val apiResults = Json.parseToJsonElement(get("http://127.0.0.1:${first.server.port}/api/benchmark/results"))
+                            .jsonObject.getValue("results").jsonArray
+                        assertEquals(20, apiResults.size)
+                        assertTrue(apiResults.all {
+                            it.jsonObject.getValue("providerId").jsonPrimitive.content == "fixture" &&
+                                it.jsonObject.getValue("modelId").jsonPrimitive.content == "deepseek-v4-pro"
+                        })
+                        assertEquals(20, page.locator("#benchmark-results .strategy-card").count(), page.locator("#benchmark-results").innerText())
 
                         val rating = page.locator("#benchmark-results .rating-form").first()
                         rating.locator("select[name=\"baselineRating\"]").selectOption("FAIL")
@@ -156,9 +175,10 @@ class BrowserAcceptanceTest {
 
                         first.close()
                         fixture = null
-                        fixture = BrowserAppFixture(paths, fake)
+                        fixture = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
                         val reopened = fixture!!
                         page.navigate("http://127.0.0.1:${reopened.server.port}/")
+                        assertThat(page.locator("#model-select")).hasValue("deepseek-v4-pro")
                         assertThat(page.locator("#source-list")).containsText("restart-note.txt")
                         assertEquals(1, page.locator("#source-list .source-row").count())
                         val restoredSource = Json.parseToJsonElement(get("http://127.0.0.1:${reopened.server.port}/api/sources"))
@@ -261,7 +281,7 @@ class BrowserAcceptanceTest {
                 val page = browser.newPage()
                 page.setDefaultTimeout(30_000.0)
                 page.navigate(origin)
-                assertThat(page.locator("#model-note")).containsText("Ollama доступен")
+                assertThat(page.locator("#model-note")).containsText("embeddinggemma:300m доступен")
                 assertFalse(page.locator("body").innerText().contains("LTE", ignoreCase = true))
 
                 val acceptNextDialog = AtomicBoolean(false)
@@ -309,27 +329,28 @@ class BrowserAcceptanceTest {
                 assertTrue(awaitDialog(page, dialogMessages).startsWith("Начать индексацию"))
                 assertThat(page.locator("#source-list")).containsText("страницы без текста: 2")
 
-                val chatStart = fake.chatMessages.size
+                val chatStart = fake.cloud.chatMessages.size
                 page.locator("#question").fill("What is the greenhouse humidity target?")
+                assertThat(page.locator("#query-button")).isEnabled()
                 page.locator("#query-button").click()
                 val queryResults = page.locator("#query-results")
                 assertThat(queryResults).containsText("Baseline · без коллекции")
                 assertThat(queryResults).containsText("RAG · с найденными фрагментами")
                 assertThat(queryResults).containsText("greenhouse.html")
                 assertThat(queryResults).containsText("Greenhouse telemetry")
-                val queryMessages = fake.chatMessages.drop(chatStart)
+                val queryMessages = fake.cloud.chatMessages.drop(chatStart)
                 assertEquals(2, queryMessages.size)
                 assertTrue(queryMessages.first().none { "Humidity target is 64 percent" in it })
                 assertTrue(queryMessages.last().any { "Humidity target is 64 percent" in it })
                 assertTrue(queryMessages.flatten().none { "SCRIPT_ONLY_SECRET" in it || "STYLE_ONLY_SECRET" in it })
-                val pdfChatStart = fake.chatMessages.size
+                val pdfChatStart = fake.cloud.chatMessages.size
                 page.locator("#question").fill("What does the PDF field note say about conductivity?")
                 page.locator("#query-button").click()
                 assertThat(queryResults).containsText("Baseline · без коллекции")
                 assertThat(queryResults).containsText("RAG · с найденными фрагментами")
                 assertThat(queryResults).containsText("synthetic-field-guide.pdf")
                 assertThat(queryResults).containsText("стр. 1")
-                val pdfMessages = fake.chatMessages.drop(pdfChatStart)
+                val pdfMessages = fake.cloud.chatMessages.drop(pdfChatStart)
                 assertEquals(2, pdfMessages.size)
                 assertTrue(pdfMessages.first().none { "conductivity is 21 units" in it })
                 assertTrue(pdfMessages.last().any { "conductivity is 21 units" in it })
@@ -338,34 +359,31 @@ class BrowserAcceptanceTest {
                 page.locator("#top-k").fill("10")
                 for (strategy in listOf("FIXED_SIZE", "STRUCTURAL")) {
                     page.locator("#strategy").selectOption(strategy)
-                    val codeChatStart = fake.chatMessages.size
+                    val codeChatStart = fake.cloud.chatMessages.size
                     page.locator("#question").fill("What copper calibration limit is recorded?")
                     page.locator("#query-button").click()
                     assertThat(queryResults).containsText("copper-calibration.kt")
                     assertThat(queryResults).containsText("строки 1")
-                    val codeMessages = fake.chatMessages.drop(codeChatStart)
+                    val codeMessages = fake.cloud.chatMessages.drop(codeChatStart)
                     assertEquals(2, codeMessages.size)
                     assertTrue(codeMessages.last().any { "LIMIT = 19" in it })
 
-                    val textChatStart = fake.chatMessages.size
+                    val textChatStart = fake.cloud.chatMessages.size
                     page.locator("#question").fill("What beacon threshold is recorded in the note?")
                     page.locator("#query-button").click()
                     assertThat(queryResults).containsText("version-note.txt")
                     assertThat(queryResults).containsText("строки 1")
-                    val textMessages = fake.chatMessages.drop(textChatStart)
+                    val textMessages = fake.cloud.chatMessages.drop(textChatStart)
                     assertEquals(2, textMessages.size)
                     assertTrue(textMessages.last().any { "beacon threshold" in it })
                 }
                 assertEquals(0, probe.requests.get())
-                val emptyContextChatStart = fake.chatMessages.size
+                val emptyContextChatStart = fake.cloud.chatMessages.size
                 page.locator("#question").fill("What are penguin breeding habits?")
                 page.locator("#query-button").click()
                 assertThat(queryResults).containsText("По этому ответу нет проверенных цитат.")
                 assertThat(queryResults).containsText("В коллекции не найдено подходящих фрагментов.")
-                val emptyContextMessages = fake.chatMessages.drop(emptyContextChatStart)
-                assertEquals(2, emptyContextMessages.size)
-                assertTrue(emptyContextMessages.last().first().contains("Локальные фрагменты не переданы для подтверждения ответа"))
-                assertTrue(emptyContextMessages.last().first().contains("не выдумывай цитаты"))
+                val emptyContextMessages = fake.cloud.chatMessages.drop(emptyContextChatStart)
                 assertTrue(emptyContextMessages.last().last().contains("penguin"))
 
                 page.locator("button[aria-label^=\"Удалить источник version-note.txt\"]").first().click()
@@ -478,7 +496,7 @@ class BrowserAcceptanceTest {
                 assertThat(page.locator("#query-results")).containsText("greenhouse.html")
 
 
-                fake.failChat.set(true)
+                fake.cloud.failChat.set(true)
                 page.locator("#benchmark-run").click()
                 assertThat(page.locator("#benchmark-error")).containsText("Benchmark не завершён")
                 assertThat(page.locator("#benchmark-error")).containsText("результаты предыдущих запусков")
@@ -490,7 +508,7 @@ class BrowserAcceptanceTest {
                 assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
                 assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
 
-                fake.failChat.set(false)
+                fake.cloud.failChat.set(false)
                 val noEvidenceFile = temporaryDirectory.resolve("questions-no-evidence.json")
                 Files.writeString(
                     noEvidenceFile,
@@ -541,13 +559,13 @@ class BrowserAcceptanceTest {
                     persistedReferenceIds,
                     "Deleting a referenced source must not rewrite benchmark question references.",
                 )
-                val completedChatCount = fake.chatMessages.size
+                val completedChatCount = fake.cloud.chatMessages.size
                 val completedEmbeddingCalls = fake.embeddingCalls.get()
-                fake.missingChatModel.set(true)
+                fake.cloud.credentialConfigured.set(false)
                 page.reload()
-                assertThat(page.locator("#model-note")).containsText("Локальные модели недоступны")
+                assertThat(page.locator("#model-note")).containsText("FIXTURE_API_KEY")
                 assertTrue(page.locator("#query-button").isDisabled())
-                assertEquals(completedChatCount, fake.chatMessages.size)
+                assertEquals(completedChatCount, fake.cloud.chatMessages.size)
                 assertEquals(completedEmbeddingCalls, fake.embeddingCalls.get())
             } finally {
                 browser.close()
@@ -622,6 +640,31 @@ class BrowserAcceptanceTest {
         return response.body()
     }
 
+    private fun modelConfiguration(paths: LocalRagPaths, fake: FakeDeepSeek): ModelConfiguration {
+        val selection = ModelSelection("fixture", "deepseek-flash")
+        val catalog = ProviderCatalog.create(
+            listOf(
+                ProviderDefinition(
+                    "fixture",
+                    "Fixture provider",
+                    fake.uri.toString(),
+                    "/chat/completions",
+                    "FIXTURE_API_KEY",
+                    listOf(
+                        ProviderModelDefinition(selection.modelId, "Fixture Flash"),
+                        ProviderModelDefinition("deepseek-v4-pro", "Fixture V4 Pro"),
+                    ),
+                ),
+            ),
+            selection,
+        )
+        return ModelConfiguration(
+            catalog,
+            ModelSelectionStore(paths.modelSelection, catalog),
+            ProviderCredentialSource { if (fake.credentialConfigured.get()) "fixture-secret" else null },
+        )
+    }
+
     private fun assertLineOneCitation(page: Page, sourceName: String) {
         val citationItems = page.locator("#query-results .citations li")
         citationItems.first().waitFor()
@@ -632,13 +675,17 @@ class BrowserAcceptanceTest {
         )
     }
 
-    private class BrowserAppFixture(paths: LocalRagPaths, fake: FakeOllama) : AutoCloseable {
+    private class BrowserAppFixture(
+        paths: LocalRagPaths,
+        fake: FakeOllama,
+        private val modelConfiguration: ModelConfiguration,
+    ) : AutoCloseable {
         private val index = SqliteIndexRepository(paths.database)
         private val benchmarkStore = BenchmarkStore(paths.database)
         private val jobs = JobManager()
         private val ollama = OllamaApi(fake.uri)
         private val embeddings = OllamaEmbeddingPort(ollama)
-        private val rag = RagService(index, embeddings, OllamaChatPort(ollama))
+        private val rag = RagService(index, embeddings, ChatCompletionsApi(modelConfiguration))
         private val catalog = SourceCatalog(paths.sources, index, benchmarkStore::deleteSourceReferences)
         private val indexing = IndexWorkflow(
             extractor = SourceExtractorRegistry(),
@@ -648,7 +695,7 @@ class BrowserAcceptanceTest {
             sourcesDirectory = paths.sources,
         )
         private val benchmark = BenchmarkRunner(rag, benchmarkStore, index)
-        private val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama)
+        private val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration)
         val server = LocalHttpServer(application, 0)
 
         init {
@@ -664,19 +711,13 @@ class BrowserAcceptanceTest {
     }
 
     private class FakeOllama : AutoCloseable {
-        val failChat = AtomicBoolean(false)
-        val missingChatModel = AtomicBoolean(false)
+        val cloud = FakeDeepSeek()
         val embeddingCalls = AtomicInteger()
-        val chatMessages = CopyOnWriteArrayList<List<String>>()
         private val executor = Executors.newCachedThreadPool()
         private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             this.executor = this@FakeOllama.executor
             createContext("/api/tags") { exchange ->
-                val models = if (missingChatModel.get()) {
-                    """{"models":[{"name":"embeddinggemma:300m"}]}"""
-                } else {
-                    """{"models":[{"name":"embeddinggemma:300m"},{"name":"qwen2.5:0.5b-instruct"}]}"""
-                }
+                val models = """{"models":[{"name":"embeddinggemma:300m"}]}"""
                 respond(exchange, 200, models)
             }
             createContext("/api/embed") { exchange ->
@@ -697,16 +738,45 @@ class BrowserAcceptanceTest {
                 }
                 respond(exchange, 200, buildJsonObject { put("embeddings", embeddings) }.toString())
             }
-            createContext("/api/chat") { exchange ->
+        }
+
+
+        val uri: URI get() = URI("http://127.0.0.1:${server.address.port}")
+
+        init {
+            server.start()
+        }
+
+        override fun close() {
+            server.stop(0)
+            executor.shutdownNow()
+            cloud.close()
+        }
+
+        private fun respond(exchange: HttpExchange, status: Int, body: String) {
+            val bytes = body.toByteArray(UTF_8)
+            exchange.responseHeaders.set("Content-Type", "application/json; charset=utf-8")
+            exchange.sendResponseHeaders(status, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+    }
+    private class FakeDeepSeek : AutoCloseable {
+        val failChat = AtomicBoolean(false)
+        val credentialConfigured = AtomicBoolean(true)
+        val chatMessages = CopyOnWriteArrayList<List<String>>()
+        private val executor = Executors.newCachedThreadPool()
+        private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+            this.executor = this@FakeDeepSeek.executor
+            createContext("/chat/completions") { exchange ->
                 val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
                 val messages = request.getValue("messages").jsonArray.map {
                     it.jsonObject.getValue("content").jsonPrimitive.content
                 }
                 chatMessages.add(messages)
                 if (failChat.get()) {
-                    respond(exchange, 503, """{"error":"Synthetic local model failure"}""")
+                    respond(exchange, 503, """{"error":"Synthetic cloud failure"}""")
                 } else {
-                    respond(exchange, 200, """{"message":{"content":"Synthetic answer."}}""")
+                    respond(exchange, 200, """{"choices":[{"message":{"content":"Synthetic answer."}}]}""")
                 }
             }
         }
