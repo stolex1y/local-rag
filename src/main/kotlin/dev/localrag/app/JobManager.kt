@@ -21,6 +21,7 @@ data class JobSnapshot(
     val bytesDone: Long,
     val bytesTotal: Long,
     val currentSource: String? = null,
+    val currentPosition: String? = null,
     val succeeded: Int = 0,
     val failed: Int = 0,
     val elapsedMs: Long,
@@ -50,6 +51,7 @@ class JobManager(
         var filesDone: Int = 0
         var bytesDone: Long = 0
         var currentSource: String? = null
+        var currentPosition: String? = null
         var succeeded: Int = 0
         var failed: Int = 0
         var error: String? = null
@@ -64,6 +66,7 @@ class JobManager(
             bytesDone = bytesDone.coerceAtMost(bytesTotal),
             bytesTotal = bytesTotal,
             currentSource = currentSource,
+            currentPosition = currentPosition,
             succeeded = succeeded,
             failed = failed,
             elapsedMs = (now - startedAt).coerceAtLeast(0L),
@@ -99,6 +102,7 @@ class JobManager(
                                 job.filesDone = update.filesDone.coerceIn(0, job.filesTotal)
                                 job.bytesDone = update.bytesDone.coerceIn(0, job.bytesTotal)
                                 job.currentSource = update.currentSource
+                                job.currentPosition = update.currentPosition
                                 job.succeeded = update.succeeded.coerceIn(0, job.filesTotal)
                                 job.failed = update.failed.coerceIn(0, job.filesTotal)
                             }
@@ -109,12 +113,14 @@ class JobManager(
                             job.filesDone = job.filesTotal
                             job.bytesDone = job.bytesTotal
                             job.currentSource = null
+                            job.currentPosition = null
                         }
                     } catch (error: Exception) {
                         synchronized(lock) {
                             job.state = "failed"
                             job.phase = "failed"
                             job.currentSource = null
+                            job.currentPosition = null
                             job.error = safeError(error)
                         }
                     } finally {

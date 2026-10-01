@@ -133,6 +133,7 @@ data class IndexProgressUpdate(
     val currentSource: String? = null,
     val succeeded: Int = 0,
     val failed: Int = 0,
+    val currentPosition: String? = null,
 )
 
 data class IndexOutcome(

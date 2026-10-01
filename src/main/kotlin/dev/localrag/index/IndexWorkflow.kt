@@ -8,6 +8,7 @@ import dev.localrag.domain.IndexProgressUpdate
 import dev.localrag.domain.IndexRepository
 import dev.localrag.domain.SourceRecord
 import dev.localrag.domain.SourceStatus
+import dev.localrag.domain.SourceType
 import dev.localrag.domain.StoredChunk
 import dev.localrag.domain.StoredSource
 import dev.localrag.ollama.LocalModelException
@@ -44,7 +45,8 @@ class IndexWorkflow(
         var completedBytes = 0L
         sources.forEach { stored ->
             val record = stored.record
-            progress(IndexProgressUpdate("extracting", completedFiles, sources.size, completedBytes, totalBytes, record.name, indexed.size, failed.size))
+            val initialPosition = if (record.type == SourceType.PDF) "подготовка PDF" else null
+            progress(IndexProgressUpdate("extracting", completedFiles, sources.size, completedBytes, totalBytes, record.name, indexed.size, failed.size, initialPosition))
             val storedPath = stored.storageKey?.let(sourcesDirectory::resolve)?.normalize()
             try {
                 require(storedPath != null && storedPath.parent == sourcesDirectory.normalize()) { "Storage key is invalid." }
@@ -89,6 +91,7 @@ class IndexWorkflow(
         index.clearChunks(record.sourceId)
         val pending = ChunkStrategy.entries.associateWith { mutableListOf<ChunkDraft>() }.toMutableMap()
         val written = ChunkStrategy.entries.associateWith { 0 }.toMutableMap()
+        var currentPosition: String? = if (record.type == SourceType.PDF) "подготовка PDF" else null
         val accumulators = chunkersByStrategy.mapValues { (strategy, chunker) ->
             chunker.accumulator(record) { draft ->
                 val batch = pending.getValue(strategy)
@@ -97,11 +100,28 @@ class IndexWorkflow(
                     persistBatch(record.sourceId, batch)
                     written[strategy] = written.getValue(strategy) + batch.size
                     batch.clear()
-                    progress(IndexProgressUpdate("embedding", filesDone, filesTotal, bytesDone, bytesTotal, record.name, succeeded, failed))
+                    progress(IndexProgressUpdate("embedding", filesDone, filesTotal, bytesDone, bytesTotal, record.name, succeeded, failed, currentPosition))
                 }
             }
         }
         val summary = extractor.extract(record, path) { segment ->
+            val page = segment.location.pageEnd?.let { "страница $it" }
+            if (page != null && page != currentPosition) {
+                currentPosition = page
+                progress(
+                    IndexProgressUpdate(
+                        "extracting",
+                        filesDone,
+                        filesTotal,
+                        bytesDone,
+                        bytesTotal,
+                        record.name,
+                        succeeded,
+                        failed,
+                        currentPosition,
+                    ),
+                )
+            }
             accumulators.values.forEach { accumulator -> accumulator.accept(segment) }
         }
         accumulators.values.forEach(ChunkAccumulator::finish)

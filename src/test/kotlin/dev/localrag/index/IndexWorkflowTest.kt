@@ -103,6 +103,54 @@ class IndexWorkflowTest {
         }
     }
 
+    @Test
+    fun `indexing reports each PDF page before a single source completes`() {
+        val sourcesDirectory = temporaryDirectory.resolve("page-progress-sources")
+        val repository = SqliteIndexRepository(temporaryDirectory.resolve("page-progress.sqlite"))
+        try {
+            val catalog = SourceCatalog(sourcesDirectory, repository)
+            val batch = catalog.beginImport(listOf(ImportFileMetadata("book.pdf", 12)))
+            val imported = batch.files.single()
+            catalog.writeImportedFile(batch.importId, imported.fileId, ByteArrayInputStream("%PDF-fixture".toByteArray()))
+            catalog.finishImport(batch.importId)
+            val updates = mutableListOf<IndexProgressUpdate>()
+            val extractor = object : SourceExtractor {
+                override fun extract(source: SourceRecord, storedFile: Path, emit: (SourceSegment) -> Unit): ExtractionSummary {
+                    (1..3).forEach { page ->
+                        emit(SourceSegment("Book page $page contains indexable text.", "Body", SourceLocation(page, page)))
+                    }
+                    return ExtractionSummary(3, pagesTotal = 3)
+                }
+            }
+            val workflow = IndexWorkflow(
+                extractor = extractor,
+                chunkers = listOf(FixedSizeChunker(), StructuralChunker()),
+                embeddings = FixtureEmbeddings(),
+                index = repository,
+                sourcesDirectory = sourcesDirectory,
+            )
+
+            workflow.index(repository.pendingSources()) { updates += it }
+
+            assertEquals(
+                "подготовка PDF",
+                updates.first { it.phase == "extracting" }.currentPosition,
+            )
+            assertEquals(
+                listOf("страница 1", "страница 2", "страница 3"),
+                updates.mapNotNull(IndexProgressUpdate::currentPosition)
+                    .filter { it.startsWith("страница ") }
+                    .distinct(),
+            )
+            val lastPageUpdate = updates.indexOfLast { it.currentPosition == "страница 3" }
+            val sourceComplete = updates.indexOfFirst { it.phase == "source-complete" }
+            assertTrue(lastPageUpdate >= 0 && lastPageUpdate < sourceComplete)
+            assertEquals(1, updates[sourceComplete].filesDone)
+        } finally {
+            repository.close()
+        }
+    }
+
     private class FixtureSourceExtractor : SourceExtractor {
         override fun extract(source: SourceRecord, storedFile: Path, emit: (SourceSegment) -> Unit): ExtractionSummary {
             when (source.name) {

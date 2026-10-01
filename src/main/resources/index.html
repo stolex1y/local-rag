@@ -127,15 +127,14 @@
 <body>
   <header class="hero">
     <div class="wrap">
-      <p class="eyebrow">Local RAG · локальные источники, облачная генерация</p>
+      <p class="eyebrow">Local RAG</p>
       <h1>Соберите коллекцию и задавайте вопросы по источникам</h1>
-      <p class="intro">Файлы, извлечение текста, embeddings, поиск, индекс и SQLite остаются на этом компьютере. Для baseline выбранный облачный провайдер получает только вопрос; для RAG — вопрос и текст только локально найденных фрагментов. Исходные файлы, имена и метаданные источников, embeddings и benchmark expected facts не отправляются.</p>
     </div>
   </header>
   <main class="wrap">
     <section class="panel" aria-labelledby="status-heading">
       <div class="panel-head">
-        <div><h2 id="status-heading">Состояние коллекции и модели</h2><p class="muted">Ollama используется только локально для embedding-модели.</p></div>
+        <div><h2 id="status-heading">Состояние коллекции и модели</h2></div>
         <button class="secondary" id="refresh-button" type="button">Обновить</button>
       </div>
       <div class="metrics" id="status-metrics" aria-live="polite">
@@ -143,7 +142,7 @@
       </div>
       <div class="form-grid">
         <div class="field">
-          <label for="provider-select">Облачный провайдер</label>
+          <label for="provider-select">Провайдер</label>
           <select id="provider-select"></select>
         </div>
         <div class="field">
@@ -160,7 +159,7 @@
 
     <section class="panel" aria-labelledby="sources-heading">
       <div class="panel-head">
-        <div><h2 id="sources-heading">Источники</h2><p class="muted">PDF без OCR; TXT, Markdown, HTML и текстовый исходный код в UTF-8. Без веб-ссылок и сетевой загрузки. До 256 MiB на файл и 512 MiB ожидающих источников на один запуск индексации.</p></div>
+        <div><h2 id="sources-heading">Источники</h2><p class="muted">PDF без OCR; TXT, Markdown, HTML и текстовый исходный код в UTF-8.</p></div>
         <button class="secondary" id="refresh-sources" type="button">Обновить список</button>
       </div>
       <form id="upload-form">
@@ -168,7 +167,6 @@
           <div class="field">
             <label for="source-files">Добавить файлы</label>
             <input id="source-files" type="file" multiple accept=".pdf,.txt,.md,.markdown,.html,.htm,.py,.kt,.java,.js,.ts,.tsx,.jsx,.c,.h,.cpp,.cc,.go,.rs,.sh,.css,.json,.yaml,.yml,.toml,.xml,.sql,.rb,.php,.swift,.cs,.scala,.ex,.exs,.lua,.r,.ipynb">
-            <span class="field-hint">Форматы кода принимаются как обычный UTF-8 текст. Исполнять код не требуется.</span>
           </div>
           <button id="upload-button" type="submit">Добавить выбранные</button>
         </div>
@@ -394,12 +392,8 @@
           Object.assign(node("option", model.displayName), { value: model.id }),
         ));
         modelSelect.value = configuration.selectedModelId;
-        const model = provider?.models.find(item => item.id === configuration.selectedModelId);
         const selectionNote = $("#model-selection-note");
-        selectionNote.textContent = [
-          configuration.warning,
-          `Выбрано: ${provider?.displayName || configuration.selectedProviderId} · ${model?.displayName || configuration.selectedModelId} (${configuration.selectedProviderId}/${configuration.selectedModelId}). Настройка выбора хранится локально.`,
-        ].filter(Boolean).join(" ");
+        selectionNote.textContent = configuration.warning || "";
         selectionNote.className = configuration.warning ? "notice" : "muted";
       }
 
@@ -452,11 +446,14 @@
         state.modelsAvailable = state.embeddingAvailable && Boolean(configuration?.credentialConfigured);
         const note = $("#model-note");
         if (!state.embeddingAvailable) {
+          note.hidden = false;
           note.textContent = `Локальная embedding-модель недоступна. Запустите Ollama и загрузите ${models.embedding}.`;
         } else if (!configuration?.credentialConfigured) {
+          note.hidden = false;
           note.textContent = `Ollama embedding ${models.embedding} доступен. Для облачной генерации задайте ${configuration?.credentialEnv || "DEEPSEEK_API_KEY"} и перезапустите приложение. Ключ хранится только в окружении.`;
         } else {
-          note.textContent = `Ollama embedding ${models.embedding} доступен; генерация использует ${configuration.selectedProviderId}/${configuration.selectedModelId}. Провайдер получает вопрос baseline либо вопрос и найденный текст RAG.`;
+          note.textContent = "";
+          note.hidden = true;
         }
         note.className = state.modelsAvailable ? "success" : "notice";
         state.activeJob = status.activeJob && status.activeJob.state !== "completed" && status.activeJob.state !== "failed" ? status.activeJob : null;
@@ -472,16 +469,22 @@
           meter.hidden = true;
           return;
         }
-        const isBenchmark = job.kind === "BENCHMARK";
-        const total = isBenchmark ? job.filesTotal : job.filesTotal;
+        const total = job.filesTotal;
         const done = job.filesDone;
+        const singlePdfIndex = job.kind === "INDEX" && total === 1 && job.currentPosition !== null;
         const name = job.currentSource ? ` · ${job.currentSource}` : "";
-        const bytes = job.kind === "INDEX" ? ` · ${formatBytes(job.bytesDone)} / ${formatBytes(job.bytesTotal)}` : "";
+        const detail = job.currentPosition ? ` · ${job.currentPosition}` : "";
+        const bytes = job.kind === "INDEX" && !singlePdfIndex ? ` · ${formatBytes(job.bytesDone)} / ${formatBytes(job.bytesTotal)}` : "";
         const phase = job.phase === "embedding" ? "Создание embedding" : job.phase === "extracting" ? "Извлечение текста" : job.phase === "benchmark" || job.phase === "rag" || job.phase === "baseline" ? "Сравнение ответов" : job.phase;
-        line.textContent = `${job.kind === "INDEX" ? "Индексация" : "Benchmark"}: ${phase} · ${done} / ${total}${bytes}${name} · готово ${job.succeeded}, ошибок ${job.failed}`;
+        const fileCount = singlePdfIndex ? "" : ` · ${done} / ${total}`;
+        line.textContent = `${job.kind === "INDEX" ? "Индексация" : "Benchmark"}: ${phase}${fileCount}${bytes}${name}${detail} · готово ${job.succeeded}, ошибок ${job.failed}`;
         line.hidden = false;
         meter.max = Math.max(1, total);
-        meter.value = Math.min(done, total);
+        if (job.kind === "INDEX" && job.currentPosition !== null) {
+          meter.removeAttribute("value");
+        } else {
+          meter.value = Math.min(done, total);
+        }
         meter.hidden = false;
       }
 

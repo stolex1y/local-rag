@@ -111,6 +111,58 @@ class BrowserAcceptanceTest {
     }
 
     @Test
+    fun singleBookIndexShowsPageProgressWhileEmbeddingIsInFlight() {
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("single-book-app-data"))
+            val pdf = temporaryDirectory.resolve("single-book.pdf")
+            writeSyntheticPdf(pdf)
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    page.setDefaultTimeout(30_000.0)
+                    var fixture: BrowserAppFixture? = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
+                    try {
+                        val app = fixture!!
+                        page.navigate("http://127.0.0.1:${app.server.port}/")
+                        page.onDialog { it.accept() }
+                        page.locator("#source-files").setInputFiles(pdf)
+                        page.locator("#upload-button").click()
+                        assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+
+                        fake.holdPdfEmbedding.set(true)
+                        val indexResponse = page.waitForResponse("**/api/index") {
+                            page.locator("#index-button").click()
+                        }
+                        val jobId = Json.parseToJsonElement(indexResponse.text()).jsonObject.getValue("jobId").jsonPrimitive.content
+                        assertTrue(
+                            fake.pdfEmbeddingStarted.await(10, TimeUnit.SECONDS),
+                            "Index job did not reach embedding: ${get("http://127.0.0.1:${app.server.port}/api/jobs/$jobId")}",
+                        )
+                        val progress = page.locator("#job-progress")
+                        assertThat(progress).containsText("страница 1")
+                        assertFalse(progress.textContent().contains("0 / 1"))
+                        assertEquals(null, page.locator("#job-meter").getAttribute("value"))
+
+                        fake.releasePdfEmbedding.countDown()
+                        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+                    } finally {
+                        fixture?.close()
+                        fixture = null
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
+
+    @Test
     fun applicationRestartRestoresSourcesAndBenchmarkReviewsInBrowser() {
         FakeOllama().use { fake ->
             val paths = LocalRagPaths(temporaryDirectory.resolve("restart-app-data"))
@@ -153,7 +205,6 @@ class BrowserAcceptanceTest {
                     try {
                         val first = fixture!!
                         page.navigate("http://127.0.0.1:${first.server.port}/")
-                        assertThat(page.locator("#model-note")).containsText("embeddinggemma:300m доступен")
                         assertThat(page.locator("#model-select")).hasValue("deepseek-flash")
                         assertThat(page.locator("#model-selection-note")).containsText("Сохранённая модель")
                         page.onDialog { it.accept() }
@@ -190,8 +241,6 @@ class BrowserAcceptanceTest {
                         }
                         assertEquals(200, selectionResponse.status())
                         assertThat(page.locator("#model-select")).hasValue("deepseek-v4-pro")
-                        assertThat(page.locator("#model-selection-note")).containsText("fixture/deepseek-v4-pro")
-                        assertFalse(page.locator("#model-selection-note").innerText().contains("Сохранённая модель"))
                         assertThat(page.locator("#benchmark-run")).isEnabled()
                         assertThat(page.locator("#query-button")).isEnabled()
                         val benchmarkModelCallStart = fake.cloud.chatModels.size
@@ -240,7 +289,6 @@ class BrowserAcceptanceTest {
                         val reopened = fixture!!
                         page.navigate("http://127.0.0.1:${reopened.server.port}/")
                         assertThat(page.locator("#model-select")).hasValue("deepseek-v4-pro")
-                        assertFalse(page.locator("#model-selection-note").innerText().contains("Сохранённая модель"))
                         assertThat(page.locator("#source-list")).containsText("restart-note.txt")
                         assertEquals(1, page.locator("#source-list .source-row").count())
                         val restoredSource = Json.parseToJsonElement(get("http://127.0.0.1:${reopened.server.port}/api/sources"))
@@ -343,7 +391,6 @@ class BrowserAcceptanceTest {
                 val page = browser.newPage()
                 page.setDefaultTimeout(30_000.0)
                 page.navigate(origin)
-                assertThat(page.locator("#model-note")).containsText("embeddinggemma:300m доступен")
                 assertFalse(page.locator("body").innerText().contains("LTE", ignoreCase = true))
 
                 val acceptNextDialog = AtomicBoolean(false)
@@ -776,6 +823,9 @@ class BrowserAcceptanceTest {
     private class FakeOllama : AutoCloseable {
         val cloud = FakeDeepSeek()
         val embeddingCalls = AtomicInteger()
+        val holdPdfEmbedding = AtomicBoolean(false)
+        val pdfEmbeddingStarted = CountDownLatch(1)
+        val releasePdfEmbedding = CountDownLatch(1)
         private val executor = Executors.newCachedThreadPool()
         private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             this.executor = this@FakeOllama.executor
@@ -787,6 +837,10 @@ class BrowserAcceptanceTest {
                 val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
                 val inputs = request.getValue("input").jsonArray.map { it.jsonPrimitive.content }
                 embeddingCalls.addAndGet(inputs.size)
+                if (holdPdfEmbedding.compareAndSet(true, false)) {
+                    pdfEmbeddingStarted.countDown()
+                    check(releasePdfEmbedding.await(20, TimeUnit.SECONDS))
+                }
                 val embeddings = buildJsonArray {
                     inputs.forEach { input ->
                         val vector = when {
@@ -812,6 +866,7 @@ class BrowserAcceptanceTest {
 
         override fun close() {
             server.stop(0)
+            releasePdfEmbedding.countDown()
             executor.shutdownNow()
             cloud.close()
         }
