@@ -55,6 +55,8 @@ import java.nio.file.Path
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import com.sun.net.httpserver.HttpExchange
@@ -121,16 +123,39 @@ class BrowserAcceptanceTest {
                 )
                 try {
                     val page = browser.newPage()
+                    page.addInitScript(
+                        """
+                            (() => {
+                              const originalFetch = window.fetch.bind(window);
+                              window.__holdModelSelection = false;
+                              window.__modelSelectionStarted = false;
+                              window.__releaseModelSelection = null;
+                              window.fetch = (input, init) => {
+                                const url = new URL(typeof input === "string" ? input : input.url, window.location.href);
+                                if (url.pathname === "/api/models/selection" && window.__holdModelSelection) {
+                                  window.__modelSelectionStarted = true;
+                                  return new Promise((resolve, reject) => {
+                                    window.__releaseModelSelection = () => {
+                                      window.__holdModelSelection = false;
+                                      originalFetch(input, init).then(resolve, reject);
+                                    };
+                                  });
+                                }
+                                return originalFetch(input, init);
+                              };
+                            })();
+                        """.trimIndent(),
+                    )
                     page.setDefaultTimeout(30_000.0)
+                    Files.createDirectories(paths.modelSelection.parent)
+                    Files.writeString(paths.modelSelection, """{"providerId":"fixture","modelId":"removed-model"}""")
                     var fixture: BrowserAppFixture? = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
                     try {
                         val first = fixture!!
                         page.navigate("http://127.0.0.1:${first.server.port}/")
                         assertThat(page.locator("#model-note")).containsText("embeddinggemma:300m доступен")
-                        page.waitForResponse("**/api/models/selection") {
-                            page.locator("#model-select").selectOption("deepseek-v4-pro")
-                        }
-                        assertThat(page.locator("#model-selection-note")).containsText("fixture/deepseek-v4-pro")
+                        assertThat(page.locator("#model-select")).hasValue("deepseek-flash")
+                        assertThat(page.locator("#model-selection-note")).containsText("Сохранённая модель")
                         page.onDialog { it.accept() }
 
                         page.locator("#source-files").setInputFiles(sourceFile)
@@ -152,8 +177,44 @@ class BrowserAcceptanceTest {
                         page.locator("#benchmark-file").setInputFiles(questionsFile)
                         page.locator("#benchmark-upload").click()
                         assertThat(page.locator("#benchmark-error")).containsText("Набор сохранён")
+                        assertTrue(page.locator("#query-button").isEnabled())
+                        assertTrue(page.locator("#benchmark-run").isEnabled())
+                        page.evaluate("window.__holdModelSelection = true")
+                        page.locator("#model-select").selectOption("deepseek-v4-pro")
+                        page.waitForFunction("window.__modelSelectionStarted === true")
+                        assertTrue(page.locator("#query-button").isDisabled)
+                        assertTrue(page.locator("#benchmark-run").isDisabled)
+                        assertTrue(page.locator("#model-select").isDisabled)
+                        val selectionResponse = page.waitForResponse("**/api/models/selection") {
+                            page.evaluate("window.__releaseModelSelection(); true")
+                        }
+                        assertEquals(200, selectionResponse.status())
+                        assertThat(page.locator("#model-select")).hasValue("deepseek-v4-pro")
+                        assertThat(page.locator("#model-selection-note")).containsText("fixture/deepseek-v4-pro")
+                        assertFalse(page.locator("#model-selection-note").innerText().contains("Сохранённая модель"))
+                        assertThat(page.locator("#benchmark-run")).isEnabled()
+                        assertThat(page.locator("#query-button")).isEnabled()
+                        val benchmarkModelCallStart = fake.cloud.chatModels.size
+                        fake.cloud.holdNextChat.set(true)
                         page.locator("#benchmark-run").click()
+                        assertTrue(fake.cloud.firstChatStarted.await(10, TimeUnit.SECONDS))
+                        assertThat(page.locator("#job-progress")).isVisible()
+                        page.waitForResponse("**/api/models/selection") {
+                            page.locator("#model-select").selectOption("deepseek-flash")
+                        }
+                        assertThat(page.locator("#model-select")).hasValue("deepseek-flash")
+                        assertThat(page.locator("#model-select")).isEnabled()
+                        assertThat(page.locator("#job-progress")).isVisible()
+                        assertTrue(page.locator("#benchmark-upload").isDisabled)
+                        assertTrue(page.locator("#query-button").isDisabled)
+                        fake.cloud.releaseFirstChat.countDown()
                         assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
+                        val benchmarkModels = fake.cloud.chatModels.drop(benchmarkModelCallStart)
+                        assertEquals(30, benchmarkModels.size)
+                        assertTrue(benchmarkModels.all { it == "deepseek-v4-pro" })
+                        page.waitForResponse("**/api/models/selection") {
+                            page.locator("#model-select").selectOption("deepseek-v4-pro")
+                        }
                         val apiResults = Json.parseToJsonElement(get("http://127.0.0.1:${first.server.port}/api/benchmark/results"))
                             .jsonObject.getValue("results").jsonArray
                         assertEquals(20, apiResults.size)
@@ -179,6 +240,7 @@ class BrowserAcceptanceTest {
                         val reopened = fixture!!
                         page.navigate("http://127.0.0.1:${reopened.server.port}/")
                         assertThat(page.locator("#model-select")).hasValue("deepseek-v4-pro")
+                        assertFalse(page.locator("#model-selection-note").innerText().contains("Сохранённая модель"))
                         assertThat(page.locator("#source-list")).containsText("restart-note.txt")
                         assertEquals(1, page.locator("#source-list .source-row").count())
                         val restoredSource = Json.parseToJsonElement(get("http://127.0.0.1:${reopened.server.port}/api/sources"))
@@ -657,6 +719,7 @@ class BrowserAcceptanceTest {
                 ),
             ),
             selection,
+            allowLoopbackHttpForTests = true,
         )
         return ModelConfiguration(
             catalog,
@@ -764,6 +827,10 @@ class BrowserAcceptanceTest {
         val failChat = AtomicBoolean(false)
         val credentialConfigured = AtomicBoolean(true)
         val chatMessages = CopyOnWriteArrayList<List<String>>()
+        val chatModels = CopyOnWriteArrayList<String>()
+        val holdNextChat = AtomicBoolean(false)
+        val firstChatStarted = CountDownLatch(1)
+        val releaseFirstChat = CountDownLatch(1)
         private val executor = Executors.newCachedThreadPool()
         private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             this.executor = this@FakeDeepSeek.executor
@@ -773,6 +840,11 @@ class BrowserAcceptanceTest {
                     it.jsonObject.getValue("content").jsonPrimitive.content
                 }
                 chatMessages.add(messages)
+                chatModels.add(request.getValue("model").jsonPrimitive.content)
+                if (holdNextChat.compareAndSet(true, false)) {
+                    firstChatStarted.countDown()
+                    check(releaseFirstChat.await(20, TimeUnit.SECONDS))
+                }
                 if (failChat.get()) {
                     respond(exchange, 503, """{"error":"Synthetic cloud failure"}""")
                 } else {
@@ -790,6 +862,7 @@ class BrowserAcceptanceTest {
         override fun close() {
             server.stop(0)
             executor.shutdownNow()
+            releaseFirstChat.countDown()
         }
 
         private fun respond(exchange: HttpExchange, status: Int, body: String) {

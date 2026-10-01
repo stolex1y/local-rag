@@ -241,7 +241,7 @@
       "use strict";
 
       const $ = (selector, root = document) => root.querySelector(selector);
-      const state = { modelsAvailable: false, embeddingAvailable: false, modelConfiguration: null, activeJob: null, sources: [], benchmark: null, results: [] };
+      const state = { modelsAvailable: false, embeddingAvailable: false, modelConfiguration: null, modelSelectionPending: false, activeJob: null, sources: [], benchmark: null, results: [] };
       const MAX_FILE_BYTES = 256 * 1024 * 1024;
       const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
       const MAX_BENCHMARK_FILE_BYTES = 1024 * 1024;
@@ -395,20 +395,29 @@
         ));
         modelSelect.value = configuration.selectedModelId;
         const model = provider?.models.find(item => item.id === configuration.selectedModelId);
-        $("#model-selection-note").textContent =
-          `Выбрано: ${provider?.displayName || configuration.selectedProviderId} · ${model?.displayName || configuration.selectedModelId} (${configuration.selectedProviderId}/${configuration.selectedModelId}). Настройка выбора хранится локально.`;
+        const selectionNote = $("#model-selection-note");
+        selectionNote.textContent = [
+          configuration.warning,
+          `Выбрано: ${provider?.displayName || configuration.selectedProviderId} · ${model?.displayName || configuration.selectedModelId} (${configuration.selectedProviderId}/${configuration.selectedModelId}). Настройка выбора хранится локально.`,
+        ].filter(Boolean).join(" ");
+        selectionNote.className = configuration.warning ? "notice" : "muted";
       }
 
       async function saveModelSelection(providerId, modelId) {
+        if (state.modelSelectionPending) return;
+        state.modelSelectionPending = true;
+        updateControls();
         try {
           const configuration = await request("/api/models/selection", jsonOptions("PUT", { providerId, modelId }));
           renderModelConfiguration(configuration);
-          renderStatus({ ...state.lastStatus, models: state.lastStatus.models });
-          updateControls();
+          renderStatus(await request("/api/status"));
           message("status-error", "");
         } catch (error) {
           message("status-error", error.message);
           await refresh();
+        } finally {
+          state.modelSelectionPending = false;
+          updateControls();
         }
       }
 
@@ -478,11 +487,13 @@
 
       function updateControls() {
         const busy = state.activeJob !== null;
+        $("#provider-select").disabled = state.modelSelectionPending;
+        $("#model-select").disabled = state.modelSelectionPending;
         $("#upload-button").disabled = busy;
         $("#source-files").disabled = busy;
         $("#index-button").disabled = busy || !state.sources.some(source => source.status === "PENDING");
-        $("#query-button").disabled = busy || !state.modelsAvailable || !state.sources.some(source => source.status === "READY");
-        $("#benchmark-run").disabled = busy || !state.modelsAvailable || !state.benchmark?.runnable;
+        $("#query-button").disabled = busy || state.modelSelectionPending || !state.modelsAvailable || !state.sources.some(source => source.status === "READY");
+        $("#benchmark-run").disabled = busy || state.modelSelectionPending || !state.modelsAvailable || !state.benchmark?.runnable;
         $("#benchmark-upload").disabled = busy;
       }
 
@@ -705,6 +716,10 @@
 
       async function askQuestion(event) {
         event.preventDefault();
+        if (state.modelSelectionPending) {
+          message("query-error", "Дождитесь сохранения выбора модели.");
+          return;
+        }
         message("query-error", "");
         const body = { question: $("#question").value, strategy: $("#strategy").value };
         const topK = $("#top-k").value.trim();
@@ -901,6 +916,10 @@
 
       async function runBenchmark() {
         message("benchmark-error", "");
+        if (state.modelSelectionPending) {
+          message("benchmark-error", "Дождитесь сохранения выбора модели.");
+          return;
+        }
         try {
           const job = await request("/api/benchmark/run", jsonOptions("POST", {}));
           state.activeJob = job;

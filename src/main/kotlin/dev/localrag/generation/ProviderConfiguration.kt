@@ -114,12 +114,16 @@ class ProviderCatalog private constructor(
             )
         }
 
-        fun create(providers: List<ProviderDefinition>, defaultSelection: ModelSelection): ProviderCatalog {
+        fun create(
+            providers: List<ProviderDefinition>,
+            defaultSelection: ModelSelection,
+            allowLoopbackHttpForTests: Boolean = false,
+        ): ProviderCatalog {
             require(providers.isNotEmpty()) { "Каталог моделей не должен быть пустым." }
             require(providers.map(ProviderDefinition::id).toSet().size == providers.size) {
                 "Идентификаторы провайдеров должны быть уникальными."
             }
-            providers.forEach(::validateProvider)
+            providers.forEach { validateProvider(it, allowLoopbackHttpForTests) }
             val catalog = ProviderCatalog(providers.toList(), defaultSelection)
             try {
                 catalog.requireSelection(defaultSelection)
@@ -129,7 +133,7 @@ class ProviderCatalog private constructor(
             return catalog
         }
 
-        private fun validateProvider(provider: ProviderDefinition) {
+        private fun validateProvider(provider: ProviderDefinition, allowLoopbackHttpForTests: Boolean) {
             require(provider.id.matches(Regex("[a-z][a-z0-9-]{0,63}"))) { "Некорректный provider id." }
             require(provider.displayName.isNotBlank() && provider.displayName.length <= 80) { "Некорректное display name провайдера." }
             val base = try {
@@ -137,7 +141,8 @@ class ProviderCatalog private constructor(
             } catch (_: Exception) {
                 throw IllegalArgumentException("Некорректный base_url провайдера.")
             }
-            val loopbackHttp = base.scheme == "http" && base.host in setOf("127.0.0.1", "localhost", "::1")
+            val loopbackHttp = allowLoopbackHttpForTests && base.scheme == "http" &&
+                base.host in setOf("127.0.0.1", "localhost", "::1")
             require(base.isAbsolute && (base.scheme == "https" || loopbackHttp) && base.host != null) {
                 "Provider base_url должен использовать HTTPS; HTTP допустим только для loopback fake-сервиса."
             }

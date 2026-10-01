@@ -120,6 +120,54 @@ class ChatCompletionsApiTest {
     }
 
     @Test
+    fun `provider errors and empty answers never expose provider bodies`() {
+        listOf(401, 429, 500).forEach { status ->
+            val privateBody = "provider-body-$status-secret"
+            val fake = FakeProvider { exchange -> respond(exchange, status, privateBody) }
+            fake.use {
+                val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-key" }))
+                val failure = assertFailsWith<CloudModelException> { api.answer(selection, "question") }
+
+                assertContains(failure.message.orEmpty(), "HTTP $status")
+                assertFalse("synthetic-key" in failure.message.orEmpty())
+                assertFalse(privateBody in failure.message.orEmpty())
+            }
+        }
+
+        val emptyFake = FakeProvider { exchange ->
+            respond(exchange, 200, """{"choices":[{"message":{"content":"  "}}]}""")
+        }
+        emptyFake.use {
+            val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-key" }))
+            val failure = assertFailsWith<CloudModelException> { api.answer(selection, "question") }
+            assertContains(failure.message.orEmpty(), "пустой ответ")
+            assertFalse("synthetic-key" in failure.message.orEmpty())
+        }
+    }
+
+    @Test
+    fun `unknown model and connection failure are safe and make no retry`() {
+        val requestCount = AtomicInteger()
+        val fake = FakeProvider { exchange ->
+            requestCount.incrementAndGet()
+            respond(exchange, 200, """{"choices":[{"message":{"content":"unexpected"}}]}""")
+        }
+        val configuration = configuration(fake, ProviderCredentialSource { "synthetic-key" })
+        val api = ChatCompletionsApi(configuration)
+        val unknown = assertFailsWith<CloudModelException> {
+            api.answer(ModelSelection("deepseek", "removed-model"), "question")
+        }
+        assertContains(unknown.message.orEmpty(), "не настроена")
+        assertEquals(0, requestCount.get())
+
+        fake.close()
+        val networkFailure = assertFailsWith<CloudModelException> { api.answer(selection, "question") }
+        assertContains(networkFailure.message.orEmpty(), "Не удалось связаться")
+        assertFalse("synthetic-key" in networkFailure.message.orEmpty())
+        assertEquals(0, requestCount.get())
+    }
+
+    @Test
     fun `invalid authorization header credential is not exposed`() {
         val requestCount = AtomicInteger()
         val fake = FakeProvider { exchange ->
@@ -152,6 +200,7 @@ class ChatCompletionsApiTest {
                 ),
             ),
             selection,
+            allowLoopbackHttpForTests = true,
         )
         return ModelConfiguration(catalog, ModelSelectionStore(temporaryDirectory.resolve("selection.json"), catalog), credentials)
     }

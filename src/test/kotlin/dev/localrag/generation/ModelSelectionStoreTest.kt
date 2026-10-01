@@ -76,6 +76,19 @@ class ModelSelectionStoreTest {
     }
 
     @Test
+    fun `production catalog load rejects loopback HTTP`() {
+        val providersPath = temporaryDirectory.resolve("providers.json")
+        val agentPath = temporaryDirectory.resolve("agent.json")
+        Files.writeString(
+            providersPath,
+            """{"providers":[{"id":"deepseek","display_name":"DeepSeek","base_url":"http://127.0.0.1:8080","chat_completions_path":"/chat/completions","credential_env":"DEEPSEEK_API_KEY","models":[{"id":"deepseek-flash","display_name":"DeepSeek Flash"}]}]}""",
+        )
+        Files.writeString(agentPath, """{"default_provider_id":"deepseek","default_model_id":"deepseek-flash"}""")
+
+        assertFailsWith<IllegalArgumentException> { ProviderCatalog.load(providersPath, agentPath) }
+    }
+
+    @Test
     fun `concurrent selections leave in-memory and persisted values aligned`() {
         val catalog = catalog()
         val settingsPath = temporaryDirectory.resolve("concurrent/model-selection.json")

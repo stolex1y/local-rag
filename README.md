@@ -46,7 +46,7 @@ python3 examples/create_synthetic_corpus.py /tmp/synthetic-observatory.md
 
 ## Benchmark JSON
 
-Корневой объект содержит массив `questions`. Каждая запись имеет уникальный `id`, текст `question`, непустой массив `expectedFacts` и непустой массив `expectedSources`. UUID в примере ниже синтетический: замените его на `sourceId`, скопированный из списка источников.
+Корневой объект содержит массив `questions`. Каждая запись имеет уникальный `id`, текст `question`, непустой массив `expectedFacts` и непустой массив `expectedSources`. UUID в примере ниже синтетический; подставьте настоящий полный `sourceId` из локального API `curl -sS http://127.0.0.1:8765/api/sources`. UI показывает только первые 12 символов ID для сверки.
 ```json
 {
   "questions": [
