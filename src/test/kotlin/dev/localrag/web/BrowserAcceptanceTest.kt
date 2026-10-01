@@ -28,6 +28,7 @@ import dev.localrag.generation.ProviderModelDefinition
 import dev.localrag.domain.ModelSelection
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -50,6 +51,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.charset.StandardCharsets.US_ASCII
+import java.sql.DriverManager
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Locale
@@ -83,7 +85,7 @@ class BrowserAcceptanceTest {
                         val embeddings = OllamaEmbeddingPort(ollama)
                         val modelConfiguration = modelConfiguration(paths, fake.cloud)
                         val chat = ChatCompletionsApi(modelConfiguration)
-                        val rag = RagService(index, embeddings, chat)
+                        val rag = RagService(index, embeddings, chat, chat)
                         val indexing = IndexWorkflow(
                             extractor = SourceExtractorRegistry(),
                             chunkers = listOf(FixedSizeChunker(), StructuralChunker()),
@@ -110,6 +112,504 @@ class BrowserAcceptanceTest {
         }
     }
 
+    @Test
+    fun legacyBenchmarkResultsKeepHistoricalRetrievalLabel() {
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("legacy-browser-app-data"))
+            Files.createDirectories(paths.dataDirectory)
+            DriverManager.getConnection("jdbc:sqlite:${paths.database.toAbsolutePath()}").use { connection ->
+                connection.createStatement().use { statement ->
+                    statement.execute(
+                        """CREATE TABLE benchmark_questions (
+                            question_id TEXT PRIMARY KEY,
+                            question TEXT NOT NULL,
+                            expected_facts_json TEXT NOT NULL,
+                            expected_sources_json TEXT NOT NULL,
+                            position INTEGER NOT NULL UNIQUE
+                        )""",
+                    )
+                    statement.execute(
+                        """CREATE TABLE benchmark_results (
+                            question_id TEXT NOT NULL,
+                            strategy TEXT NOT NULL,
+                            question TEXT NOT NULL,
+                            expected_facts_json TEXT NOT NULL,
+                            expected_sources_json TEXT NOT NULL,
+                            retrieved_sources_json TEXT NOT NULL,
+                            expected_source_hit INTEGER NOT NULL,
+                            baseline_answer TEXT NOT NULL,
+                            rag_answer TEXT NOT NULL,
+                            baseline_rating TEXT,
+                            rag_rating TEXT,
+                            note TEXT,
+                            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY(question_id,strategy)
+                        )""",
+                    )
+                    statement.execute(
+                        """INSERT INTO benchmark_questions VALUES
+                            ('legacy-question','Legacy question','["legacy fact"]','[]',0)""",
+                    )
+                    statement.execute(
+                        """INSERT INTO benchmark_results(
+                            question_id,strategy,question,expected_facts_json,expected_sources_json,
+                            retrieved_sources_json,expected_source_hit,baseline_answer,rag_answer,
+                            baseline_rating,rag_rating,note
+                        ) VALUES (
+                            'legacy-question','FIXED_SIZE','Legacy question','["legacy fact"]','[]',
+                            '[]',0,'Legacy baseline','Legacy RAG','PASS','PARTIAL','Legacy note'
+                        )""",
+                    )
+                }
+            }
+
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                        page.navigate("http://127.0.0.1:${app.server.port}/")
+                        assertThat(page.locator("#benchmark-results")).containsText("Legacy RAG")
+                        assertThat(page.locator("#benchmark-results")).containsText("Прежний retrieval · до D23")
+                        assertThat(page.locator("#benchmark-results")).not().containsText("Enhanced retrieval · нормализация + reranker")
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
+
+
+    @Test
+    fun queryShowsRawAndEnhancedRetrievalWithValidatedCitations() {
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("retrieval-comparison-app-data"))
+            val source = temporaryDirectory.resolve("greenhouse-comparison.md")
+            Files.writeString(
+                source,
+                "# Greenhouse alpha\nController reading is ALPHA.\n\n# Greenhouse beta\nController reading is BETA.\n\n# Greenhouse gamma\nController reading is GAMMA.\n\n# Greenhouse delta\nController reading is DELTA.\n",
+            )
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    page.setDefaultTimeout(30_000.0)
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                        page.navigate("http://127.0.0.1:${app.server.port}/")
+                        page.onDialog { it.accept() }
+                        page.locator("#source-files").setInputFiles(source)
+                        page.locator("#upload-button").click()
+                        assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+                        page.locator("#index-button").click()
+                        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+
+                        page.locator("#strategy").selectOption("STRUCTURAL")
+                        page.locator("#top-k").fill("10")
+                        val question = "  WHAT—   greenhouse “controller” reading?  "
+                        val normalizedQuestion = "what- greenhouse \"controller\" reading?"
+                        val queryEmbeddingStart = fake.embeddingInputs.size
+                        page.locator("#question").fill(question)
+                        val response = page.waitForResponse("**/api/query") {
+                            page.locator("#query-button").click()
+                        }
+                        val result = Json.parseToJsonElement(response.text()).jsonObject
+                        assertEquals(
+                            listOf(question, normalizedQuestion),
+                            fake.embeddingInputs.drop(queryEmbeddingStart),
+                        )
+                        val raw = result.getValue("rawSources").jsonArray.map { it.jsonObject }
+                        val enhanced = result.getValue("rag").jsonObject.getValue("sources").jsonArray.map { it.jsonObject }
+                        assertEquals(4, raw.size)
+                        assertEquals(4, raw.map { it.getValue("location") }.toSet().size)
+                        assertEquals(raw.map { it.getValue("chunkId").jsonPrimitive.content }.reversed(),
+                            enhanced.map { it.getValue("chunkId").jsonPrimitive.content })
+                        assertTrue(raw.all { it.getValue("quote").jsonPrimitive.content.length <= 300 })
+                        val rawCard = page.locator("#query-results .answer-card").nth(1).innerText()
+                        val enhancedCard = page.locator("#query-results .answer-card").nth(2).innerText()
+                        val firstRawQuote = raw[0].getValue("quote").jsonPrimitive.content
+                        val secondRawQuote = raw[1].getValue("quote").jsonPrimitive.content
+                        assertTrue(rawCard.indexOf(firstRawQuote) in 0 until rawCard.indexOf(secondRawQuote))
+                        assertTrue(enhancedCard.indexOf(secondRawQuote) in 0 until enhancedCard.indexOf(firstRawQuote))
+                        assertTrue(rawCard.contains("cosine"))
+                        val firstLocation = raw[0].getValue("location").jsonObject
+                        val expectedLocation = firstLocation["pageStart"]?.jsonPrimitive?.content?.toIntOrNull()
+                            ?.let { "стр. $it" }
+                            ?: firstLocation["lineStart"]?.jsonPrimitive?.content?.toIntOrNull()
+                                ?.let { "строки $it" }
+                            ?: "место не указано"
+                        assertTrue(rawCard.contains(expectedLocation))
+                        assertTrue(rawCard.contains("greenhouse-comparison.md") && rawCard.contains("фрагмент"))
+                        assertTrue(listOf("ALPHA", "BETA", "GAMMA", "DELTA").all(enhancedCard::contains))
+
+                        val rerankPayload = Json.parseToJsonElement(fake.cloud.rerankMessages.last().last()).jsonObject
+                        assertEquals(setOf("question", "candidates"), rerankPayload.keys)
+                        assertEquals(4, rerankPayload.getValue("candidates").jsonArray.size)
+                        assertTrue(rerankPayload.getValue("candidates").jsonArray.all {
+                            it.jsonObject.keys == setOf("index", "text")
+                        })
+                        val candidateTexts = rerankPayload.getValue("candidates").jsonArray.map {
+                            it.jsonObject.getValue("text").jsonPrimitive.content
+                        }
+                        assertEquals(4, enhanced.size)
+                        enhanced.forEach { citation ->
+                            val matchingRaw = raw.single {
+                                it.getValue("chunkId") == citation.getValue("chunkId")
+                            }
+                            assertEquals(matchingRaw.getValue("sourceId"), citation.getValue("sourceId"))
+                            assertEquals(matchingRaw.getValue("source"), citation.getValue("source"))
+                            assertEquals(matchingRaw.getValue("section"), citation.getValue("section"))
+                            assertEquals(matchingRaw.getValue("location"), citation.getValue("location"))
+                            val candidateIndex = raw.indexOf(matchingRaw)
+                            val quote = citation.getValue("quote").jsonPrimitive.content
+                            assertTrue(quote.length <= 300)
+                            assertTrue(candidateTexts[candidateIndex].contains(quote))
+                        }
+
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
+
+    @Test
+    fun emptyEnhancedRetrievalKeepsBaselineAndAbstainsForRag() {
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("empty-retrieval-app-data"))
+            val source = temporaryDirectory.resolve("synthetic-observatory.txt")
+            Files.writeString(source, "Observatory temperature is 21 degrees.\n", UTF_8)
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    page.setDefaultTimeout(30_000.0)
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                        page.navigate("http://127.0.0.1:${app.server.port}/")
+                        page.onDialog { it.accept() }
+                        page.locator("#source-files").setInputFiles(source)
+                        page.locator("#upload-button").click()
+                        assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+                        page.locator("#index-button").click()
+                        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+
+                        val question = "What are penguin breeding habits?"
+                        val chatStart = fake.cloud.chatMessages.size
+                        val rerankStart = fake.cloud.rerankMessages.size
+                        page.locator("#question").fill(question)
+                        val response = page.waitForResponse("**/api/query") {
+                            page.locator("#query-button").click()
+                        }
+                        val result = Json.parseToJsonElement(response.text()).jsonObject
+                        val rawSources = result.getValue("rawSources").jsonArray
+                        assertTrue(rawSources.isNotEmpty())
+                        assertTrue(rawSources.all { it.jsonObject.getValue("score").jsonPrimitive.content.toDouble() < 0.20 })
+                        val rag = result.getValue("rag").jsonObject
+                        assertTrue(rag.getValue("sources").jsonArray.isEmpty())
+                        assertEquals("Synthetic answer.", result.getValue("baseline").jsonObject
+                            .getValue("answer").jsonPrimitive.content)
+                        assertEquals(
+                            "Не знаю на основе текущих источников. Уточните вопрос или добавьте источник.",
+                            rag.getValue("answer").jsonPrimitive.content,
+                        )
+                        val cloudCalls = fake.cloud.chatMessages.drop(chatStart)
+                        assertEquals(1, cloudCalls.size)
+                        assertEquals(2, cloudCalls.single().size)
+                        assertEquals(question, cloudCalls.single().last())
+                        assertTrue(cloudCalls.single().none { "Observatory temperature" in it || "synthetic-observatory.txt" in it })
+                        assertEquals(rerankStart, fake.cloud.rerankMessages.size)
+                        assertEquals(
+                            0,
+                            page.locator("#query-results .answer-card").nth(2)
+                                .locator("blockquote.citation-quote").count(),
+                        )
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
+
+    @Test
+    fun rerankerFailureDoesNotReturnRawAsEnhanced() {
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("reranker-failure-app-data"))
+            val source = temporaryDirectory.resolve("synthetic-greenhouse.txt")
+            Files.writeString(source, "Greenhouse humidity target is 64 percent.\n", UTF_8)
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    page.setDefaultTimeout(30_000.0)
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                        page.navigate("http://127.0.0.1:${app.server.port}/")
+                        page.onDialog { it.accept() }
+                        page.locator("#source-files").setInputFiles(source)
+                        page.locator("#upload-button").click()
+                        page.locator("#index-button").click()
+                        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+
+                        fake.cloud.failReranker.set(true)
+                        val chatStart = fake.cloud.chatMessages.size
+                        val rerankStart = fake.cloud.rerankMessages.size
+                        page.locator("#question").fill("What is the greenhouse humidity target?")
+                        val response = page.waitForResponse("**/api/query") {
+                            page.locator("#query-button").click()
+                        }
+                        assertEquals(502, response.status())
+                        assertFalse("Synthetic cloud failure" in response.text())
+                        assertFalse("fixture-secret" in response.text())
+                        assertEquals(2, fake.cloud.chatMessages.size - chatStart)
+                        assertEquals(1, fake.cloud.rerankMessages.size - rerankStart)
+                        assertTrue(
+                            Json.parseToJsonElement(fake.cloud.rerankMessages.last().last()).jsonObject
+                                .getValue("candidates").jsonArray.isNotEmpty(),
+                        )
+                        assertThat(page.locator("#query-error")).containsText("HTTP 503")
+                        assertThat(page.locator("#query-results")).containsText("нового ответа нет")
+                        assertFalse(page.locator("#query-results").innerText().contains("Greenhouse humidity target"))
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
+
+    @Test
+    fun benchmarkPersistsRawAndRerankedRetrievalAndMetrics() {
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("benchmark-comparison-app-data"))
+            val sourceFiles = (1..12).map { number ->
+                temporaryDirectory.resolve("record-${number.toString().padStart(2, '0')}.txt").also { file ->
+                    Files.writeString(file, "Synthetic record marker $number contains local event $number.\n", UTF_8)
+                }
+            }
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    page.setDefaultTimeout(30_000.0)
+                    var fixture: BrowserAppFixture? =
+                        BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
+                    try {
+                        val app = fixture!!
+                        page.navigate("http://127.0.0.1:${app.server.port}/")
+                        val benchmarkDisclosure = page.getByText("Один запуск отправляет провайдеру")
+                        assertThat(benchmarkDisclosure).containsText("до 20 пар reranker/RAG-запросов")
+                        assertThat(benchmarkDisclosure).containsText("максимум 50 запросов")
+                        assertThat(benchmarkDisclosure).containsText("запросы пропускаются")
+                        page.onDialog { it.accept() }
+                        page.locator("#source-files").setInputFiles(sourceFiles.toTypedArray())
+                        page.locator("#upload-button").click()
+                        assertThat(page.locator("#upload-success")).containsText("12 файл(ов) добавлено")
+                        page.locator("#index-button").click()
+                        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+
+                        val sources = Json.parseToJsonElement(get("http://127.0.0.1:${app.server.port}/api/sources"))
+                            .jsonArray.map { it.jsonObject }
+                        assertEquals(12, sources.size)
+                        val sourceNumberById = sources.associate { source ->
+                            source.getValue("sourceId").jsonPrimitive.content to
+                                source.getValue("name").jsonPrimitive.content
+                                    .substringAfter("record-").substringBefore(".txt").toInt()
+                        }
+                        val rawByStrategy = mutableMapOf<String, List<JsonObject>>()
+                        for (strategy in listOf("FIXED_SIZE", "STRUCTURAL")) {
+                            page.locator("#strategy").selectOption(strategy)
+                            page.locator("#top-k").fill("4")
+                            page.locator("#question").fill("What observations are recorded?")
+                            val queryResponse = page.waitForResponse("**/api/query") {
+                                page.locator("#query-button").click()
+                            }
+                            rawByStrategy[strategy] = Json.parseToJsonElement(queryResponse.text()).jsonObject
+                                .getValue("rawSources").jsonArray.map { it.jsonObject }
+                        }
+                        val fixedRaw = rawByStrategy.getValue("FIXED_SIZE")
+                        val structuralIds = rawByStrategy.getValue("STRUCTURAL")
+                            .map { it.getValue("sourceId").jsonPrimitive.content }.toSet()
+                        val commonCitations = fixedRaw.filter {
+                            it.getValue("sourceId").jsonPrimitive.content in structuralIds
+                        }
+                        assertEquals(4, commonCitations.size)
+                        val retrievedIds = rawByStrategy.values.flatten()
+                            .map { it.getValue("sourceId").jsonPrimitive.content }.toSet()
+                        val missingSourceId = sources.first {
+                            it.getValue("sourceId").jsonPrimitive.content !in retrievedIds
+                        }.getValue("sourceId").jsonPrimitive.content
+                        assertEquals(4, fixedRaw.size)
+                        assertEquals(4, rawByStrategy.getValue("STRUCTURAL").size)
+
+                        val emptyQuestion = "What are penguin breeding habits?"
+                        val questionEntries = (1..10).joinToString(",") { number ->
+                            val expectedCitation = if (number <= 4) {
+                                commonCitations[(number - 1) % commonCitations.size]
+                            } else {
+                                null
+                            }
+                            val targetSourceId = expectedCitation?.getValue("sourceId")?.jsonPrimitive?.content
+                                ?: missingSourceId
+                            val targetNumber = sourceNumberById.getValue(targetSourceId)
+                            val expectedSection = expectedCitation?.get("section")?.jsonPrimitive?.content
+                                ?: "Document body"
+                            val location = expectedCitation?.getValue("location")?.toString()
+                                ?: """{"lineStart":1,"lineEnd":1}"""
+                            val question = if (number == 5) emptyQuestion
+                                else "Question $number: What observations are recorded?"
+                            """{"id":"q${number.toString().padStart(2, '0')}","question":${JsonPrimitive(question)},"expectedFacts":[${JsonPrimitive("Synthetic record marker $targetNumber contains local event $targetNumber.")}],"expectedSources":[{"sourceId":${JsonPrimitive(targetSourceId)},"location":$location,"section":${JsonPrimitive(expectedSection)}}]}"""
+                        }
+                        val benchmarkFile = temporaryDirectory.resolve("comparison-questions.json")
+                        Files.writeString(benchmarkFile, """{"questions":[$questionEntries]}""", UTF_8)
+                        page.locator("#benchmark-file").setInputFiles(benchmarkFile)
+                        page.locator("#benchmark-upload").click()
+                        assertThat(page.locator("#benchmark-error")).containsText("Набор сохранён")
+
+                        val benchmarkCallStart = fake.cloud.chatMessages.size
+                        val benchmarkRerankStart = fake.cloud.rerankMessages.size
+                        page.locator("#benchmark-run").click()
+                        assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
+                        val benchmarkCalls = fake.cloud.chatMessages.drop(benchmarkCallStart)
+                        assertEquals(46, benchmarkCalls.size)
+                        assertEquals(18, fake.cloud.rerankMessages.size - benchmarkRerankStart)
+                        assertEquals(
+                            listOf(emptyQuestion),
+                            benchmarkCalls.filter { it.last().contains(emptyQuestion) }.map { it.last() },
+                        )
+
+                        val before = Json.parseToJsonElement(get("http://127.0.0.1:${app.server.port}/api/benchmark/results"))
+                            .jsonObject
+                        val beforeRows = before.getValue("results").jsonArray
+                        assertEquals(20, beforeRows.size)
+                        val allRows = beforeRows.map { it.jsonObject }
+                        fun expectedRank(row: JsonObject, retrievalField: String): Int? {
+                            val expectedSources = row.getValue("expectedSources").jsonArray.map { it.jsonObject }
+                            val retrieved = row.getValue(retrievalField).jsonArray.map { it.jsonObject }
+                            val position = retrieved.indexOfFirst { citation ->
+                                expectedSources.any { expected ->
+                                    citation.getValue("sourceId") == expected.getValue("sourceId") &&
+                                        citation.getValue("location") == expected.getValue("location") &&
+                                        citation.getValue("section").jsonPrimitive.content.contains(
+                                            expected.getValue("section").jsonPrimitive.content,
+                                            ignoreCase = true,
+                                        )
+                                }
+                            }
+                            return position.takeIf { it >= 0 }?.plus(1)
+                        }
+                        fun storedRank(row: JsonObject, field: String): Int? =
+                            row.getValue(field).jsonPrimitive.content.toIntOrNull()
+
+                        for (row in allRows) {
+                            assertEquals(expectedRank(row, "rawRetrievedSources"), storedRank(row, "rawExpectedSourceRank"))
+                            assertEquals(expectedRank(row, "retrievedSources"), storedRank(row, "expectedSourceRank"))
+                        }
+                        val retrievalSummary = before.getValue("summary").jsonObject.getValue("retrieval").jsonArray
+                            .map { it.jsonObject }
+                        for (strategy in listOf("FIXED_SIZE", "STRUCTURAL")) {
+                            val strategyRows = allRows.filter {
+                                it.getValue("strategy").jsonPrimitive.content == strategy
+                            }
+                            assertEquals(10, strategyRows.size)
+                            val rawRanks = strategyRows.map { expectedRank(it, "rawRetrievedSources") }
+                            val enhancedRanks = strategyRows.map { expectedRank(it, "retrievedSources") }
+                            assertTrue(rawRanks.any { it == null } && rawRanks.any { it != null })
+                            assertTrue(enhancedRanks.any { it == null } && enhancedRanks.any { it != null })
+                            val metrics = retrievalSummary.single {
+                                it.getValue("strategy").jsonPrimitive.content == strategy
+                            }
+                            assertEquals(10, metrics.getValue("completedQuestions").jsonPrimitive.content.toInt())
+                            assertEquals(
+                                rawRanks.count { it != null && it <= 4 } / 10.0,
+                                metrics.getValue("rawHitAtK").jsonPrimitive.content.toDouble(),
+                            )
+                            assertEquals(
+                                rawRanks.sumOf { it?.let { rank -> 1.0 / rank } ?: 0.0 } / 10.0,
+                                metrics.getValue("rawMrr").jsonPrimitive.content.toDouble(),
+                            )
+                            assertEquals(
+                                enhancedRanks.count { it != null && it <= 4 } / 10.0,
+                                metrics.getValue("enhancedHitAtK").jsonPrimitive.content.toDouble(),
+                            )
+                            assertEquals(
+                                enhancedRanks.sumOf { it?.let { rank -> 1.0 / rank } ?: 0.0 } / 10.0,
+                                metrics.getValue("enhancedMrr").jsonPrimitive.content.toDouble(),
+                            )
+                        }
+                        assertThat(page.locator("#benchmark-results")).containsText("Raw retrieval")
+                        val benchmarkText = page.locator("#benchmark-results").innerText()
+                        fun displayedRank(label: String, rank: Int?): String =
+                            if (rank == null) "$label: не найдено · RR 0.000"
+                            else "$label: rank $rank · RR ${String.format(Locale.ROOT, "%.3f", 1.0 / rank)}"
+                        allRows.forEach { row ->
+                            val rawLabel = displayedRank("Raw", expectedRank(row, "rawRetrievedSources"))
+                            val enhancedLabel = displayedRank("Enhanced", expectedRank(row, "retrievedSources"))
+                            assertTrue(benchmarkText.contains(rawLabel), "Missing $rawLabel")
+                            assertTrue(benchmarkText.contains(enhancedLabel), "Missing $enhancedLabel")
+                        }
+
+                        assertThat(page.locator("#benchmark-summary")).containsText("Raw Hit@4")
+                        assertThat(page.locator("#benchmark-summary")).containsText("Enhanced Hit@4")
+                        assertThat(page.locator("#benchmark-results")).containsText("Raw retrieval")
+                        assertThat(page.locator("#benchmark-results")).containsText("Enhanced retrieval")
+                        val review = page.locator("#benchmark-results .rating-form").first()
+                        review.locator("select[name=\"baselineRating\"]").selectOption("PASS")
+                        review.locator("select[name=\"ragRating\"]").selectOption("PASS")
+                        review.locator("input[name=\"note\"]").fill("Synthetic benchmark review.")
+                        page.waitForResponse("**/api/benchmark/review") {
+                            review.locator("button[type=\"submit\"]").click()
+                        }
+                        val beforeRestart = Json.parseToJsonElement(get("http://127.0.0.1:${app.server.port}/api/benchmark/results"))
+                            .jsonObject
+                        fixture?.close()
+                        fixture = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
+                        val reopened = fixture!!
+                        page.navigate("http://127.0.0.1:${reopened.server.port}/")
+                        val afterRestart = Json.parseToJsonElement(get("http://127.0.0.1:${reopened.server.port}/api/benchmark/results"))
+                            .jsonObject
+                        assertEquals(beforeRestart.getValue("results"), afterRestart.getValue("results"))
+                        assertEquals(beforeRestart.getValue("summary"), afterRestart.getValue("summary"))
+                        assertEquals(
+                            "Synthetic benchmark review.",
+                            page.locator("#benchmark-results .rating-form").first()
+                                .locator("input[name=\"note\"]").inputValue(),
+                        )
+                        assertThat(page.locator("#benchmark-summary")).containsText("Raw Hit@4")
+                    } finally {
+                        fixture?.close()
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
     @Test
     fun singleBookIndexShowsPageProgressWhileEmbeddingIsInFlight() {
         FakeOllama().use { fake ->
@@ -259,7 +759,7 @@ class BrowserAcceptanceTest {
                         fake.cloud.releaseFirstChat.countDown()
                         assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
                         val benchmarkModels = fake.cloud.chatModels.drop(benchmarkModelCallStart)
-                        assertEquals(30, benchmarkModels.size)
+                        assertEquals(50, benchmarkModels.size)
                         assertTrue(benchmarkModels.all { it == "deepseek-v4-pro" })
                         page.waitForResponse("**/api/models/selection") {
                             page.locator("#model-select").selectOption("deepseek-v4-pro")
@@ -271,6 +771,18 @@ class BrowserAcceptanceTest {
                             it.jsonObject.getValue("providerId").jsonPrimitive.content == "fixture" &&
                                 it.jsonObject.getValue("modelId").jsonPrimitive.content == "deepseek-v4-pro"
                         })
+                        assertTrue(apiResults.all {
+                            val row = it.jsonObject
+                            row.getValue("rawRetrievedSources").jsonArray.all { citation ->
+                                citation.jsonObject.getValue("quote").jsonPrimitive.content.length <= 300
+                            } &&
+                                row.containsKey("rawExpectedSourceRank") && row.containsKey("expectedSourceRank")
+                        })
+                        assertThat(page.locator("#benchmark-summary")).containsText("Raw Hit@4")
+                        assertThat(page.locator("#benchmark-summary")).containsText("Enhanced Hit@4")
+                        assertThat(page.locator("#benchmark-results")).containsText("RR")
+                        assertThat(page.locator("#benchmark-results")).containsText("Raw retrieval")
+                        assertThat(page.locator("#benchmark-results")).containsText("Enhanced retrieval")
                         assertEquals(20, page.locator("#benchmark-results .strategy-card").count(), page.locator("#benchmark-results").innerText())
 
                         val rating = page.locator("#benchmark-results .rating-form").first()
@@ -444,23 +956,25 @@ class BrowserAcceptanceTest {
                 page.locator("#query-button").click()
                 val queryResults = page.locator("#query-results")
                 assertThat(queryResults).containsText("Baseline · без коллекции")
-                assertThat(queryResults).containsText("RAG · с найденными фрагментами")
+                assertThat(queryResults).containsText("RAG · fixture/deepseek-flash")
                 assertThat(queryResults).containsText("greenhouse.html")
                 assertThat(queryResults).containsText("Greenhouse telemetry")
                 val queryMessages = fake.cloud.chatMessages.drop(chatStart)
-                assertEquals(2, queryMessages.size)
+                assertEquals(3, queryMessages.size)
                 assertTrue(queryMessages.first().none { "Humidity target is 64 percent" in it })
+                assertTrue(queryMessages[1].last().contains("Humidity target is 64 percent"))
+                assertTrue(listOf("sourceId", "sourceName", "chunkId", "location").none { it in queryMessages[1].last() })
                 assertTrue(queryMessages.last().any { "Humidity target is 64 percent" in it })
                 assertTrue(queryMessages.flatten().none { "SCRIPT_ONLY_SECRET" in it || "STYLE_ONLY_SECRET" in it })
                 val pdfChatStart = fake.cloud.chatMessages.size
                 page.locator("#question").fill("What does the PDF field note say about conductivity?")
                 page.locator("#query-button").click()
                 assertThat(queryResults).containsText("Baseline · без коллекции")
-                assertThat(queryResults).containsText("RAG · с найденными фрагментами")
+                assertThat(queryResults).containsText("RAG · fixture/deepseek-flash")
                 assertThat(queryResults).containsText("synthetic-field-guide.pdf")
                 assertThat(queryResults).containsText("стр. 1")
                 val pdfMessages = fake.cloud.chatMessages.drop(pdfChatStart)
-                assertEquals(2, pdfMessages.size)
+                assertEquals(3, pdfMessages.size)
                 assertTrue(pdfMessages.first().none { "conductivity is 21 units" in it })
                 assertTrue(pdfMessages.last().any { "conductivity is 21 units" in it })
                 assertEquals(0, probe.requests.get())
@@ -474,7 +988,7 @@ class BrowserAcceptanceTest {
                     assertThat(queryResults).containsText("copper-calibration.kt")
                     assertThat(queryResults).containsText("строки 1")
                     val codeMessages = fake.cloud.chatMessages.drop(codeChatStart)
-                    assertEquals(2, codeMessages.size)
+                    assertEquals(3, codeMessages.size)
                     assertTrue(codeMessages.last().any { "LIMIT = 19" in it })
 
                     val textChatStart = fake.cloud.chatMessages.size
@@ -483,17 +997,20 @@ class BrowserAcceptanceTest {
                     assertThat(queryResults).containsText("version-note.txt")
                     assertThat(queryResults).containsText("строки 1")
                     val textMessages = fake.cloud.chatMessages.drop(textChatStart)
-                    assertEquals(2, textMessages.size)
+                    assertEquals(3, textMessages.size)
                     assertTrue(textMessages.last().any { "beacon threshold" in it })
                 }
                 assertEquals(0, probe.requests.get())
                 val emptyContextChatStart = fake.cloud.chatMessages.size
                 page.locator("#question").fill("What are penguin breeding habits?")
                 page.locator("#query-button").click()
-                assertThat(queryResults).containsText("По этому ответу нет проверенных цитат.")
-                assertThat(queryResults).containsText("В коллекции не найдено подходящих фрагментов.")
+                assertThat(queryResults).containsText("Baseline ·")
+                assertThat(queryResults).containsText("Synthetic answer.")
+                assertThat(queryResults).containsText("Не знаю на основе текущих источников. Уточните вопрос или добавьте источник.")
+                assertThat(queryResults).containsText("Проверенные фрагменты не найдены.")
                 val emptyContextMessages = fake.cloud.chatMessages.drop(emptyContextChatStart)
-                assertTrue(emptyContextMessages.last().last().contains("penguin"))
+                assertEquals(1, emptyContextMessages.size)
+                assertTrue(emptyContextMessages.single().last().contains("penguin"))
 
                 page.locator("button[aria-label^=\"Удалить источник version-note.txt\"]").first().click()
                 assertTrue(awaitDialog(page, dialogMessages).contains(duplicateIds.first()))
@@ -635,14 +1152,15 @@ class BrowserAcceptanceTest {
                 page.locator("#benchmark-run").click()
                 assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
                 assertThat(page.locator("#benchmark-results"))
-                    .containsText("В коллекции не найдено подходящих фрагментов.")
+                    .containsText("Не знаю на основе текущих источников. Уточните вопрос или добавьте источник.")
                 val noEvidenceRows = Json.parseToJsonElement(get("$origin/api/benchmark/results"))
                     .jsonObject.getValue("results").jsonArray
                 assertEquals(20, noEvidenceRows.size)
                 assertTrue(noEvidenceRows.all {
-                    it.jsonObject.getValue("retrievedSources").jsonArray.isEmpty() &&
-                        it.jsonObject.getValue("ragAnswer").jsonPrimitive.content
-                            .startsWith("В коллекции не найдено подходящих фрагментов.")
+                    it.jsonObject.getValue("baselineAnswer").jsonPrimitive.content == "Synthetic answer." &&
+                        it.jsonObject.getValue("retrievedSources").jsonArray.isEmpty() &&
+                        it.jsonObject.getValue("ragAnswer").jsonPrimitive.content ==
+                        "Не знаю на основе текущих источников. Уточните вопрос или добавьте источник."
                 })
                 assertThat(page.locator("#source-list")).containsText("greenhouse.html")
                 assertTrue(!page.locator("#source-list").textContent().orEmpty().contains("same-bytes-copy.txt"))
@@ -795,7 +1313,8 @@ class BrowserAcceptanceTest {
         private val jobs = JobManager()
         private val ollama = OllamaApi(fake.uri)
         private val embeddings = OllamaEmbeddingPort(ollama)
-        private val rag = RagService(index, embeddings, ChatCompletionsApi(modelConfiguration))
+        private val chat = ChatCompletionsApi(modelConfiguration)
+        private val rag = RagService(index, embeddings, chat, chat)
         private val catalog = SourceCatalog(paths.sources, index, benchmarkStore::deleteSourceReferences)
         private val indexing = IndexWorkflow(
             extractor = SourceExtractorRegistry(),
@@ -822,6 +1341,7 @@ class BrowserAcceptanceTest {
 
     private class FakeOllama : AutoCloseable {
         val cloud = FakeDeepSeek()
+        val embeddingInputs = CopyOnWriteArrayList<String>()
         val embeddingCalls = AtomicInteger()
         val holdPdfEmbedding = AtomicBoolean(false)
         val pdfEmbeddingStarted = CountDownLatch(1)
@@ -836,6 +1356,7 @@ class BrowserAcceptanceTest {
             createContext("/api/embed") { exchange ->
                 val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
                 val inputs = request.getValue("input").jsonArray.map { it.jsonPrimitive.content }
+                embeddingInputs.addAll(inputs)
                 embeddingCalls.addAndGet(inputs.size)
                 if (holdPdfEmbedding.compareAndSet(true, false)) {
                     pdfEmbeddingStarted.countDown()
@@ -880,9 +1401,11 @@ class BrowserAcceptanceTest {
     }
     private class FakeDeepSeek : AutoCloseable {
         val failChat = AtomicBoolean(false)
+        val failReranker = AtomicBoolean(false)
         val credentialConfigured = AtomicBoolean(true)
         val chatMessages = CopyOnWriteArrayList<List<String>>()
         val chatModels = CopyOnWriteArrayList<String>()
+        val rerankMessages = CopyOnWriteArrayList<List<String>>()
         val holdNextChat = AtomicBoolean(false)
         val firstChatStarted = CountDownLatch(1)
         val releaseFirstChat = CountDownLatch(1)
@@ -896,12 +1419,19 @@ class BrowserAcceptanceTest {
                 }
                 chatMessages.add(messages)
                 chatModels.add(request.getValue("model").jsonPrimitive.content)
+                val isReranker = messages.firstOrNull()?.contains("Ты reranker") == true
+                if (isReranker) rerankMessages.add(messages)
                 if (holdNextChat.compareAndSet(true, false)) {
                     firstChatStarted.countDown()
                     check(releaseFirstChat.await(20, TimeUnit.SECONDS))
                 }
-                if (failChat.get()) {
+                if (failChat.get() || (isReranker && failReranker.get())) {
                     respond(exchange, 503, """{"error":"Synthetic cloud failure"}""")
+                } else if (isReranker) {
+                    val candidateCount = Json.parseToJsonElement(messages.last()).jsonObject
+                        .getValue("candidates").jsonArray.size
+                    val reversed = (candidateCount - 1 downTo 0).joinToString(",")
+                    respond(exchange, 200, """{"choices":[{"message":{"content":"{\"ranked_indices\":[$reversed]}"}}]}""")
                 } else {
                     respond(exchange, 200, """{"choices":[{"message":{"content":"Synthetic answer."}}]}""")
                 }

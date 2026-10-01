@@ -6,6 +6,7 @@ import dev.localrag.domain.ChunkStrategy
 import dev.localrag.domain.EmbeddingPort
 import dev.localrag.domain.IndexProgressUpdate
 import dev.localrag.domain.ScoredChunk
+import dev.localrag.domain.RerankPort
 import dev.localrag.domain.ModelSelection
 import dev.localrag.domain.SourceLocation
 import dev.localrag.domain.SourceRecord
@@ -75,7 +76,18 @@ class IndexWorkflowTest {
             assertTrue(repository.chunkCount(orbitId, ChunkStrategy.FIXED_SIZE) > 0)
             assertTrue(repository.chunkCount(copperId, ChunkStrategy.STRUCTURAL) > 0)
 
-            val rag = RagService(repository, FixtureEmbeddings(), EvidenceChat())
+            val rag = RagService(
+                repository,
+                FixtureEmbeddings(),
+                EvidenceChat(),
+                object : RerankPort {
+                    override fun rerank(
+                        selection: ModelSelection,
+                        question: String,
+                        candidateTexts: List<String>,
+                    ): List<Int> = candidateTexts.indices.toList()
+                },
+            )
             val response = rag.answer(
                 "Where are orbit markers?",
                 ChunkStrategy.FIXED_SIZE,

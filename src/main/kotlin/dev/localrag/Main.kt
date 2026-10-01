@@ -39,7 +39,7 @@ fun main() {
                 val modelConfiguration = ModelConfiguration(modelCatalog, ModelSelectionStore(paths.modelSelection, modelCatalog), EnvironmentProviderCredentials)
                 val embeddings = OllamaEmbeddingPort(ollama)
                 val chat = ChatCompletionsApi(modelConfiguration)
-                val rag = RagService(index, embeddings, chat)
+                val rag = RagService(index, embeddings, chat, chat)
                 val indexing = IndexWorkflow(
                     extractor = SourceExtractorRegistry(),
                     chunkers = listOf(FixedSizeChunker(), StructuralChunker()),

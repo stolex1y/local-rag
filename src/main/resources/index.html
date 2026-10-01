@@ -90,6 +90,7 @@
     .answer-text { white-space: pre-wrap; overflow-wrap: anywhere; }
     .citations { margin: .55rem 0 0; padding-left: 1.3rem; }
     .citations li { margin: .4rem 0; overflow-wrap: anywhere; }
+    .citation-quote { margin: .35rem 0; padding-left: .7rem; border-left: 3px solid var(--line); color: var(--muted); white-space: pre-wrap; }
     .benchmark-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: .6rem; margin-top: .9rem; }
     .summary-item { padding: .7rem; border-radius: .55rem; background: #f0f6f5; }
     .summary-item strong { display: block; font-size: 1.1rem; }
@@ -217,7 +218,7 @@
         <div><h2 id="benchmark-heading">Benchmark на своих вопросах</h2><p class="muted">Загрузите JSON ровно с 10 вопросами, ожидаемыми фактами и ссылками на готовые источники.</p></div>
         <button class="secondary" id="benchmark-refresh" type="button">Обновить вопросы и результаты</button>
       </div>
-      <div class="callout">Один запуск отправляет выбранному провайдеру 10 baseline-вопросов и 20 RAG-запросов. Для каждого результата сохраняются provider ID и model ID. Фактические расходы зависят от тарифа провайдера; запускайте benchmark только если принимаете эти запросы и возможные расходы. Выбранная пара фиксируется на весь запуск; изменение выбора повлияет на следующий.</div>
+      <div class="callout">Один запуск отправляет провайдеру 10 baseline-вопросов и до 20 пар reranker/RAG-запросов — максимум 50 запросов. Если enhanced retrieval не нашёл кандидатов, соответствующие reranker и RAG-запросы пропускаются. Фактические расходы зависят от тарифа провайдера; запускайте benchmark только если принимаете эти запросы и возможные расходы. Выбранная пара фиксируется на весь запуск; изменение выбора повлияет на следующий.</div>
       <div class="upload-grid">
         <div class="field">
           <label for="benchmark-file">JSON-файл benchmark</label>
@@ -702,7 +703,7 @@
       function renderCitations(sources) {
         const list = node("ul", undefined, "citations");
         if (!sources?.length) {
-          list.append(node("li", "По этому ответу нет проверенных цитат."));
+          list.append(node("li", "Проверенные фрагменты не найдены."));
           return list;
         }
         sources.forEach(source => {
@@ -711,7 +712,9 @@
             : location.lineStart ? `строки ${location.lineStart}${location.lineEnd !== location.lineStart ? `–${location.lineEnd}` : ""}`
               : "место не указано";
           if (source.section) where += ` · ${source.section}`;
-          const item = node("li", `${source.source} · ${where} · фрагмент ${source.chunkId}`);
+          const score = Number.isFinite(Number(source.score)) ? Number(source.score).toFixed(3) : "—";
+          const item = node("li", `${source.source} · ${where} · фрагмент ${source.chunkId} · cosine ${score}`);
+          if (source.quote) item.append(node("blockquote", source.quote, "citation-quote"));
           list.append(item);
         });
         return list;
@@ -734,13 +737,15 @@
           const result = await request("/api/query", jsonOptions("POST", body));
           results.replaceChildren();
           const answers = node("div", undefined, "answers");
-          const baseline = node("article", undefined, "answer-card");
           const selection = result.modelSelection || {};
           const modelLabel = `${selection.providerId || "?"}/${selection.modelId || "?"}`;
+          const baseline = node("article", undefined, "answer-card");
           baseline.append(node("h3", `Baseline · без коллекции · ${modelLabel}`), node("div", result.baseline.answer, "answer-text"));
+          const raw = node("article", undefined, "answer-card");
+          raw.append(node("h3", "Raw retrieval · исходный вопрос"), node("p", "Порядок по cosine similarity; score не является вероятностью."), renderCitations(result.rawSources));
           const rag = node("article", undefined, "answer-card");
-          rag.append(node("h3", `RAG · с найденными фрагментами · ${modelLabel}`), node("div", result.rag.answer, "answer-text"), node("h4", "Источники"), renderCitations(result.rag.sources));
-          answers.append(baseline, rag);
+          rag.append(node("h3", "Enhanced retrieval · нормализация + reranker"), node("h4", `RAG · ${modelLabel}`), node("div", result.rag.answer, "answer-text"), node("h4", "Упорядоченные источники"), renderCitations(result.rag.sources));
+          answers.append(baseline, raw, rag);
           results.append(answers);
         } catch (error) {
           results.replaceChildren(node("p", "Ответы предыдущего запроса скрыты; нового ответа нет.", "empty"));
@@ -773,10 +778,20 @@
           [
             ["Baseline PASS", summary.baselinePass], ["Baseline PARTIAL", summary.baselinePartial], ["Baseline FAIL", summary.baselineFail],
             ["RAG PASS", summary.ragPass], ["RAG PARTIAL", summary.ragPartial], ["RAG FAIL", summary.ragFail],
-            ["Найдены ожидаемые источники", summary.expectedSourceHits],
           ].forEach(([label, value]) => {
             const item = node("div", undefined, "summary-item");
             item.append(node("strong", value ?? 0), node("span", label));
+            summaryRoot.append(item);
+          });
+          (summary.retrieval || []).forEach(metrics => {
+            const heading = metrics.strategy === "FIXED_SIZE" ? "Фрагменты 500/50" : "Структурные фрагменты";
+            const format = value => value == null ? "—" : Number(value).toFixed(3);
+            const item = node("div", undefined, "summary-item");
+            item.append(
+              node("strong", `${heading} · ${metrics.completedQuestions}/10`),
+              node("span", `Raw Hit@${metrics.k}: ${format(metrics.rawHitAtK)} · MRR ${format(metrics.rawMrr)}`),
+              node("span", `Enhanced Hit@${metrics.k}: ${format(metrics.enhancedHitAtK)} · MRR ${format(metrics.enhancedMrr)}`),
+            );
             summaryRoot.append(item);
           });
         }
@@ -824,15 +839,35 @@
           ? `${row.providerId}/${row.modelId}`
           : "Модель не записана (исторический результат)";
         head.append(node("span", modelLabel, "muted"));
-        const hit = node("span", row.expectedSourceHit ? "Ожидаемый источник найден" : "Ожидаемый источник не найден", `badge ${row.expectedSourceHit ? "rating-PASS" : "rating-FAIL"}`);
-        head.append(hit);
+        const available = row.rawRetrievedSources !== null && row.rawRetrievedSources !== undefined;
+        const rankLabel = (label, rank) => {
+          const result = !available ? "метрика недоступна"
+            : rank == null ? "не найдено · RR 0.000"
+              : `rank ${rank} · RR ${(1 / rank).toFixed(3)}`;
+          return node("span", `${label}: ${result}`, "muted");
+        };
+        head.append(rankLabel("Raw", row.rawExpectedSourceRank), rankLabel("Enhanced", row.expectedSourceRank));
         strategy.append(head);
         const answers = node("div", undefined, "strategy-answers");
         const baseline = node("article", undefined, "answer-card");
         baseline.append(node("h4", `Baseline${ratingBadge(row.baselineRating)}`), node("div", row.baselineAnswer, "answer-text"));
+        const raw = node("article", undefined, "answer-card");
+        raw.append(node("h4", "Raw retrieval · исходный вопрос"));
+        if (available) {
+          raw.append(node("p", "Порядок по cosine similarity; score не является вероятностью."));
+          raw.append(renderCitations(row.rawRetrievedSources));
+        } else {
+          raw.append(node("p", "Raw retrieval отсутствует в этой исторической записи.", "muted"));
+        }
         const rag = node("article", undefined, "answer-card");
-        rag.append(node("h4", `RAG${ratingBadge(row.ragRating)}`), node("div", row.ragAnswer, "answer-text"), node("h4", "Полученные источники"), renderCitations(row.retrievedSources));
-        answers.append(baseline, rag);
+        rag.append(node("h4", `RAG${ratingBadge(row.ragRating)}`), node("div", row.ragAnswer, "answer-text"));
+        if (available) {
+          rag.append(node("h4", "Enhanced retrieval · нормализация + reranker"), node("p", "Cosine score — оценка сходства, не вероятность."));
+        } else {
+          rag.append(node("h4", "Прежний retrieval · до D23"), node("p", "Эта историческая запись сохранена без raw retrieval и reranker-метаданных.", "muted"));
+        }
+        rag.append(renderCitations(row.retrievedSources));
+        answers.append(baseline, raw, rag);
         strategy.append(answers);
         const form = node("form", undefined, "rating-form");
         form.append(ratingField("Оценка baseline", "baselineRating", row.baselineRating), ratingField("Оценка RAG", "ragRating", row.ragRating));

@@ -56,20 +56,31 @@ data class PendingIndexResponse(
 )
 
 @Serializable
-data class RatingSummary(
+data class RetrievalSummary(
+    val strategy: ChunkStrategy,
+    val k: Int,
+    val completedQuestions: Int,
+    val rawHitAtK: Double?,
+    val rawMrr: Double?,
+    val enhancedHitAtK: Double?,
+    val enhancedMrr: Double?,
+)
+
+@Serializable
+data class BenchmarkSummary(
     val baselinePass: Int,
     val baselinePartial: Int,
     val baselineFail: Int,
     val ragPass: Int,
     val ragPartial: Int,
     val ragFail: Int,
-    val expectedSourceHits: Int,
+    val retrieval: List<RetrievalSummary>,
 )
 
 @Serializable
 data class BenchmarkResultsResponse(
     val results: List<BenchmarkResult>,
-    val summary: RatingSummary,
+    val summary: BenchmarkSummary,
 )
 
 class ApplicationService(
@@ -240,14 +251,35 @@ class ApplicationService(
         val rows = store.results()
         return BenchmarkResultsResponse(
             results = rows,
-            summary = RatingSummary(
+            summary = BenchmarkSummary(
                 baselinePass = rows.count { it.baselineRating == "PASS" },
                 baselinePartial = rows.count { it.baselineRating == "PARTIAL" },
                 baselineFail = rows.count { it.baselineRating == "FAIL" },
                 ragPass = rows.count { it.ragRating == "PASS" },
                 ragPartial = rows.count { it.ragRating == "PARTIAL" },
                 ragFail = rows.count { it.ragRating == "FAIL" },
-                expectedSourceHits = rows.count(BenchmarkResult::expectedSourceHit),
+                retrieval = ChunkStrategy.entries.map { strategy ->
+                    val completed = rows.filter { it.strategy == strategy && it.rawRetrievedSources != null }
+                    val count = completed.size
+                    val denominator = BenchmarkStore.EXPECTED_QUESTION_COUNT.toDouble()
+                    RetrievalSummary(
+                        strategy = strategy,
+                        k = RagService.DEFAULT_TOP_K,
+                        completedQuestions = count,
+                        rawHitAtK =
+                            completed.count { row ->
+                                row.rawExpectedSourceRank?.let { rank -> rank in 1..RagService.DEFAULT_TOP_K } == true
+                            } / denominator,
+                        rawMrr =
+                            completed.sumOf { it.rawExpectedSourceRank?.let { rank -> 1.0 / rank } ?: 0.0 } / denominator,
+                        enhancedHitAtK =
+                            completed.count { row ->
+                                row.expectedSourceRank?.let { rank -> rank in 1..RagService.DEFAULT_TOP_K } == true
+                            } / denominator,
+                        enhancedMrr =
+                            completed.sumOf { it.expectedSourceRank?.let { rank -> 1.0 / rank } ?: 0.0 } / denominator,
+                    )
+                },
             ),
         )
     }

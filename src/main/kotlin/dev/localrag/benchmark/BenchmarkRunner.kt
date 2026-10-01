@@ -21,17 +21,22 @@ class BenchmarkRunner(
         questions.forEach { question ->
             progress(IndexProgressUpdate("baseline", completed, totalCases, 0, 0, question.question, 0, 0))
             val baseline = rag.baseline(question.question, selection)
-            val sourcesByStrategy = rag.retrieveForStrategies(question.question)
+            val validExpectedSources = question.expectedSources.filter { expected ->
+                index.hasSourceLocation(expected.sourceId, expected.location, expected.section)
+            }
+            val comparisonsByStrategy = rag.retrieveForStrategies(question.question, selection)
             ChunkStrategy.entries.forEach { strategy ->
                 progress(IndexProgressUpdate("rag", completed, totalCases, 0, 0, question.question, 0, 0))
-                val sources = sourcesByStrategy.getValue(strategy)
+                val comparison = comparisonsByStrategy.getValue(strategy)
                 store.saveResult(
                     question = question,
                     strategy = strategy,
-                    sources = sources,
+                    rawSources = comparison.raw,
+                    sources = comparison.enhanced,
                     baselineAnswer = baseline,
-                    ragAnswer = rag.ragAnswer(question.question, sources, selection),
-                    referenceHit = hasExpectedSourceHit(question, sources),
+                    ragAnswer = rag.ragAnswer(question.question, comparison.enhanced, selection),
+                    rawExpectedSourceRank = expectedSourceRank(validExpectedSources, comparison.raw),
+                    expectedSourceRank = expectedSourceRank(validExpectedSources, comparison.enhanced),
                     selection = selection,
                 )
                 completed++
@@ -40,14 +45,15 @@ class BenchmarkRunner(
         }
     }
 
-    private fun hasExpectedSourceHit(question: BenchmarkQuestion, retrieved: List<ScoredChunk>): Boolean =
-        question.expectedSources.any { expected ->
-            index.hasSourceLocation(expected.sourceId, expected.location, expected.section) &&
-                retrieved.any { candidate ->
-                    val draft = candidate.chunk.draft
-                    draft.sourceId == expected.sourceId && locationMatches(expected, draft.location, draft.section)
-                }
+    private fun expectedSourceRank(expectedSources: List<BenchmarkExpectedSource>, retrieved: List<ScoredChunk>): Int? {
+        val position = retrieved.indexOfFirst { candidate ->
+            val draft = candidate.chunk.draft
+            expectedSources.any { expected ->
+                draft.sourceId == expected.sourceId && locationMatches(expected, draft.location, draft.section)
+            }
         }
+        return if (position < 0) null else position + 1
+    }
 
     private fun locationMatches(expected: BenchmarkExpectedSource, actual: dev.localrag.domain.SourceLocation, section: String): Boolean {
         val wanted = expected.location

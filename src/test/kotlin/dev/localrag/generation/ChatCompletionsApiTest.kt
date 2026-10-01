@@ -25,6 +25,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.jupiter.api.io.TempDir
 
 class ChatCompletionsApiTest {
@@ -184,6 +185,74 @@ class ChatCompletionsApiTest {
             assertContains(failure.message.orEmpty(), "безопасно")
             assertFalse(secret in failure.message.orEmpty())
             assertEquals(0, requestCount.get())
+        }
+    }
+
+
+    @Test
+    fun `reranker receives only query and candidate text and returns a validated order`() {
+        val requests = CopyOnWriteArrayList<JsonObject>()
+        val fake = FakeProvider { exchange ->
+            requests += Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+            respond(exchange, 200, """{"choices":[{"message":{"content":"{\"ranked_indices\":[1,0]}"}}]}""")
+        }
+        fake.use {
+            val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-api-key" }))
+            val question = "What is the calibration limit?"
+            val candidateTexts = listOf("LIMIT = 19", "Unrelated synthetic note")
+
+            assertEquals(listOf(1, 0), api.rerank(selection, question, candidateTexts))
+
+            val messages = requests.single().getValue("messages").jsonArray.map { it.jsonObject }
+            assertEquals(listOf("system", "user"), messages.map { it.getValue("role").jsonPrimitive.content })
+            val payloadText = messages.last().getValue("content").jsonPrimitive.content
+            val payload = Json.parseToJsonElement(payloadText).jsonObject
+            assertEquals(question, payload.getValue("question").jsonPrimitive.content)
+            assertEquals(
+                candidateTexts,
+                payload.getValue("candidates").jsonArray.map {
+                    it.jsonObject.getValue("text").jsonPrimitive.content
+                },
+            )
+            listOf("sourceId", "sourceName", "chunkId", "location", "section", "embedding")
+                .forEach { field -> assertFalse(field in payloadText, "Reranker payload contained $field") }
+        }
+    }
+
+    @Test
+    fun `reranker rejects malformed incomplete duplicate and out of range orders safely`() {
+        val responses = listOf(
+            200 to "not JSON",
+            200 to """{"ranked_indices":[0]}""",
+            200 to """{"ranked_indices":[0,0]}""",
+            200 to """{"ranked_indices":[0,2]}""",
+            503 to """{"error":"SYNTHETIC_PRIVATE_FULL_PROMPT"}""",
+        )
+        val requests = AtomicInteger()
+        val fake = FakeProvider { exchange ->
+            val (status, content) = responses[requests.getAndIncrement()]
+            val body = if (status == 200) {
+                """{"choices":[{"message":{"content":${JsonPrimitive(content)}}}]}"""
+            } else {
+                content
+            }
+            respond(exchange, status, body)
+        }
+        fake.use {
+            val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-api-key" }))
+            assertEquals(emptyList(), api.rerank(selection, "Question?", emptyList()))
+            assertEquals(0, requests.get())
+
+            val sensitiveQuestion = "SENSITIVE_SYNTHETIC_QUERY"
+            repeat(responses.size) {
+                val error = assertFailsWith<CloudModelException> {
+                    api.rerank(selection, sensitiveQuestion, listOf("synthetic candidate one", "synthetic candidate two"))
+                }
+                assertFalse("SYNTHETIC_PRIVATE_FULL_PROMPT" in error.message.orEmpty())
+                assertFalse(sensitiveQuestion in error.message.orEmpty())
+                assertFalse("synthetic-api-key" in error.message.orEmpty())
+            }
+            assertEquals(responses.size, requests.get())
         }
     }
 

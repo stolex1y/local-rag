@@ -101,6 +101,7 @@ data class SourceCitation(
     val chunkId: String,
     val location: SourceLocation,
     val score: Double,
+    val quote: String = "",
 )
 
 interface EmbeddingPort {
@@ -116,6 +117,10 @@ data class ModelSelection(
 
 interface ChatPort {
     fun answer(selection: ModelSelection, question: String, context: List<ScoredChunk> = emptyList()): String
+}
+
+interface RerankPort {
+    fun rerank(selection: ModelSelection, question: String, candidateTexts: List<String>): List<Int>
 }
 
 data class StoredSource(

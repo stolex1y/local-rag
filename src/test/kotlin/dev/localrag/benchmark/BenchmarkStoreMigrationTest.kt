@@ -12,7 +12,7 @@ class BenchmarkStoreMigrationTest {
     lateinit var temporaryDirectory: Path
 
     @Test
-    fun `adding provider fields preserves previous answers ratings and notes`() {
+    fun `adding model and retrieval fields preserves previous answers ratings and notes`() {
         val database = temporaryDirectory.resolve("legacy.sqlite")
         DriverManager.getConnection("jdbc:sqlite:${database.toAbsolutePath()}").use { connection ->
             connection.createStatement().use { statement ->
@@ -85,6 +85,9 @@ class BenchmarkStoreMigrationTest {
             assertEquals("Keep this note", result.note)
             assertNull(result.providerId)
             assertNull(result.modelId)
+            assertNull(result.rawRetrievedSources)
+            assertNull(result.rawExpectedSourceRank)
+            assertNull(result.expectedSourceRank)
         }
     }
 }

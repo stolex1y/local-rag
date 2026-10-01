@@ -15,6 +15,7 @@ import dev.localrag.domain.SourceType
 import dev.localrag.domain.StoredChunk
 import dev.localrag.domain.ChatPort
 import dev.localrag.domain.ModelSelection
+import dev.localrag.domain.RerankPort
 import dev.localrag.domain.ScoredChunk
 import dev.localrag.domain.StoredSource
 import dev.localrag.index.FixedSizeChunker
@@ -152,6 +153,7 @@ class ApplicationServiceTest {
                 assertEquals(guideId, citation.getValue("sourceId").jsonPrimitive.content)
                 assertEquals("guide.txt", citation.getValue("source").jsonPrimitive.content)
                 assertEquals(1, citation.getValue("location").jsonObject.getValue("lineStart").jsonPrimitive.content.toInt())
+                assertEquals("Orbit markers follow a stable route.", citation.getValue("quote").jsonPrimitive.content)
 
                 val questions = (1..10).map { number ->
                     BenchmarkQuestion(
@@ -171,6 +173,7 @@ class ApplicationServiceTest {
                 val savedQuestions = api.putJson("/api/benchmark/questions", """{"questions":$questionsJson}""")
                 assertEquals(200, savedQuestions.statusCode(), savedQuestions.body())
                 assertTrue(json(savedQuestions.body()).jsonObject.getValue("runnable").jsonPrimitive.content.toBoolean())
+                val rerankerCallsBeforeBenchmark = fixture.rerankCalls.get()
                 val benchmarkStart = api.postJson("/api/benchmark/run", "{}")
                 assertEquals(202, benchmarkStart.statusCode())
                 val benchmarkJobId = json(benchmarkStart.body()).jsonObject.getValue("jobId").jsonPrimitive.content
@@ -186,7 +189,24 @@ class ApplicationServiceTest {
                 }.map { it.getValue("questionId").jsonPrimitive.content }.toSet()
                 assertEquals((1..10).map { "q${it.toString().padStart(2, '0')}" }.toSet(), fixedQuestionIds)
                 assertEquals(fixedQuestionIds, structuralQuestionIds)
-                assertEquals(20, resultsResponse.getValue("summary").jsonObject.getValue("expectedSourceHits").jsonPrimitive.content.toInt())
+                val retrievalSummary = resultsResponse.getValue("summary").jsonObject.getValue("retrieval").jsonArray
+                assertEquals(2, retrievalSummary.size)
+                assertTrue(retrievalSummary.all { row ->
+                    val metrics = row.jsonObject
+                    metrics.getValue("completedQuestions").jsonPrimitive.content.toInt() == 10 &&
+                        metrics.getValue("rawHitAtK").jsonPrimitive.content.toDouble() == 1.0 &&
+                        metrics.getValue("rawMrr").jsonPrimitive.content.toDouble() == 1.0 &&
+                        metrics.getValue("enhancedHitAtK").jsonPrimitive.content.toDouble() == 1.0 &&
+                        metrics.getValue("enhancedMrr").jsonPrimitive.content.toDouble() == 1.0
+                })
+                val firstBenchmarkRow = benchmarkRows.first { it.getValue("questionId").jsonPrimitive.content == "q01" }
+                assertEquals(1, firstBenchmarkRow.getValue("rawExpectedSourceRank").jsonPrimitive.content.toInt())
+                assertEquals(1, firstBenchmarkRow.getValue("expectedSourceRank").jsonPrimitive.content.toInt())
+                assertTrue(
+                    firstBenchmarkRow.getValue("rawRetrievedSources").jsonArray.first().jsonObject
+                        .getValue("quote").jsonPrimitive.content.startsWith("Orbit markers"),
+                )
+                assertEquals(20, fixture.rerankCalls.get() - rerankerCallsBeforeBenchmark)
 
                 val review = api.postJson(
                     "/api/benchmark/review",
@@ -218,6 +238,87 @@ class ApplicationServiceTest {
         }
     }
 
+
+    @Test
+    fun `retrieval summary uses ten question denominator for partial results`() {
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                val expectedSourceId = "00000000-0000-4000-8000-000000000001"
+                val distractorSourceId = "00000000-0000-4000-8000-000000000002"
+                val questions = (1..10).map { number ->
+                    BenchmarkQuestion(
+                        id = "q${number.toString().padStart(2, '0')}",
+                        question = "Synthetic question $number",
+                        expectedFacts = listOf("Expected fact $number"),
+                        expectedSources = listOf(
+                            BenchmarkExpectedSource(
+                                sourceId = expectedSourceId,
+                                location = SourceLocation(lineStart = 1, lineEnd = 1),
+                                section = "Document body",
+                            ),
+                        ),
+                    )
+                }
+                fixture.store.saveQuestions(questions)
+                fun scoredChunk(chunkId: String, sourceId: String, text: String) = ScoredChunk(
+                    chunk = StoredChunk(
+                        draft = ChunkDraft(
+                            strategy = ChunkStrategy.FIXED_SIZE,
+                            chunkId = chunkId,
+                            sourceId = sourceId,
+                            sourceName = "$chunkId.txt",
+                            section = "Document body",
+                            location = SourceLocation(lineStart = 1, lineEnd = 1),
+                            tokenUnits = 1,
+                            text = text,
+                        ),
+                        embedding = listOf(1f, 0f, 0f, 0f),
+                        embeddingModel = "fixture-embedding",
+                    ),
+                    cosineScore = 1.0,
+                )
+
+                val hit = scoredChunk("hit", expectedSourceId, "Expected excerpt")
+                fixture.store.saveResult(
+                    question = questions[0],
+                    strategy = ChunkStrategy.FIXED_SIZE,
+                    rawSources = listOf(hit),
+                    sources = listOf(hit),
+                    baselineAnswer = "Baseline",
+                    ragAnswer = "Grounded",
+                    rawExpectedSourceRank = 1,
+                    expectedSourceRank = 1,
+                    selection = ModelSelection("fixture", "fixture-chat"),
+                )
+                val miss = scoredChunk("miss", distractorSourceId, "Unrelated excerpt")
+                fixture.store.saveResult(
+                    question = questions[1],
+                    strategy = ChunkStrategy.FIXED_SIZE,
+                    rawSources = listOf(miss),
+                    sources = emptyList(),
+                    baselineAnswer = "Baseline",
+                    ragAnswer = "Abstain",
+                    rawExpectedSourceRank = null,
+                    expectedSourceRank = null,
+                    selection = ModelSelection("fixture", "fixture-chat"),
+                )
+
+                val summary = json(api.get("/api/benchmark/results").body()).jsonObject
+                    .getValue("summary").jsonObject.getValue("retrieval").jsonArray
+                    .map { it.jsonObject }.single { it.getValue("strategy").jsonPrimitive.content == "FIXED_SIZE" }
+                assertEquals(2, summary.getValue("completedQuestions").jsonPrimitive.content.toInt())
+                assertEquals(0.1, summary.getValue("rawHitAtK").jsonPrimitive.content.toDouble())
+                assertEquals(0.1, summary.getValue("rawMrr").jsonPrimitive.content.toDouble())
+                assertEquals(0.1, summary.getValue("enhancedHitAtK").jsonPrimitive.content.toDouble())
+                assertEquals(0.1, summary.getValue("enhancedMrr").jsonPrimitive.content.toDouble())
+            } finally {
+                fixture.close()
+            }
+        }
+    }
     @Test
     fun `HTTP import enforces the pending collection index run limit`() {
         FakeOllama().use { ollama ->
@@ -478,8 +579,10 @@ class ApplicationServiceTest {
                 assertEquals(200, noMatch.statusCode(), noMatch.body())
                 val ragNoMatch = json(noMatch.body()).jsonObject.getValue("rag").jsonObject
                 assertTrue(ragNoMatch.getValue("sources").jsonArray.isEmpty())
-                assertTrue(ragNoMatch.getValue("answer").jsonPrimitive.content
-                    .startsWith("В коллекции не найдено подходящих фрагментов."))
+                assertEquals(
+                    "Не знаю на основе текущих источников. Уточните вопрос или добавьте источник.",
+                    ragNoMatch.getValue("answer").jsonPrimitive.content,
+                )
             } finally {
                 fixture.close()
             }
@@ -529,7 +632,7 @@ class ApplicationServiceTest {
     }
 
     @Test
-    fun `HTTP benchmark labels answers when both strategies retrieve no evidence`() {
+    fun `HTTP benchmark retains baseline and abstains when enhanced retrieval has no evidence`() {
         FakeOllama().use { ollama ->
             val fixture = LocalRagFixture(temporaryDirectory, ollama)
             try {
@@ -582,16 +685,18 @@ class ApplicationServiceTest {
                 val rows = json(api.get("/api/benchmark/results").body()).jsonObject
                     .getValue("results").jsonArray.map { it.jsonObject }
                 assertEquals(20, rows.size)
-                assertEquals(30, fixture.generationCalls.get())
+                assertEquals(10, fixture.generationCalls.get())
+                assertEquals(0, fixture.rerankCalls.get())
                 assertTrue(rows.all {
                     it.getValue("providerId").jsonPrimitive.content == "fixture" &&
                         it.getValue("modelId").jsonPrimitive.content == "fixture-chat"
                 })
                 assertTrue(fixture.generationSelections.all { it == ModelSelection("fixture", "fixture-chat") })
-                assertTrue(rows.all { it.getValue("retrievedSources").jsonArray.isEmpty() })
                 assertTrue(rows.all {
-                    it.getValue("ragAnswer").jsonPrimitive.content
-                        .startsWith("В коллекции не найдено подходящих фрагментов.")
+                    it.getValue("rawRetrievedSources").jsonArray.single().jsonObject.getValue("source").jsonPrimitive.content == "guide.txt" &&
+                        it.getValue("retrievedSources").jsonArray.isEmpty() &&
+                        it.getValue("ragAnswer").jsonPrimitive.content ==
+                        "Не знаю на основе текущих источников. Уточните вопрос или добавьте источник."
                 })
             } finally {
                 fixture.close()
@@ -738,8 +843,9 @@ class ApplicationServiceTest {
         val sourcesDirectory = directory.resolve("sources")
         val credentialConfigured = AtomicBoolean(true)
         val generationCalls = AtomicInteger()
+        val rerankCalls = AtomicInteger()
         val index = SqliteIndexRepository(database)
-        private val store = BenchmarkStore(database)
+        val store = BenchmarkStore(database)
         private val jobs = JobManager()
         private val api = ollama.client()
         private val embeddings = OllamaEmbeddingPort(api)
@@ -768,7 +874,7 @@ class ApplicationServiceTest {
         private val chat = FixtureChat(generationCalls)
         val generationSelections: List<ModelSelection> get() = chat.selections.toList()
         fun holdNextGeneration() = chat.holdNext()
-        private val rag = RagService(index, embeddings, chat)
+        private val rag = RagService(index, embeddings, chat, FixtureReranker(rerankCalls))
         private val catalog = SourceCatalog(sourcesDirectory, index, store::deleteSourceReferences)
         private val indexing = IndexWorkflow(
             extractor = SourceExtractorRegistry(),
@@ -910,6 +1016,13 @@ class ApplicationServiceTest {
             }
             return if (context.isEmpty()) "Baseline answer without indexed sources."
             else "RAG answer grounded in imported context."
+        }
+    }
+
+    private class FixtureReranker(private val calls: AtomicInteger) : RerankPort {
+        override fun rerank(selection: ModelSelection, question: String, candidateTexts: List<String>): List<Int> {
+            calls.incrementAndGet()
+            return candidateTexts.indices.toList()
         }
     }
     private class FakeOllama : AutoCloseable {
