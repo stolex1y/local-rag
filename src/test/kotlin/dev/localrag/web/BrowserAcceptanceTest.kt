@@ -858,6 +858,22 @@ class BrowserAcceptanceTest {
         }
     }
 
+    private fun formatUiBytes(bytes: Long): String {
+        if (bytes < 1024) {
+            return java.text.NumberFormat.getIntegerInstance(Locale.forLanguageTag("ru-RU")).format(bytes) + " Б"
+        }
+        val units = listOf("КиБ", "МиБ", "ГиБ")
+        var value = bytes.toDouble()
+        var unit = -1
+        do {
+            value /= 1024
+            unit++
+        } while (value >= 1024 && unit < units.lastIndex)
+        return java.text.NumberFormat.getNumberInstance(Locale.forLanguageTag("ru-RU")).apply {
+            maximumFractionDigits = 1
+        }.format(value) + " " + units[unit]
+    }
+
     private fun exerciseUserJourney(fake: FakeOllama, probe: RequestProbe, port: Int, sourcesDirectory: Path) {
         val firstDuplicate = temporaryDirectory.resolve("first/version-note.txt")
         val secondDuplicate = temporaryDirectory.resolve("second/version-note.txt")
@@ -914,8 +930,8 @@ class BrowserAcceptanceTest {
                 page.locator("#source-files").setInputFiles(arrayOf(firstDuplicate, identicalCopy, secondDuplicate, html, code, invalidUtf8, binary, pdf, reference))
                 page.locator("#upload-button").click()
                 assertThat(page.locator("#upload-success")).containsText("6 файл(ов)")
-                assertThat(page.locator("#upload-success")).containsText("invalid-utf8.md")
-                assertThat(page.locator("#upload-success")).containsText("capture.bin")
+                assertThat(page.locator("#upload-success")).containsText("invalid-utf8.md: Файл не является корректным UTF-8 текстом.")
+                assertThat(page.locator("#upload-success")).containsText("capture.bin: Файл содержит бинарные или управляющие данные, а не UTF-8 текст.")
 
                 val duplicateRows = page.locator("#source-list .source-row").all()
                     .filter { it.locator(".source-name").textContent() == "version-note.txt" }
@@ -941,6 +957,20 @@ class BrowserAcceptanceTest {
                 val cancelledIndex = awaitDialog(page, dialogMessages)
                 assertTrue(cancelledIndex.contains("6 файлов"))
                 assertTrue(cancelledIndex.contains("greenhouse.html"))
+                val pendingTotalBytes = pendingFiles.sumOf { it.jsonObject.getValue("sizeBytes").jsonPrimitive.content.toLong() }
+                assertTrue(
+                    cancelledIndex.contains("Начать индексацию 6 файлов (${formatUiBytes(pendingTotalBytes)})"),
+                    "Index confirmation omitted or misreported the total size: $cancelledIndex",
+                )
+                pendingFiles.forEach { file ->
+                    val item = file.jsonObject
+                    val name = item.getValue("name").jsonPrimitive.content
+                    val sizeBytes = item.getValue("sizeBytes").jsonPrimitive.content.toLong()
+                    assertTrue(
+                        cancelledIndex.contains("$name (${formatUiBytes(sizeBytes)})"),
+                        "Index confirmation omitted or misreported size for $name: $cancelledIndex",
+                    )
+                }
                 assertEquals(0, fake.embeddingCalls.get())
                 assertThat(page.locator("#source-list")).containsText("ожидает индексации")
 
@@ -1100,23 +1130,42 @@ class BrowserAcceptanceTest {
                 assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
 
                 val malformedFile = temporaryDirectory.resolve("malformed-questions.json")
-                Files.writeString(malformedFile, """{"questions":[{"id":"q01"}]}""", UTF_8)
+                Files.writeString(malformedFile, """{"questions":"not-an-array"}""", UTF_8)
                 page.locator("#benchmark-file").setInputFiles(malformedFile)
-                page.waitForResponse("**/api/benchmark/questions") {
-                    page.locator("#benchmark-upload").click()
-                }
-                assertThat(page.locator("#benchmark-error")).not().hasText("")
+                page.locator("#benchmark-upload").click()
+                assertThat(page.locator("#benchmark-error")).containsText("Ожидается JSON-объект с массивом questions.")
                 assertTrue(page.locator("#benchmark-run").isEnabled())
+                assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
+                assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
+
                 val malformedSyntaxFile = temporaryDirectory.resolve("malformed-syntax.json")
                 Files.writeString(malformedSyntaxFile, "{\"questions\":[", UTF_8)
                 page.locator("#benchmark-file").setInputFiles(malformedSyntaxFile)
                 page.locator("#benchmark-upload").click()
                 assertThat(page.locator("#benchmark-error")).not().hasText("")
+                val malformedSyntaxError = page.locator("#benchmark-error").innerText()
+                assertFalse(malformedSyntaxError == "Ожидается JSON-объект с массивом questions.")
+                assertFalse(malformedSyntaxError == "Тело запроса не соответствует ожидаемому JSON-формату.")
+                assertTrue(
+                    malformedSyntaxError.contains("property", ignoreCase = true) ||
+                        malformedSyntaxError.contains("position", ignoreCase = true) ||
+                        malformedSyntaxError.contains("Unexpected end", ignoreCase = true),
+                    "Expected a syntax-specific JSON error, got: $malformedSyntaxError",
+                )
                 assertTrue(page.locator("#benchmark-run").isEnabled())
+                assertThat(page.locator("#benchmark-results")).containsText("Baseline · FAIL")
+                assertThat(page.locator("#benchmark-results")).containsText("RAG · PASS")
+                val resultsAfterMalformedJson = Json.parseToJsonElement(get("$origin/api/benchmark/results"))
+                    .jsonObject.getValue("results").jsonArray
+                assertEquals(preservedRows, resultsAfterMalformedJson, "Invalid JSON replaced or mutated benchmark results.")
                 val acceptedQuestions = Json.parseToJsonElement(get("$origin/api/benchmark/questions")).jsonObject
                 assertTrue(acceptedQuestions.getValue("runnable").jsonPrimitive.content.toBoolean())
-                assertEquals(10, acceptedQuestions.getValue("questions").jsonArray.size)
-                assertTrue(page.locator("#query-button").isEnabled())
+                assertEquals(
+                    unresolvedQuestionsState.getValue("questions"),
+                    acceptedQuestions.getValue("questions"),
+                    "Invalid JSON replaced the previously accepted question set.",
+                )
+
                 page.locator("#question").fill("What is the greenhouse humidity target?")
                 page.locator("#query-button").click()
                 assertThat(page.locator("#query-results")).containsText("greenhouse.html")
