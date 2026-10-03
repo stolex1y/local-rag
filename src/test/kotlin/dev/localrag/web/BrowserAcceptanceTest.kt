@@ -638,7 +638,13 @@ class BrowserAcceptanceTest {
                         page.onDialog { it.accept() }
                         page.locator("#source-files").setInputFiles(source)
                         page.locator("#upload-button").click()
-                        page.locator("#index-button").click()
+                        val indexStart = page.waitForResponse("**/api/index") {
+                            page.locator("#index-button").click()
+                        }
+                        assertEquals(202, indexStart.status())
+                        page.locator("#index-success").waitFor(
+                            com.microsoft.playwright.Locator.WaitForOptions().setTimeout(30_000.0),
+                        )
                         assertThat(page.locator("#index-success")).containsText("Индексация завершена")
 
                         fake.cloud.failReranker.set(true)
