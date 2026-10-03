@@ -109,6 +109,33 @@
     .rating-PASS { background: var(--success-bg); color: var(--success); }
     .rating-PARTIAL { background: var(--warning-bg); color: var(--warning); }
     .rating-FAIL { background: var(--danger-bg); color: var(--danger); }
+    .app-tabs { display: flex; gap: .6rem; margin: 1rem 0; border-bottom: 1px solid var(--line); }
+    .app-tabs button { border-radius: .55rem .55rem 0 0; }
+    .app-tabs button[aria-selected="false"] { color: var(--accent-dark); background: #fff; }
+    .chat-grid { display: grid; grid-template-columns: minmax(13rem, .28fr) minmax(0, 1fr); gap: .8rem; margin-top: 1rem; }
+    .chat-main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(16rem, .38fr); gap: .8rem; min-width: 0; }
+    .chat-sidebar, .chat-messages, .chat-state, .chat-memory { min-width: 0; padding: .8rem; border: 1px solid var(--line); border-radius: .65rem; background: #fcfefe; }
+    .chat-sidebar { display: flex; flex-direction: column; gap: .5rem; }
+    .chat-sidebar h3 { margin: .25rem 0 0; }
+    .chat-list { display: grid; gap: .4rem; max-height: 26rem; overflow: auto; }
+    .chat-list button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+    .chat-list button[aria-current="page"] { color: var(--accent-dark); background: var(--accent-soft); }
+    .chat-workspace { display: grid; gap: .7rem; align-content: start; min-width: 0; }
+    .chat-messages { display: grid; align-content: start; gap: .7rem; max-height: 65vh; min-height: 18rem; overflow: auto; }
+    .chat-bubble { padding: .75rem; border-radius: .65rem; background: #f1f6f5; overflow-wrap: anywhere; }
+    .chat-bubble.user { margin-left: 8%; background: #e2f3f0; }
+    .chat-bubble.assistant { margin-right: 8%; }
+    .chat-evidence { margin-top: .6rem; padding-top: .5rem; border-top: 1px solid var(--line); }
+    .chat-evidence h4 { margin: .25rem 0; font-size: .95rem; }
+    .chat-evidence ul, .memory-items { margin: .3rem 0 0; padding-left: 1.2rem; }
+    .memory-item { margin: .45rem 0; overflow-wrap: anywhere; }
+    .memory-item button { margin: .25rem .25rem 0 0; }
+    .chat-form { display: grid; gap: .55rem; margin-top: .75rem; }
+    .chat-form textarea { min-height: 5rem; }
+    .chat-state textarea { min-height: 4rem; }
+    .chat-state .field { margin-top: .5rem; }
+    .chat-message-error { margin: .5rem 0; }
+    .chat-meta { margin-top: .25rem; color: var(--muted); font-size: .82rem; }
     @media (max-width: 720px) {
       .upload-grid, .form-grid, .answers, .strategy-answers { grid-template-columns: 1fr; }
       .source-row { grid-template-columns: 1fr; }
@@ -116,6 +143,8 @@
       .panel-head { align-items: stretch; }
       .panel-head button { width: 100%; }
       .toolbar button, .actions button { flex: 1 1 100%; }
+      .chat-grid, .chat-main { grid-template-columns: 1fr; }
+      .chat-messages { max-height: 58vh; }
     }
     @media (max-width: 520px) {
       .wrap { width: min(100% - 1rem, 1140px); }
@@ -157,6 +186,11 @@
       <p class="job" id="job-progress" role="status" aria-live="polite" hidden></p>
       <progress id="job-meter" max="1" value="0" aria-label="Прогресс текущего задания" hidden></progress>
     </section>
+    <nav class="app-tabs" aria-label="Разделы приложения">
+      <button id="collection-tab" type="button" aria-selected="true">Источники и поиск</button>
+      <button id="chat-tab" type="button" aria-selected="false">Чат</button>
+    </nav>
+    <div id="collection-view">
 
     <section class="panel" aria-labelledby="sources-heading">
       <div class="panel-head">
@@ -233,6 +267,56 @@
       <div class="benchmark-summary" id="benchmark-summary" aria-live="polite"></div>
       <div id="benchmark-results" aria-live="polite"><p class="empty">Сохранённых результатов пока нет.</p></div>
     </section>
+    </div>
+    <section id="chat-view" class="chat-view" aria-labelledby="chat-heading" hidden>
+      <div class="panel">
+        <div class="panel-head">
+          <div><h2 id="chat-heading">Чат с RAG и памятью задачи</h2><p class="muted">Каждый ход ищет по текущим READY-источникам. Сессионная память не смешивается с общей.</p></div>
+          <div class="actions">
+            <button id="chat-new-session" type="button">Новая сессия</button>
+            <button id="chat-delete-session" class="danger" type="button" disabled>Удалить сессию</button>
+          </div>
+        </div>
+        <p id="chat-status" class="notice" role="status" aria-live="polite">Выберите или создайте сессию.</p>
+        <p id="chat-error" class="error chat-message-error" role="alert" hidden></p>
+        <div class="chat-grid">
+          <aside class="chat-sidebar" aria-label="Сессии и общая память">
+            <h3>Сессии</h3>
+            <div id="chat-sessions" class="chat-list" aria-live="polite"><p class="empty">Загружаем сессии…</p></div>
+            <h3>Общая память</h3>
+            <p class="chat-meta">Общие факты попадают сюда только после отдельного подтверждения.</p>
+            <div id="shared-memory-list" class="memory-items" aria-live="polite"><p class="empty">Загружаем факты…</p></div>
+          </aside>
+          <div class="chat-main">
+            <section class="chat-workspace" aria-label="Диалог">
+              <div id="chat-messages" class="chat-messages" role="log" aria-live="polite"><p class="empty">Создайте сессию, чтобы начать диалог.</p></div>
+              <form id="chat-form" class="chat-form">
+                <label for="chat-question">Сообщение</label>
+                <textarea id="chat-question" maxlength="4000" required placeholder="Задайте вопрос, уточните цель или добавьте ограничение"></textarea>
+                <button id="chat-send" type="submit" disabled>Отправить</button>
+              </form>
+            </section>
+            <div class="chat-workspace">
+              <section class="chat-state" aria-labelledby="task-state-heading">
+                <h3 id="task-state-heading">Состояние задачи</h3>
+                <form id="task-state-form">
+                  <div class="field"><label for="task-goal">Цель</label><input id="task-goal" maxlength="500"></div>
+                  <div class="field"><label for="task-clarifications">Уточнения · по одному на строку</label><textarea id="task-clarifications"></textarea></div>
+                  <div class="field"><label for="task-constraints">Ограничения · по одному на строку</label><textarea id="task-constraints"></textarea></div>
+                  <div class="field"><label for="task-terms">Термины · «термин — определение»</label><textarea id="task-terms"></textarea></div>
+                  <div class="actions"><button id="task-state-save" class="secondary" type="submit" disabled>Сохранить состояние</button></div>
+                </form>
+              </section>
+              <section class="chat-memory" aria-labelledby="session-memory-heading">
+                <h3 id="session-memory-heading">Факты этой сессии</h3>
+                <p class="chat-meta">Извлечены из подтверждённого состояния задачи. Передача в общую память — отдельное действие.</p>
+                <div id="session-memory-list" class="memory-items" aria-live="polite"><p class="empty">Пока нет фактов.</p></div>
+              </section>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <script>
@@ -241,6 +325,7 @@
 
       const $ = (selector, root = document) => root.querySelector(selector);
       const state = { modelsAvailable: false, embeddingAvailable: false, modelConfiguration: null, modelSelectionPending: false, activeJob: null, sources: [], benchmark: null, results: [] };
+      const chatState = { sessionId: null, detail: null, sessions: [], memoryFacts: [], sharedFacts: [], pendingTurn: null, busy: false, loadingSession: false, sessionLoadGeneration: 0, refreshGeneration: 0, activeTab: "collection" };
       const MAX_FILE_BYTES = 256 * 1024 * 1024;
       const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
       const MAX_BENCHMARK_FILE_BYTES = 1024 * 1024;
@@ -970,6 +1055,430 @@
         }
       }
 
+      function setChatUrl(tab, sessionId = chatState.sessionId, replace = false) {
+        const url = new URL(window.location.href);
+        url.searchParams.set("tab", tab);
+        if (sessionId) url.searchParams.set("session", sessionId);
+        else url.searchParams.delete("session");
+        window.history[replace ? "replaceState" : "pushState"]({}, "", url);
+      }
+
+      function showTab(tab, updateUrl = true, load = true) {
+        chatState.activeTab = tab === "chat" ? "chat" : "collection";
+        $("#collection-view").hidden = chatState.activeTab !== "collection";
+        $("#chat-view").hidden = chatState.activeTab !== "chat";
+        $("#collection-tab").setAttribute("aria-selected", String(chatState.activeTab === "collection"));
+        $("#chat-tab").setAttribute("aria-selected", String(chatState.activeTab === "chat"));
+        if (updateUrl) setChatUrl(chatState.activeTab);
+        if (load && chatState.activeTab === "chat") refreshChat().catch(error => message("chat-error", error.message));
+      }
+
+      async function loadChatFromUrl() {
+        const url = new URL(window.location.href);
+        const requestedSessionId = url.searchParams.get("session") || null;
+        const generation = ++chatState.sessionLoadGeneration;
+        chatState.loadingSession = true;
+        chatState.sessionId = requestedSessionId;
+        chatState.detail = null;
+        chatState.memoryFacts = [];
+        chatState.pendingTurn = null;
+        showTab(url.searchParams.get("tab") === "chat" ? "chat" : "collection", false, false);
+        renderChatMessages();
+        renderTaskState();
+        updateChatControls();
+        try {
+          await refreshChat(requestedSessionId);
+        } finally {
+          if (generation === chatState.sessionLoadGeneration) {
+            chatState.loadingSession = false;
+            renderChatSessions();
+            renderSessionMemory();
+            renderChatMessages();
+            renderTaskState();
+            updateChatControls();
+          }
+        }
+      }
+
+      async function refreshChat(sessionId = chatState.sessionId) {
+        const generation = ++chatState.refreshGeneration;
+        const isCurrent = () => generation === chatState.refreshGeneration && sessionId === chatState.sessionId;
+        const [sessions, sharedFacts] = await Promise.all([
+          request("/api/chat/sessions"),
+          request("/api/chat/memory/shared"),
+        ]);
+        if (!isCurrent()) return;
+        chatState.sessions = sessions;
+        chatState.sharedFacts = sharedFacts;
+        if (sessionId && !sessions.some(session => session.id === sessionId)) {
+          chatState.sessionId = null;
+          chatState.detail = null;
+          chatState.memoryFacts = [];
+          chatState.pendingTurn = null;
+          setChatUrl(chatState.activeTab, null, true);
+          message("chat-error", "Сессия больше не существует.");
+        }
+        if (chatState.sessionId) {
+          const activeSessionId = chatState.sessionId;
+          const [detail, memoryFacts] = await Promise.all([
+            request(`/api/chat/sessions/${encodeURIComponent(activeSessionId)}`),
+            request(`/api/chat/sessions/${encodeURIComponent(activeSessionId)}/memory`),
+          ]);
+          if (!isCurrent()) return;
+          chatState.detail = detail;
+          chatState.memoryFacts = memoryFacts;
+          const completedTurns = new Set(detail.messages
+            .filter(item => item.role === "ASSISTANT")
+            .map(item => item.turnId));
+          const pending = [...detail.messages].reverse().find(item => item.role === "USER" && !completedTurns.has(item.turnId));
+          chatState.pendingTurn = pending ? { turnId: pending.turnId, question: pending.content } : null;
+          $("#chat-status").textContent = `Сессия: ${detail.session.title}`;
+        } else {
+          chatState.detail = null;
+          chatState.memoryFacts = [];
+          chatState.pendingTurn = null;
+          $("#chat-status").textContent = "Выберите существующую сессию или создайте новую.";
+        }
+        renderChatSessions();
+        renderSharedFacts();
+        renderSessionMemory();
+        renderChatMessages();
+        renderTaskState();
+        updateChatControls();
+      }
+
+      function renderChatSessions() {
+        const list = $("#chat-sessions");
+        list.replaceChildren();
+        if (!chatState.sessions.length) list.append(node("p", "Сессий пока нет.", "empty"));
+        chatState.sessions.forEach(session => {
+          const button = node("button", `${session.title} · ${session.messageCount}`);
+          button.type = "button";
+          button.className = "secondary";
+          button.disabled = chatState.busy || chatState.loadingSession;
+          if (session.id === chatState.sessionId) button.setAttribute("aria-current", "page");
+          button.addEventListener("click", () => openChatSession(session.id));
+          list.append(button);
+        });
+      }
+
+      function renderSharedFacts() {
+        const list = $("#shared-memory-list");
+        list.replaceChildren();
+        if (!chatState.sharedFacts.length) {
+          list.append(node("p", "Общая память пуста.", "empty"));
+          return;
+        }
+        chatState.sharedFacts.forEach(fact => {
+          const item = node("div", undefined, "memory-item");
+          item.append(node("p", fact.text));
+          const edit = node("button", "Изменить", "secondary");
+          edit.type = "button";
+          edit.addEventListener("click", async () => {
+            const updated = window.prompt("Изменить общий факт", fact.text);
+            if (updated === null) return;
+            try {
+              await request(`/api/chat/memory/shared/${encodeURIComponent(fact.id)}`, jsonOptions("PUT", { content: updated }));
+              await refreshChat();
+            } catch (error) { message("chat-error", error.message); }
+          });
+          const remove = node("button", "Удалить", "danger");
+          remove.type = "button";
+          remove.addEventListener("click", async () => {
+            if (!window.confirm("Удалить этот факт из общей памяти?")) return;
+            try {
+              await request(`/api/chat/memory/shared/${encodeURIComponent(fact.id)}`, jsonOptions("DELETE", { confirm: true }));
+              await refreshChat();
+            } catch (error) { message("chat-error", error.message); }
+          });
+          item.append(edit, remove);
+          list.append(item);
+        });
+      }
+
+      function renderSessionMemory() {
+        const list = $("#session-memory-list");
+        list.replaceChildren();
+        if (!chatState.memoryFacts.length) {
+          list.append(node("p", "Пока нет сохранённых фактов состояния.", "empty"));
+          return;
+        }
+        chatState.memoryFacts.forEach(fact => {
+          const item = node("div", undefined, "memory-item");
+          item.append(node("p", fact.text));
+          const share = node("button", "Поделиться с другими сессиями", "secondary");
+          share.type = "button";
+          share.disabled = chatState.busy;
+          share.addEventListener("click", async () => {
+            if (!window.confirm("Скопировать этот факт в общую память? Он станет доступен другим сессиям.")) return;
+            try {
+              await request(`/api/chat/sessions/${encodeURIComponent(chatState.sessionId)}/memory/${encodeURIComponent(fact.id)}/share`, jsonOptions("POST", { confirm: true }));
+              await refreshChat();
+              message("chat-error", "Факт добавлен в общую память.", "success");
+            } catch (error) { message("chat-error", error.message); }
+          });
+          item.append(share);
+          list.append(item);
+        });
+      }
+
+      function renderTaskState() {
+        const taskState = chatState.detail?.taskState;
+        $("#task-goal").value = taskState?.goal || "";
+        $("#task-clarifications").value = (taskState?.clarifications || []).join("\n");
+        $("#task-constraints").value = (taskState?.constraints || []).join("\n");
+        $("#task-terms").value = (taskState?.terms || []).map(term => `${term.term} — ${term.definition}`).join("\n");
+      }
+
+      function renderChatMessages() {
+        const list = $("#chat-messages");
+        list.replaceChildren();
+        const messages = chatState.detail?.messages || [];
+        if (!messages.length) {
+          list.append(node("p", "Напишите первый вопрос. Поиск по документам выполняется для каждого хода.", "empty"));
+          return;
+        }
+        const completedTurns = new Set(messages.filter(item => item.role === "ASSISTANT").map(item => item.turnId));
+        messages.forEach(item => {
+          const role = item.role === "USER" ? "Вы" : "Ассистент";
+          const bubble = node("article", undefined, `chat-bubble ${item.role.toLowerCase()}`);
+          bubble.append(node("strong", role), node("p", item.content, "answer-text"));
+          bubble.append(node("div", `Сохранено ${item.createdAt}`, "chat-meta"));
+          if (item.role === "USER" && !completedTurns.has(item.turnId)) {
+            const retry = node("button", "Повторить этот ход", "secondary");
+            retry.type = "button";
+            retry.disabled = chatState.busy;
+            retry.addEventListener("click", () => sendChatTurn(item.turnId, item.content));
+            bubble.append(retry);
+          }
+          if (item.role === "ASSISTANT") {
+            const evidence = node("section", undefined, "chat-evidence");
+            evidence.append(node("h4", "Источники документов"));
+            evidence.append(renderChatDocumentSources(item.documentCitations));
+            evidence.append(node("h4", "Память"));
+            evidence.append(renderChatMemoryReferences(item.memoryReferences));
+            evidence.append(node("p", "Показан контекст, включённый в запрос; это не доказательство семантической опоры ответа.", "chat-meta"));
+            bubble.append(evidence);
+          }
+          list.append(bubble);
+        });
+        list.scrollTop = list.scrollHeight;
+      }
+
+      function renderChatDocumentSources(sources) {
+        const list = node("ul", undefined, "citations");
+        if (!sources?.length) {
+          list.append(node("li", "Документные фрагменты не найдены."));
+          return list;
+        }
+        sources.forEach(source => {
+          const location = source.location?.pageStart
+            ? `стр. ${source.location.pageStart}${source.location.pageEnd !== source.location.pageStart ? `–${source.location.pageEnd}` : ""}`
+            : source.location?.lineStart
+              ? `строки ${source.location.lineStart}${source.location.lineEnd !== source.location.lineStart ? `–${source.location.lineEnd}` : ""}`
+              : "место не указано";
+          const item = node("li", `${source.source} · ${source.section} · ${location}`);
+          if (source.quote) item.append(node("blockquote", source.quote, "citation-quote"));
+          list.append(item);
+        });
+        return list;
+      }
+
+      function renderChatMemoryReferences(references) {
+        const list = node("ul", undefined, "citations");
+        if (!references?.length) {
+          list.append(node("li", "Факты памяти не передавались."));
+          return list;
+        }
+        references.forEach(reference => {
+          const label = reference.scope === "SHARED" ? "Общая память" : "Память сессии";
+          list.append(node("li", `${label} · ${reference.id}: ${reference.text}`));
+        });
+        return list;
+      }
+
+      function updateChatControls() {
+        const locked = chatState.busy || chatState.loadingSession;
+        const hasSession = Boolean(chatState.sessionId && chatState.detail);
+        const canEditTaskState = hasSession && !locked;
+        $("#chat-new-session").disabled = locked;
+        $("#chat-delete-session").disabled = !hasSession || locked;
+        $("#chat-send").disabled = !hasSession || locked || Boolean(chatState.pendingTurn);
+        $("#task-state-save").disabled = !canEditTaskState;
+        $("#task-goal").disabled = !canEditTaskState;
+        $("#task-clarifications").disabled = !canEditTaskState;
+        $("#task-constraints").disabled = !canEditTaskState;
+        $("#task-terms").disabled = !canEditTaskState;
+        $("#chat-question").disabled = locked || Boolean(chatState.pendingTurn);
+        $("#chat-question").placeholder = chatState.pendingTurn
+          ? "Сначала повторите незавершённый ход выше."
+          : "Задайте вопрос, уточните цель или добавьте ограничение";
+      }
+
+      async function createChatSession() {
+        if (chatState.busy || chatState.loadingSession) return;
+        const generation = ++chatState.sessionLoadGeneration;
+        chatState.loadingSession = true;
+        updateChatControls();
+        try {
+          const detail = await request("/api/chat/sessions", jsonOptions("POST", {}));
+          if (generation !== chatState.sessionLoadGeneration) return;
+          chatState.sessionId = detail.session.id;
+          chatState.detail = null;
+          chatState.memoryFacts = [];
+          chatState.pendingTurn = null;
+          showTab("chat", false);
+          setChatUrl("chat", chatState.sessionId);
+          renderChatMessages();
+          renderTaskState();
+          await refreshChat(detail.session.id);
+          $("#chat-question").focus();
+        } catch (error) { message("chat-error", error.message); }
+        finally {
+          if (generation === chatState.sessionLoadGeneration) {
+            chatState.loadingSession = false;
+            renderChatSessions();
+            renderSessionMemory();
+            updateChatControls();
+          }
+        }
+      }
+
+      async function openChatSession(sessionId) {
+        if (chatState.busy || chatState.loadingSession || sessionId === chatState.sessionId) return;
+        const generation = ++chatState.sessionLoadGeneration;
+        chatState.loadingSession = true;
+        chatState.sessionId = sessionId;
+        chatState.detail = null;
+        chatState.memoryFacts = [];
+        chatState.pendingTurn = null;
+        setChatUrl("chat", sessionId);
+        renderChatSessions();
+        renderSessionMemory();
+        renderChatMessages();
+        renderTaskState();
+        updateChatControls();
+        try {
+          await refreshChat(sessionId);
+        } catch (error) {
+          message("chat-error", error.message);
+        } finally {
+          if (generation === chatState.sessionLoadGeneration) {
+            chatState.loadingSession = false;
+            renderChatSessions();
+            renderSessionMemory();
+            renderChatMessages();
+            renderTaskState();
+            updateChatControls();
+          }
+        }
+      }
+
+      async function sendChatTurn(retryTurnId = null, retryQuestion = null) {
+        if (chatState.busy || chatState.loadingSession) return;
+        if (!chatState.sessionId) {
+          await createChatSession();
+          if (!chatState.sessionId) return;
+        }
+        const pending = retryTurnId ? { turnId: retryTurnId, question: retryQuestion } : chatState.pendingTurn;
+        if (chatState.pendingTurn && !retryTurnId) return;
+        const question = pending?.question || $("#chat-question").value.trim();
+        if (!question) return;
+        const turnId = pending?.turnId || crypto.randomUUID();
+        chatState.pendingTurn = { turnId, question };
+        chatState.busy = true;
+        updateChatControls();
+        $("#chat-status").textContent = "Ищем по документам и изолированной памяти сессии…";
+        message("chat-error", "");
+        try {
+          await request(`/api/chat/sessions/${encodeURIComponent(chatState.sessionId)}/turns`, jsonOptions("POST", {
+            turnId,
+            question,
+            strategy: "STRUCTURAL",
+          }));
+          chatState.pendingTurn = null;
+          $("#chat-question").value = "";
+          await refreshChat();
+          message("chat-error", "");
+        } catch (error) {
+          try { await refreshChat(); } catch { }
+          message("chat-error", error.message);
+        } finally {
+          chatState.busy = false;
+          renderChatMessages();
+          renderSessionMemory();
+          updateChatControls();
+          $("#chat-status").textContent = chatState.detail ? `Сессия: ${chatState.detail.session.title}` : "Выберите или создайте сессию.";
+        }
+      }
+
+      async function saveTaskState(event) {
+        event.preventDefault();
+        if (!chatState.sessionId || chatState.busy || chatState.loadingSession) return;
+        const terms = [];
+        for (const line of $("#task-terms").value.split("\n").map(value => value.trim()).filter(Boolean)) {
+          const separator = line.indexOf(" — ");
+          if (separator <= 0 || separator + 3 >= line.length) {
+            message("chat-error", "Каждый термин задайте как «термин — определение».");
+            return;
+          }
+          terms.push({ term: line.slice(0, separator).trim(), definition: line.slice(separator + 3).trim() });
+        }
+        chatState.busy = true;
+        updateChatControls();
+        try {
+          await request(`/api/chat/sessions/${encodeURIComponent(chatState.sessionId)}/task-state`, jsonOptions("PUT", {
+            goal: $("#task-goal").value.trim() || null,
+            clarifications: $("#task-clarifications").value.split("\n").map(value => value.trim()).filter(Boolean),
+            constraints: $("#task-constraints").value.split("\n").map(value => value.trim()).filter(Boolean),
+            terms,
+          }));
+          await refreshChat();
+          message("chat-error", "Состояние задачи сохранено.", "success");
+        } catch (error) { message("chat-error", error.message); }
+        finally { chatState.busy = false; renderSessionMemory(); updateChatControls(); }
+      }
+
+      async function deleteChatSession() {
+        if (chatState.busy || chatState.loadingSession || !chatState.sessionId ||
+            !window.confirm("Удалить эту сессию, сообщения, факты и состояние задачи? Общая память останется.")) return;
+        const deletedSessionId = chatState.sessionId;
+        const navigationGeneration = chatState.sessionLoadGeneration;
+        chatState.busy = true;
+        updateChatControls();
+        try {
+          await request(`/api/chat/sessions/${encodeURIComponent(deletedSessionId)}`, jsonOptions("DELETE", { confirm: true }));
+          if (chatState.sessionId === deletedSessionId && chatState.sessionLoadGeneration === navigationGeneration) {
+            chatState.sessionId = null;
+            chatState.detail = null;
+            chatState.memoryFacts = [];
+            chatState.pendingTurn = null;
+            setChatUrl(chatState.activeTab, null);
+            await refreshChat(null);
+          } else {
+            await refreshChat(chatState.sessionId);
+          }
+        } catch (error) { message("chat-error", error.message); }
+        finally {
+          chatState.busy = false;
+          renderChatSessions();
+          renderSessionMemory();
+          renderChatMessages();
+          renderTaskState();
+          updateChatControls();
+        }
+      }
+
+      async function initializeTabs() {
+        $("#collection-tab").addEventListener("click", () => showTab("collection"));
+        $("#chat-tab").addEventListener("click", () => showTab("chat"));
+        $("#chat-new-session").addEventListener("click", createChatSession);
+        $("#chat-delete-session").addEventListener("click", deleteChatSession);
+        $("#chat-form").addEventListener("submit", event => { event.preventDefault(); sendChatTurn(); });
+        $("#task-state-form").addEventListener("submit", saveTaskState);
+        window.addEventListener("popstate", () => loadChatFromUrl().catch(error => message("chat-error", error.message)));
+        await loadChatFromUrl();
+      }
       $("#refresh-button").addEventListener("click", refresh);
       $("#refresh-sources").addEventListener("click", refreshSources);
       $("#source-files").addEventListener("change", renderUploadSelection);
@@ -981,6 +1490,7 @@
       $("#benchmark-upload").addEventListener("click", uploadBenchmark);
       $("#benchmark-run").addEventListener("click", runBenchmark);
       $("#benchmark-refresh").addEventListener("click", refresh);
+      initializeTabs().catch(error => message("chat-error", error.message));
       refresh();
     })();
   </script>

@@ -1,5 +1,8 @@
 package dev.localrag.web
 
+import dev.localrag.chat.ChatStore
+import dev.localrag.chat.ChatService
+
 import com.microsoft.playwright.BrowserType
 import com.microsoft.playwright.Playwright
 import com.microsoft.playwright.Page
@@ -70,6 +73,210 @@ class BrowserAcceptanceTest {
     lateinit var temporaryDirectory: Path
 
     @Test
+    fun chatSessionDisplaysRetrievedCitationsAndRestoresDirectUrl() {
+        withChatBrowser { page, app, fake ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            val sessionId = createChatSession(page)
+            val turnResponse = submitChatQuestion(page, "greenhouse payment date?")
+            val message = turnResponse.getValue("message").jsonObject
+            val citationData = message.getValue("documentCitations").jsonArray.single().jsonObject
+            val sources = Json.parseToJsonElement(
+                page.request().get("http://127.0.0.1:${app.server.port}/api/sources").text(),
+            ).jsonArray.map { it.jsonObject }
+            val expectedSourceId = sources.single {
+                it.getValue("name").jsonPrimitive.content == "greenhouse-chat.md"
+            }.getValue("sourceId").jsonPrimitive.content
+            assertEquals("greenhouse-chat.md", citationData.getValue("source").jsonPrimitive.content)
+            assertEquals(expectedSourceId, citationData.getValue("sourceId").jsonPrimitive.content)
+            assertEquals(1, citationData.getValue("location").jsonObject.getValue("lineStart").jsonPrimitive.content.toInt())
+            assertEquals(2, citationData.getValue("location").jsonObject.getValue("lineEnd").jsonPrimitive.content.toInt())
+            val quote = citationData.getValue("quote").jsonPrimitive.content
+            assertTrue("2026-03-15" in quote)
+            val providerPayload = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
+            assertTrue(providerPayload.getValue("document_chunks").jsonArray.any { quote in it.jsonPrimitive.content })
+            assertFalse(providerPayload.toString().contains("greenhouse-chat.md"))
+            val citation = page.locator(".chat-bubble.assistant .chat-evidence .citations")
+                .first().locator("li").first()
+            assertThat(citation).containsText("greenhouse-chat.md · Greenhouse · строки 1–2")
+            assertThat(citation).containsText("2026-03-15")
+            assertThat(page.locator(".chat-bubble.assistant .chat-evidence")).containsText("Источники документов")
+            assertThat(page.locator(".chat-bubble.assistant .chat-evidence")).containsText("Память")
+
+            page.reload()
+            assertEquals(sessionId, page.url().substringAfter("session="))
+            assertThat(page.locator("#chat-messages")).containsText("Synthetic chat answer.")
+            assertThat(page.locator(".chat-bubble.assistant .citations").first()).containsText("greenhouse-chat.md")
+        }
+    }
+
+    @Test
+    fun chatSessionsKeepLongTaskStatePrivateAndExposeOnlyExplicitlySharedMemory() {
+        withChatBrowser { page, _, fake ->
+            val dialogMessages = CopyOnWriteArrayList<String>()
+            page.onDialog {
+                dialogMessages.add(it.message())
+                it.accept()
+            }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            val taskSessionA = createChatSession(page)
+            for (turn in 1..12) {
+                submitChatQuestion(page, if (turn == 1) "session-A goal" else "session-A turn $turn")
+            }
+            assertThat(page.locator("#task-goal")).hasValue("Goal A")
+            assertThat(page.locator("#task-clarifications")).hasValue("Clarification A")
+            assertThat(page.locator("#task-constraints")).hasValue("Constraint A")
+            assertThat(page.locator("#task-terms")).hasValue("A-term — Term A")
+            val lastRequestA = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
+            assertEquals(8, lastRequestA.getValue("previous_messages").jsonArray.size)
+            assertEquals("Goal A", lastRequestA.getValue("task_state").jsonObject.getValue("goal").jsonPrimitive.content)
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Current goal: Goal A")
+            repeat(12) { index ->
+                assertThat(page.locator(".chat-bubble.assistant").nth(index).locator(".chat-evidence"))
+                    .containsText("greenhouse-chat.md")
+            }
+
+            page.reload()
+            assertThat(page.locator("#task-goal")).hasValue("Goal A")
+            assertThat(page.locator("#task-clarifications")).hasValue("Clarification A")
+            assertThat(page.locator("#task-constraints")).hasValue("Constraint A")
+            assertThat(page.locator("#task-terms")).hasValue("A-term — Term A")
+            val memoryEvidence = page.locator(".chat-bubble.assistant").last()
+                .locator(".chat-evidence .citations").nth(1)
+            assertThat(memoryEvidence).containsText("Факты памяти не передавались.")
+            page.locator(".memory-item").filter(
+                com.microsoft.playwright.Locator.FilterOptions().setHasText("Цель задачи: Goal A"),
+            ).locator("button").click()
+            assertThat(page.locator("#chat-error")).containsText("добавлен в общую память")
+
+            val taskSessionB = createChatSession(page)
+            assertNotEquals(taskSessionA, taskSessionB)
+            for (turn in 1..12) {
+                submitChatQuestion(page, if (turn == 1) "session-B goal" else "session-B turn $turn")
+                if (turn == 1) {
+                    val firstRequestB = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
+                    val firstContext = firstRequestB.toString()
+                    assertTrue("Цель задачи: Goal A" in firstContext)
+                    assertFalse("Clarification A" in firstContext)
+                    assertFalse("Constraint A" in firstContext)
+                    assertFalse("A-term" in firstContext)
+                    assertTrue(firstRequestB.getValue("previous_messages").jsonArray.isEmpty())
+                    val sharedEvidence = page.locator(".chat-bubble.assistant").last()
+                        .locator(".chat-evidence .citations").nth(1)
+                    assertThat(sharedEvidence).containsText("Общая память ·")
+                    assertThat(sharedEvidence).containsText("Цель задачи: Goal A")
+                }
+            }
+            val lastRequestB = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
+            val sessionBContext = lastRequestB.toString()
+            assertTrue("Цель задачи: Goal A" in sessionBContext)
+            assertFalse("Clarification A" in sessionBContext)
+            assertFalse("Constraint A" in sessionBContext)
+            assertFalse("A-term" in sessionBContext)
+            assertEquals(8, lastRequestB.getValue("previous_messages").jsonArray.size)
+            assertEquals("Goal B", page.locator("#task-goal").inputValue())
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Current goal: Goal B")
+            repeat(12) { index ->
+                assertThat(page.locator(".chat-bubble.assistant").nth(index).locator(".chat-evidence"))
+                    .containsText("greenhouse-chat.md")
+            }
+            assertTrue(dialogMessages.contains("Скопировать этот факт в общую память? Он станет доступен другим сессиям."))
+            page.navigate("${page.url().substringBefore('?')}?tab=chat&session=$taskSessionA")
+            assertThat(page.locator("#task-goal")).hasValue("Goal A")
+            page.locator("#chat-delete-session").click()
+            page.waitForFunction("() => !new URL(location.href).searchParams.has('session')")
+            assertTrue(dialogMessages.contains("Удалить эту сессию, сообщения, факты и состояние задачи? Общая память останется."))
+            assertThat(page.locator("#chat-sessions")).not().containsText("session-A goal")
+            assertThat(page.locator("#chat-sessions")).containsText("session-B goal")
+            assertThat(page.locator("#shared-memory-list")).containsText("Цель задачи: Goal A")
+        }
+    }
+
+    @Test
+    fun malformedChatResponseKeepsUserTurnAndCanRetryWithoutDuplicate() {
+        withChatBrowser { page, _, fake ->
+            page.locator("#chat-tab").click()
+            createChatSession(page)
+            page.locator("#task-goal").fill("Prior synthetic goal")
+            page.locator("#task-state-save").click()
+            assertThat(page.locator("#chat-error")).containsText("Состояние задачи сохранено.")
+            fake.cloud.malformedStructuredResponse.set(true)
+            page.locator("#chat-question").fill("Retry this synthetic turn")
+            page.locator("#chat-send").click()
+            page.locator("#chat-error").waitFor()
+            assertEquals(1, page.locator(".chat-bubble.user").count())
+            assertEquals(0, page.locator(".chat-bubble.assistant").count())
+            assertThat(page.locator("#task-goal")).hasValue("Prior synthetic goal")
+            assertThat(page.locator(".chat-bubble.user button")).containsText("Повторить этот ход")
+
+            page.locator(".chat-bubble.user button").click()
+            assertThat(page.locator(".chat-bubble.assistant")).containsText("Не знаю на основе текущих источников.")
+            assertEquals(1, page.locator(".chat-bubble.user").count())
+            assertEquals(1, page.locator(".chat-bubble.assistant").count())
+            assertThat(page.locator("#task-goal")).hasValue("Prior synthetic goal")
+            val evidence = page.locator(".chat-bubble.assistant .chat-evidence .citations")
+            assertThat(evidence.nth(0)).containsText("Документные фрагменты не найдены.")
+            assertThat(evidence.nth(1)).containsText("Факты памяти не передавались.")
+        }
+    }
+
+    private fun withChatBrowser(block: (Page, BrowserAppFixture, FakeOllama) -> Unit) {
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("chat-browser-app-data"))
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    page.setDefaultTimeout(30_000.0)
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                        page.navigate("http://127.0.0.1:${app.server.port}/")
+                        block(page, app, fake)
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
+
+    private fun indexSyntheticGreenhouseSource(page: Page) {
+        val source = temporaryDirectory.resolve("greenhouse-chat.md")
+        Files.writeString(source, "# Greenhouse\nThe greenhouse payment date is 2026-03-15.\n")
+        page.locator("#source-files").setInputFiles(source)
+        page.locator("#upload-button").click()
+        assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+        page.locator("#index-button").click()
+        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+    }
+
+    private fun createChatSession(page: Page): String {
+        val previousId = page.url().substringAfter("session=", "")
+        page.waitForResponse("**/api/chat/sessions") {
+            page.locator("#chat-new-session").click()
+        }
+        page.waitForFunction(
+            "() => { const id = new URL(location.href).searchParams.get('session'); return Boolean(id) && id !== '$previousId'; }",
+        )
+        return page.url().substringAfter("session=")
+    }
+
+    private fun submitChatQuestion(page: Page, question: String): JsonObject {
+        page.locator("#chat-question").fill(question)
+        val response = page.waitForResponse("**/api/chat/sessions/*/turns") {
+            page.locator("#chat-send").click()
+        }
+        assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Synthetic chat answer.")
+        return Json.parseToJsonElement(response.text()).jsonObject
+    }
+
+    @Test
     fun fullSourceAndBenchmarkJourneyPreservesStateAndDeduplicatesContent() {
         FakeOllama().use { fake ->
             RequestProbe().use { probe ->
@@ -78,6 +285,7 @@ class BrowserAcceptanceTest {
             try {
                 val benchmarkStore = BenchmarkStore(paths.database)
                 try {
+                    val chatStore = ChatStore(paths.database)
                     val jobs = JobManager()
                     try {
                         val catalog = SourceCatalog(paths.sources, index, benchmarkStore::deleteSourceReferences)
@@ -86,6 +294,7 @@ class BrowserAcceptanceTest {
                         val modelConfiguration = modelConfiguration(paths, fake.cloud)
                         val chat = ChatCompletionsApi(modelConfiguration)
                         val rag = RagService(index, embeddings, chat, chat)
+                        val chatService = ChatService(chatStore, rag, chat, embeddings)
                         val indexing = IndexWorkflow(
                             extractor = SourceExtractorRegistry(),
                             chunkers = listOf(FixedSizeChunker(), StructuralChunker()),
@@ -94,13 +303,14 @@ class BrowserAcceptanceTest {
                             sourcesDirectory = paths.sources,
                         )
                         val benchmark = BenchmarkRunner(rag, benchmarkStore, index)
-                        val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration)
+                        val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration, chatStore, chatService)
                         LocalHttpServer(application, 0).use { server ->
                             server.start()
                             exerciseUserJourney(fake, probe, server.port, paths.sources)
                         }
                     } finally {
                         jobs.close()
+                        chatStore.close()
                     }
                 } finally {
                     benchmarkStore.close()
@@ -1359,11 +1569,13 @@ class BrowserAcceptanceTest {
     ) : AutoCloseable {
         private val index = SqliteIndexRepository(paths.database)
         private val benchmarkStore = BenchmarkStore(paths.database)
+        private val chatStore = ChatStore(paths.database)
         private val jobs = JobManager()
         private val ollama = OllamaApi(fake.uri)
         private val embeddings = OllamaEmbeddingPort(ollama)
         private val chat = ChatCompletionsApi(modelConfiguration)
         private val rag = RagService(index, embeddings, chat, chat)
+        private val chatService = ChatService(chatStore, rag, chat, embeddings)
         private val catalog = SourceCatalog(paths.sources, index, benchmarkStore::deleteSourceReferences)
         private val indexing = IndexWorkflow(
             extractor = SourceExtractorRegistry(),
@@ -1373,7 +1585,7 @@ class BrowserAcceptanceTest {
             sourcesDirectory = paths.sources,
         )
         private val benchmark = BenchmarkRunner(rag, benchmarkStore, index)
-        private val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration)
+        private val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration, chatStore, chatService)
         val server = LocalHttpServer(application, 0)
 
         init {
@@ -1382,7 +1594,7 @@ class BrowserAcceptanceTest {
 
         override fun close() {
             server.close()
-            jobs.close()
+            chatStore.close()
             benchmarkStore.close()
             index.close()
         }
@@ -1450,6 +1662,7 @@ class BrowserAcceptanceTest {
     }
     private class FakeDeepSeek : AutoCloseable {
         val failChat = AtomicBoolean(false)
+        val malformedStructuredResponse = AtomicBoolean(false)
         val failReranker = AtomicBoolean(false)
         val credentialConfigured = AtomicBoolean(true)
         val chatMessages = CopyOnWriteArrayList<List<String>>()
@@ -1481,6 +1694,53 @@ class BrowserAcceptanceTest {
                         .getValue("candidates").jsonArray.size
                     val reversed = (candidateCount - 1 downTo 0).joinToString(",")
                     respond(exchange, 200, """{"choices":[{"message":{"content":"{\"ranked_indices\":[$reversed]}"}}]}""")
+                } else if (request.containsKey("response_format")) {
+                    val payload = Json.parseToJsonElement(messages.last()).jsonObject
+                    val question = payload.getValue("question").jsonPrimitive.content
+                    val currentGoal = payload.getValue("task_state").jsonObject.getValue("goal")
+                    val firstSessionA = currentGoal == kotlinx.serialization.json.JsonNull && question.contains("session-A", ignoreCase = true)
+                    val firstSessionB = currentGoal == kotlinx.serialization.json.JsonNull && question.contains("session-B", ignoreCase = true)
+                    val answerGoal = when {
+                        firstSessionA -> "Goal A"
+                        firstSessionB -> "Goal B"
+                        currentGoal != kotlinx.serialization.json.JsonNull -> currentGoal.jsonPrimitive.content
+                        else -> null
+                    }
+                    val delta = buildJsonObject {
+                        put("goal", when {
+                            firstSessionA -> JsonPrimitive("Goal A")
+                            firstSessionB -> JsonPrimitive("Goal B")
+                            else -> kotlinx.serialization.json.JsonNull
+                        })
+                        put("clarifications_to_add", buildJsonArray {
+                            if (firstSessionA) add(JsonPrimitive("Clarification A"))
+                            if (firstSessionB) add(JsonPrimitive("Clarification B"))
+                        })
+                        put("constraints_to_add", buildJsonArray {
+                            if (firstSessionA) add(JsonPrimitive("Constraint A"))
+                            if (firstSessionB) add(JsonPrimitive("Constraint B"))
+                        })
+                        put("terms_to_add", buildJsonArray {
+                            if (firstSessionA) add(buildJsonObject { put("term", "A-term"); put("definition", "Term A") })
+                            if (firstSessionB) add(buildJsonObject { put("term", "B-term"); put("definition", "Term B") })
+                        })
+                    }
+                    val structuredContent = if (malformedStructuredResponse.compareAndSet(true, false)) {
+                        """{"answer":"Malformed synthetic answer","task_state_delta":{"goal":"broken"}}"""
+                    } else {
+                        buildJsonObject {
+                            put("answer", answerGoal?.let { "Synthetic chat answer. Current goal: $it" } ?: "Synthetic chat answer.")
+                            put("task_state_delta", delta)
+                        }.toString()
+                    }
+                    val response = buildJsonObject {
+                        put("choices", buildJsonArray {
+                            add(buildJsonObject {
+                                put("message", buildJsonObject { put("content", JsonPrimitive(structuredContent)) })
+                            })
+                        })
+                    }.toString()
+                    respond(exchange, 200, response)
                 } else {
                     respond(exchange, 200, """{"choices":[{"message":{"content":"Synthetic answer."}}]}""")
                 }
