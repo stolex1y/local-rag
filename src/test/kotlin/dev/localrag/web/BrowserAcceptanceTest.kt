@@ -1337,7 +1337,13 @@ class BrowserAcceptanceTest {
                 page.locator("#benchmark-upload").click()
                 assertThat(page.locator("#benchmark-error")).containsText("Набор сохранён")
 
-                page.locator("#benchmark-run").click()
+                val benchmarkStart = page.waitForResponse("**/api/benchmark/run") {
+                    page.locator("#benchmark-run").click()
+                }
+                assertEquals(202, benchmarkStart.status())
+                page.locator("#benchmark-error").waitFor(
+                    com.microsoft.playwright.Locator.WaitForOptions().setTimeout(30_000.0),
+                )
                 assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
                 val expectedSources = page.locator("#benchmark-results .gold p").allInnerTexts()
                 assertTrue(expectedSources.any { it.contains("synthetic-observatory.md [") })
