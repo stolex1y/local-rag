@@ -222,6 +222,54 @@ class BrowserAcceptanceTest {
         }
     }
 
+
+    @Test
+    fun chatLeavesCollectionAndBenchmarkFlowsUsable() {
+        withChatBrowser { page, app, _ ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            createChatSession(page)
+            submitChatQuestion(page, "greenhouse payment date?")
+
+            page.locator("#collection-tab").click()
+            assertThat(page.locator("#source-list")).containsText("greenhouse-chat.md")
+            assertThat(page.locator("#model-select")).hasValue("deepseek-flash")
+            page.locator("#question").fill("What is the greenhouse payment date?")
+            val queryResponse = page.waitForResponse("**/api/query") {
+                page.locator("#query-button").click()
+            }
+            assertEquals(200, queryResponse.status())
+            assertThat(page.locator("#query-results")).containsText("greenhouse-chat.md")
+            assertThat(page.locator("#query-results")).containsText("строки 1–2")
+            assertThat(page.locator("#query-results")).containsText("2026-03-15")
+
+            val source = Json.parseToJsonElement(
+                page.request().get("http://127.0.0.1:${app.server.port}/api/sources").text(),
+            ).jsonArray.single { it.jsonObject.getValue("name").jsonPrimitive.content == "greenhouse-chat.md" }
+                .jsonObject
+            val sourceId = source.getValue("sourceId").jsonPrimitive.content
+            val questionsFile = temporaryDirectory.resolve("chat-followup-benchmark.json")
+            Files.writeString(
+                questionsFile,
+                benchmarkQuestions(
+                    sourceId,
+                    2,
+                    "The greenhouse payment date is 2026-03-15.",
+                    questionText = "What is the greenhouse payment date?",
+                    questionCount = 10,
+                ),
+                UTF_8,
+            )
+            page.locator("#benchmark-file").setInputFiles(questionsFile)
+            page.locator("#benchmark-upload").click()
+            assertThat(page.locator("#benchmark-error")).containsText("Набор сохранён")
+            page.locator("#benchmark-run").click()
+            assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
+            assertThat(page.locator("#benchmark-results")).containsText("Baseline")
+            assertThat(page.locator("#benchmark-results")).containsText("RAG")
+        }
+    }
     private fun withChatBrowser(block: (Page, BrowserAppFixture, FakeOllama) -> Unit) {
         FakeOllama().use { fake ->
             val paths = LocalRagPaths(temporaryDirectory.resolve("chat-browser-app-data"))
