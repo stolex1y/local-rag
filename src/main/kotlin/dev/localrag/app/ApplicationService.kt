@@ -154,17 +154,9 @@ class ApplicationService(
         )
     }
 
-    fun promoteChatFact(sessionId: String, memoryId: String, confirmed: Boolean): ChatMemoryFactSummary {
-        chatSession(sessionId)
-        return chatService.promoteSessionFact(sessionId, memoryId, confirmed)
-    }
 
     fun sharedChatFacts(): List<ChatMemoryFactSummary> = chatService.sharedFacts()
 
-    fun sessionChatMemory(sessionId: String): List<ChatMemoryFactSummary> {
-        chatSession(sessionId)
-        return chatService.sessionMemoryFacts(sessionId)
-    }
 
     fun deleteSharedChatFact(memoryId: String, confirmed: Boolean) = chatService.deleteSharedFact(memoryId, confirmed)
     fun updateSharedChatFact(memoryId: String, content: String): ChatMemoryFactSummary =

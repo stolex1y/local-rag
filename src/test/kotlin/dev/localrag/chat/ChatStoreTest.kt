@@ -28,7 +28,7 @@ class ChatStoreTest {
     lateinit var temporaryDirectory: Path
 
     @Test
-    fun `sessions persist user turns update title and delete only session data`() {
+    fun `sessions persist user turns and keep new titles neutral until generation`() {
         val database = temporaryDirectory.resolve("chat.sqlite")
         ChatStore(database).use { store ->
             val first = store.createSession()
@@ -39,7 +39,7 @@ class ChatStoreTest {
             val repeated = store.saveUserMessage(first.session.id, turnId, "  Импортируй выписку  ")
             assertEquals(saved.id, repeated.id)
             assertEquals(1, store.sessionDetail(first.session.id)?.session?.messageCount)
-            assertEquals("Импортируй выписку", store.sessionDetail(first.session.id)?.session?.title)
+            assertEquals(ChatStore.NEW_SESSION_TITLE, store.sessionDetail(first.session.id)?.session?.title)
             assertEquals("Новая сессия", store.sessionDetail(second.session.id)?.session?.title)
             assertEquals(1, store.sessions().first().messageCount)
             assertTrue(runCatching { store.saveUserMessage(first.session.id, turnId, "изменённый текст") }.isFailure)
@@ -137,6 +137,51 @@ class ChatStoreTest {
         }
         assertEquals(savedModelSelection, java.nio.file.Files.readString(modelSelectionPath))
         assertEquals(ChatStore.CHAT_SCHEMA_VERSION, userVersion(database))
+    }
+
+    @Test
+    fun `title migration preserves legacy names and generated titles freeze after first completion`() {
+        val database = temporaryDirectory.resolve("legacy-title.sqlite")
+        val legacySessionId = UUID.randomUUID().toString()
+        DriverManager.getConnection("jdbc:sqlite:${database.toAbsolutePath()}").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.execute(
+                    "CREATE TABLE chat_sessions(session_id TEXT PRIMARY KEY,title TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
+                )
+            }
+            connection.prepareStatement(
+                "INSERT INTO chat_sessions(session_id,title,created_at,updated_at) VALUES (?,?,?,?)",
+            ).use { statement ->
+                statement.setString(1, legacySessionId)
+                statement.setString(2, "Legacy user-visible title")
+                statement.setString(3, "2026-10-01T00:00:00Z")
+                statement.setString(4, "2026-10-01T00:00:00Z")
+                statement.executeUpdate()
+            }
+        }
+
+        ChatStore(database).use { store ->
+            assertTrue(store.sessionTitleGenerated(legacySessionId))
+            store.saveUserMessage(legacySessionId, UUID.randomUUID().toString(), "Legacy conversation")
+            assertEquals("Legacy user-visible title", store.sessionDetail(legacySessionId)?.session?.title)
+
+            val created = store.createSession().session.id
+            assertFalse(store.sessionTitleGenerated(created))
+            val turnId = UUID.randomUUID().toString()
+            store.saveUserMessage(created, turnId, "Initial request that must not become the title")
+            assertEquals(ChatStore.NEW_SESSION_TITLE, store.sessionDetail(created)?.session?.title)
+            store.completeTurn(
+                sessionId = created,
+                turnId = turnId,
+                answer = "Synthetic answer",
+                citations = emptyList(),
+                memoryReferences = emptyList(),
+                taskState = ChatTaskState(),
+                sessionTitle = "Context-based synthetic title",
+            )
+            assertTrue(store.sessionTitleGenerated(created))
+            assertEquals("Context-based synthetic title", store.sessionDetail(created)?.session?.title)
+        }
     }
 
     @Test

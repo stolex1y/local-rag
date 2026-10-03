@@ -38,46 +38,101 @@ class ChatService(
         val completed = store.assistantMessage(sessionId, turnId)
         if (completed != null) return ChatTurnResponse(completed, store.taskState(sessionId))
         val retrieved = rag.retrieveForChat(question, strategy, topK, selection).enhanced
-        val sharedFacts = store.memoryFacts(sessionId).filter { it.scope == ChatMemoryScope.SHARED }
-        val queryEmbedding = if (sharedFacts.isEmpty()) emptyList() else embedOne(question)
-        val selectedSharedFacts = selectFacts(sharedFacts, ChatMemoryScope.SHARED, queryEmbedding)
+        val existingFacts = store.memoryFacts(sessionId)
+        val queryEmbedding = if (existingFacts.isEmpty()) emptyList() else embedOne(question)
+        val selectedSessionFacts = selectFacts(
+            existingFacts.filter { it.scope == ChatMemoryScope.SESSION },
+            ChatMemoryScope.SESSION,
+            queryEmbedding,
+        )
+        val selectedSharedFacts = selectFacts(
+            existingFacts.filter { it.scope == ChatMemoryScope.SHARED },
+            ChatMemoryScope.SHARED,
+            queryEmbedding,
+        )
+        val sessionCandidates = selectedSessionFacts.mapIndexed { index, fact ->
+            ChatMemoryCandidate("S${index + 1}", fact.scope, fact.text)
+        }
+        val sharedCandidates = selectedSharedFacts.mapIndexed { index, fact ->
+            ChatMemoryCandidate("M${index + 1}", fact.scope, fact.text)
+        }
+        val documentCandidates = retrieved.mapIndexed { index, chunk ->
+            ChatDocumentCandidate("D${index + 1}", chunk.chunk.draft.text)
+        }
         val state = store.taskState(sessionId)
+        val generateTitle = !store.sessionTitleGenerated(sessionId)
         val result = generator.completeTurn(
             selection,
             ChatTurnRequest(
                 question = question,
                 previousMessages = previous,
                 taskState = state,
-                sharedFacts = selectedSharedFacts,
-                documentChunks = retrieved.map { it.chunk.draft.text },
+                sessionFacts = sessionCandidates,
+                sharedFacts = sharedCandidates,
+                documentCandidates = documentCandidates,
+                generateTitle = generateTitle,
             ),
         )
         validateDelta(result.taskStateDelta)
+        validateMemoryUpdates(result.memoryUpdates)
         val nextState = merge(state, result.taskStateDelta)
-        val newFacts = stateFacts(nextState)
-        val factVectors = if (newFacts.isEmpty()) emptyList() else embeddings.embed(newFacts)
-        require(factVectors.size == newFacts.size && factVectors.all { it.isNotEmpty() }) {
+        val documentsByRef = documentCandidates.associateBy(ChatDocumentCandidate::refId)
+        require(result.documentCitationRefs.distinct().size == result.documentCitationRefs.size) {
+            "Модель вернула повторную ссылку на источник."
+        }
+        val citations = result.documentCitationRefs.map { ref ->
+            val index = ref.removePrefix("D").toIntOrNull()?.minus(1)
+            require(ref in documentsByRef && index != null && index in retrieved.indices) {
+                "Модель вернула неизвестную ссылку на документ."
+            }
+            retrieved[index].toCitation()
+        }
+        val memoryByRef = (sessionCandidates + sharedCandidates).associateBy(ChatMemoryCandidate::refId)
+        require(result.memoryReferenceRefs.distinct().size == result.memoryReferenceRefs.size) {
+            "Модель вернула повторную ссылку на память."
+        }
+        val memoryReferences = result.memoryReferenceRefs.map { ref ->
+            val candidate = memoryByRef[ref] ?: throw IllegalArgumentException("Модель вернула неизвестную ссылку на память.")
+            val fact = (selectedSessionFacts + selectedSharedFacts).first { it.scope == candidate.scope && it.text == candidate.text }
+            ChatMemoryReference(fact.scope, fact.id, fact.text)
+        }
+        val title = if (generateTitle) {
+            requireNotNull(result.sessionTitle) { "Модель не вернула название новой сессии." }
+                .trim().replace(WHITESPACE, " ")
+                .also { require(it.isNotEmpty() && it.length <= ChatStore.MAX_TITLE_LENGTH) { "Модель вернула некорректное название сессии." } }
+        } else {
+            require(result.sessionTitle == null) { "Модель не должна менять название существующей сессии." }
+            null
+        }
+        val memoryTexts = result.memoryUpdates.map(ChatMemoryUpdate::content).distinctBy(::normalize)
+        val vectors = if (memoryTexts.isEmpty()) emptyList() else embeddings.embed(memoryTexts)
+        require(vectors.size == memoryTexts.size && vectors.all { it.isNotEmpty() }) {
             "Embedding-сервис вернул неполный вектор для локальной памяти."
         }
-        val factDrafts = newFacts.zip(factVectors).map { (text, vector) ->
-            ChatMemoryFactDraft(text, vector, embeddings.modelName)
+        val draftsByText = memoryTexts.zip(vectors).associate { (text, vector) ->
+            normalize(text) to ChatMemoryFactDraft(text, vector, embeddings.modelName)
         }
-        val hasSupportingEvidence = retrieved.isNotEmpty() || selectedSharedFacts.isNotEmpty()
-        val references = if (hasSupportingEvidence) {
-            selectedSharedFacts.map { fact -> ChatMemoryReference(fact.scope, fact.id, fact.text) }
-        } else {
-            emptyList()
-        }
-        val citations = if (hasSupportingEvidence) retrieved.map { it.toCitation() } else emptyList()
-        val answer = if (hasSupportingEvidence) result.answer else ABSTENTION
+        val sessionUpdates = result.memoryUpdates.filter { it.scope == ChatMemoryScope.SESSION }
+            .mapNotNull { draftsByText[normalize(it.content)] }
+        val updatedSessionContent = sessionUpdates.mapTo(HashSet()) { normalize(it.content) }
+        val retainedSessionFacts = existingFacts.asSequence()
+            .filter { it.scope == ChatMemoryScope.SESSION && normalize(it.text) !in updatedSessionContent }
+            .map { ChatMemoryFactDraft(it.text, it.embedding, it.embeddingModel) }
+            .toList()
+        val sessionDrafts = (sessionUpdates + retainedSessionFacts).distinctBy { normalize(it.content) }
+        val sharedDrafts = result.memoryUpdates.filter { it.scope == ChatMemoryScope.SHARED }
+            .mapNotNull { draftsByText[normalize(it.content)] }
+            .distinctBy { normalize(it.content) }
         val message = store.completeTurn(
             sessionId = sessionId,
             turnId = turnId,
-            answer = answer,
+            answer = result.answer,
             citations = citations,
-            memoryReferences = references,
+            memoryReferences = memoryReferences,
             taskState = nextState,
-            sessionFacts = factDrafts,
+            sessionFacts = sessionDrafts,
+            sharedFacts = sharedDrafts,
+            sessionTitle = title,
         )
         return ChatTurnResponse(message, store.taskState(sessionId))
     }
@@ -95,31 +150,14 @@ class ChatService(
             requireStateString(it.term, "Термин")
             requireStateString(it.definition, "Определение")
         }
-        val facts = stateFacts(state)
-        val vectors = if (facts.isEmpty()) emptyList() else embeddings.embed(facts)
-        require(vectors.size == facts.size && vectors.all { it.isNotEmpty() }) {
-            "Embedding-сервис вернул неполный вектор для локальной памяти."
-        }
-        store.replaceTaskState(
-            sessionId,
-            state,
-            facts.zip(vectors).map { (text, vector) -> ChatMemoryFactDraft(text, vector, embeddings.modelName) },
-        )
+        val retained = store.memoryFacts(sessionId)
+            .filter { it.scope == ChatMemoryScope.SESSION }
+            .map { ChatMemoryFactDraft(it.text, it.embedding, it.embeddingModel) }
+        store.replaceTaskState(sessionId, state, retained)
         return state
     }
-
-    fun promoteSessionFact(sessionId: String, memoryId: String, confirmed: Boolean): ChatMemoryFactSummary {
-        require(confirmed) { "Копирование факта в общую память требует отдельного подтверждения." }
-        val fact = store.memoryFacts(sessionId).firstOrNull {
-            it.scope == ChatMemoryScope.SESSION && it.id == memoryId
-        } ?: throw IllegalArgumentException("Факт сессии не найден.")
-        return store.saveSharedFact(fact.text, fact.embedding, fact.embeddingModel).toSummary()
-    }
-
     fun sharedFacts(): List<ChatMemoryFactSummary> = store.sharedFacts().map { it.toSummary() }
 
-    fun sessionMemoryFacts(sessionId: String): List<ChatMemoryFactSummary> =
-        store.memoryFacts(sessionId).filter { it.scope == ChatMemoryScope.SESSION }.map { it.toSummary() }
 
     private fun ChatMemoryFact.toSummary() = ChatMemoryFactSummary(scope, id, sessionId, text, createdAt)
 
@@ -157,12 +195,6 @@ class ChatService(
         ?.takeIf(List<Float>::isNotEmpty)
         ?: throw IllegalStateException("Embedding-сервис должен вернуть один вектор запроса.")
 
-    private fun stateFacts(state: ChatTaskState): List<String> = buildList {
-        state.goal?.let { add("Цель задачи: ${it.trim()}") }
-        state.clarifications.forEach { add("Уточнение: ${it.trim()}") }
-        state.constraints.forEach { add("Ограничение: ${it.trim()}") }
-        state.terms.forEach { add("Термин ${it.term.trim()}: ${it.definition.trim()}") }
-    }.distinctBy(::normalize)
 
     private fun validateDelta(delta: ChatTaskStateDelta) {
         delta.goal?.let { requireStateString(it, "Цель") }
@@ -174,6 +206,15 @@ class ChatService(
         delta.termsToAdd.forEach {
             requireStateString(it.term, "Термин")
             requireStateString(it.definition, "Определение")
+        }
+    }
+
+    private fun validateMemoryUpdates(updates: List<ChatMemoryUpdate>) {
+        require(updates.size <= MAX_MEMORY_UPDATES)
+        updates.forEach { update ->
+            require(update.content.isNotBlank() && update.content.length <= ChatStore.MAX_MEMORY_FACT_LENGTH) {
+                "Память должна содержать не более ${ChatStore.MAX_MEMORY_FACT_LENGTH} символов."
+            }
         }
     }
 
@@ -252,7 +293,9 @@ class ChatService(
         const val MIN_MEMORY_SCORE = 0.20
         private const val MAX_TASK_STATE_STRING_LENGTH = 500
         private const val MAX_TASK_STATE_ITEMS = 20
+        private const val MAX_MEMORY_UPDATES = 20
         private const val MAX_CITATION_LENGTH = 300
         const val ABSTENTION = "Не знаю на основе текущих источников. Уточните вопрос или добавьте источник."
+        private val WHITESPACE = Regex("\\s+")
     }
 }

@@ -184,15 +184,7 @@ class LocalHttpServer(
                 val state = readJson<dev.localrag.chat.ChatTaskState>(exchange)
                 sendJson(exchange, 200, application.updateChatTaskState(parts[3], state))
             }
-            parts.size == 7 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" &&
-                parts[4] == "memory" && parts[6] == "share" && method == "POST" -> {
-                requireJsonContentType(exchange)
-                val request = readJson<DeleteRequest>(exchange)
-                sendJson(exchange, 200, application.promoteChatFact(parts[3], parts[5], request.confirm))
-            }
             path == "/api/status" && method == "GET" -> sendJson(exchange, 200, application.status())
-            parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "memory" && method == "GET" ->
-                sendJson(exchange, 200, application.sessionChatMemory(parts[3]))
             path == "/api/sources" && method == "GET" -> sendJson(exchange, 200, application.sources())
             path == "/api/imports" && method == "POST" -> {
                 requireJsonContentType(exchange)

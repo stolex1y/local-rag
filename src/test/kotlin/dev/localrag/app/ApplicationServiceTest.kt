@@ -1082,8 +1082,15 @@ class ApplicationServiceTest {
         override fun completeTurn(
             selection: ModelSelection,
             request: dev.localrag.chat.ChatTurnRequest,
-        ): dev.localrag.chat.ChatTurnCompletion =
-            dev.localrag.chat.ChatTurnCompletion("Synthetic fixture answer.", dev.localrag.chat.ChatTaskStateDelta())
+        ): dev.localrag.chat.ChatTurnCompletion {
+            val hasEvidence = request.documentCandidates.isNotEmpty() || request.sessionFacts.isNotEmpty() || request.sharedFacts.isNotEmpty()
+            return dev.localrag.chat.ChatTurnCompletion(
+                if (hasEvidence) "Synthetic fixture answer." else ChatService.ABSTENTION,
+                dev.localrag.chat.ChatTaskStateDelta(),
+                documentCitationRefs = request.documentCandidates.take(1).map { it.refId },
+                sessionTitle = if (request.generateTitle) "Synthetic session" else null,
+            )
+        }
     }
 
     private class FixtureReranker(private val calls: AtomicInteger) : RerankPort {

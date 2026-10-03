@@ -21,7 +21,7 @@ class ChatServiceTest {
     lateinit var temporaryDirectory: Path
 
     @Test
-    fun `session facts stay isolated until explicit shared promotion and history is bounded`() {
+    fun `turns classify session and shared memory automatically and bound history`() {
         val database = temporaryDirectory.resolve("chat.sqlite")
         ChatStore(database).use { store ->
             SqliteIndexRepository(database).use { index ->
@@ -33,46 +33,41 @@ class ChatServiceTest {
 
                 generator.enqueue(
                     ChatTurnCompletion(
-                        "Synthetic answer",
+                        "Конечно, продолжим с новой целью.",
                         ChatTaskStateDelta(
                             goal = "Импортировать transaction-import",
                             clarificationsToAdd = listOf("Формат CSV"),
                             constraintsToAdd = listOf("Не изменять исходный файл"),
                             termsToAdd = listOf(ChatTaskTerm("transaction-import", "Импорт банковских операций")),
                         ),
+                        memoryUpdates = listOf(
+                            ChatMemoryUpdate(ChatMemoryScope.SESSION, "Ограничение: не употреблять орехи"),
+                            ChatMemoryUpdate(ChatMemoryScope.SHARED, "Preferred currency is USD"),
+                        ),
                     ),
                 )
                 val firstTurn = service.turn(first, UUID.randomUUID().toString(), "Как импортировать?", ChunkStrategy.STRUCTURAL, SELECTION)
-                assertEquals(ChatService.ABSTENTION, firstTurn.message.content)
+                assertEquals("Конечно, продолжим с новой целью.", firstTurn.message.content)
                 assertEquals("Импортировать transaction-import", firstTurn.taskState.goal)
-                assertTrue(service.sessionMemoryFacts(first).any { it.text == "Цель задачи: Импортировать transaction-import" })
+                assertTrue(store.memoryFacts(first).any { it.scope == ChatMemoryScope.SESSION && it.text == "Ограничение: не употреблять орехи" })
+                assertTrue(store.sharedFacts().any { it.text == "Preferred currency is USD" })
 
-                generator.enqueue(ChatTurnCompletion("Unsupported prose", ChatTaskStateDelta()))
-                val sessionOnlyTurn = service.turn(
-                    first,
-                    UUID.randomUUID().toString(),
-                    "Что следует делать дальше?",
-                    ChunkStrategy.STRUCTURAL,
-                    SELECTION,
+                generator.enqueue(
+                    ChatTurnCompletion(
+                        "Shared-memory response",
+                        ChatTaskStateDelta(),
+                        memoryReferenceRefs = listOf("M1"),
+                    ),
                 )
-                assertEquals(ChatService.ABSTENTION, sessionOnlyTurn.message.content)
-                assertTrue(sessionOnlyTurn.message.documentCitations.isEmpty())
-                assertTrue(sessionOnlyTurn.message.memoryReferences.isEmpty())
-                assertTrue(generator.requests.last().sharedFacts.isEmpty())
-                val goalFact = service.sessionMemoryFacts(first)
-                    .single { it.text == "Цель задачи: Импортировать transaction-import" }
+                val secondTurn = service.turn(second, UUID.randomUUID().toString(), "Какая валюта предпочтительна?", ChunkStrategy.STRUCTURAL, SELECTION)
+                assertEquals("Shared-memory response", secondTurn.message.content)
+                assertTrue(generator.requests.last().sessionFacts.isEmpty())
+                assertEquals("Preferred currency is USD", generator.requests.last().sharedFacts.single().text)
+                assertTrue(store.memoryFacts(second).none { it.text == "Ограничение: не употреблять орехи" })
 
-                generator.enqueue(ChatTurnCompletion("Second session answer", ChatTaskStateDelta()))
-                service.turn(second, UUID.randomUUID().toString(), "С чего начать?", ChunkStrategy.STRUCTURAL, SELECTION)
-                assertTrue(generator.requests.last().sharedFacts.isEmpty())
-
-                assertTrue(runCatching { service.promoteSessionFact(first, goalFact.id, false) }.isFailure)
-                service.promoteSessionFact(first, goalFact.id, true)
-
-                generator.enqueue(ChatTurnCompletion("Shared memory answer", ChatTaskStateDelta()))
-                val sharedTurn = service.turn(second, UUID.randomUUID().toString(), "Что означает transaction-import?", ChunkStrategy.STRUCTURAL, SELECTION)
-                assertEquals("Shared memory answer", sharedTurn.message.content)
-                assertEquals("Цель задачи: Импортировать transaction-import", generator.requests.last().sharedFacts.single().text)
+                generator.enqueue(ChatTurnCompletion("Session answer", ChatTaskStateDelta()))
+                service.turn(first, UUID.randomUUID().toString(), "Что было сказано в этой сессии?", ChunkStrategy.STRUCTURAL, SELECTION)
+                assertTrue(generator.requests.last().sessionFacts.any { it.text == "Ограничение: не употреблять орехи" })
 
                 repeat(12) { indexTurn ->
                     generator.enqueue(ChatTurnCompletion("Bounded answer", ChatTaskStateDelta()))
@@ -80,9 +75,57 @@ class ChatServiceTest {
                 }
                 val lastRequest = generator.requests.last()
                 assertEquals(ChatStore.MAX_HISTORY_MESSAGES, lastRequest.previousMessages.size)
-                assertTrue(lastRequest.previousMessages.none { it.content == "С чего начать?" })
-                assertFalse(lastRequest.previousMessages.any { it.content.startsWith("Shared memory answer") })
+                assertTrue(lastRequest.previousMessages.none { it.content == "Какая валюта предпочтительна?" })
                 assertEquals(14, requireNotNull(store.sessionDetail(first)).session.messageCount / 2)
+                service.updateTaskState(first, ChatTaskState(goal = "Ручная правка цели"))
+                assertTrue(store.memoryFacts(first).any { it.text == "Ограничение: не употреблять орехи" })
+            }
+        }
+    }
+
+    @Test
+    fun `invalid selected reference leaves completion updates atomic and retry reuses user turn`() {
+        val database = temporaryDirectory.resolve("invalid-reference.sqlite")
+        ChatStore(database).use { store ->
+            SqliteIndexRepository(database).use { index ->
+                val embeddings = FixtureEmbeddings()
+                val generator = FixtureGenerator()
+                val service = ChatService(store, RagService(index, embeddings, EmptyChatPort, EmptyReranker), generator, embeddings)
+                val sessionId = store.createSession().session.id
+                val turnId = UUID.randomUUID().toString()
+                generator.enqueue(
+                    ChatTurnCompletion(
+                        "Invalid completion",
+                        ChatTaskStateDelta(goal = "Must not persist"),
+                        memoryUpdates = listOf(ChatMemoryUpdate(ChatMemoryScope.SHARED, "Must not persist")),
+                        memoryReferenceRefs = listOf("M99"),
+                    ),
+                )
+
+                assertTrue(
+                    runCatching {
+                        service.turn(sessionId, turnId, "Atomic retry", ChunkStrategy.STRUCTURAL, SELECTION)
+                    }.isFailure,
+                )
+                assertEquals(ChatTaskState(), store.taskState(sessionId))
+                assertTrue(store.assistantMessage(sessionId, turnId) == null)
+                assertTrue(store.sharedFacts().isEmpty())
+                assertFalse(store.sessionTitleGenerated(sessionId))
+
+                generator.enqueue(
+                    ChatTurnCompletion(
+                        "Valid retry",
+                        ChatTaskStateDelta(),
+                        memoryUpdates = listOf(ChatMemoryUpdate(ChatMemoryScope.SHARED, "Persisted after retry")),
+                    ),
+                )
+                val response = service.turn(sessionId, turnId, "Atomic retry", ChunkStrategy.STRUCTURAL, SELECTION)
+                assertEquals("Valid retry", response.message.content)
+                val messages = requireNotNull(store.sessionDetail(sessionId)).messages
+                assertEquals(1, messages.count { it.role == ChatMessageRole.USER })
+                assertEquals(1, messages.count { it.role == ChatMessageRole.ASSISTANT })
+                assertEquals("Persisted after retry", store.sharedFacts().single().text)
+                assertTrue(store.sessionTitleGenerated(sessionId))
             }
         }
     }
@@ -120,7 +163,7 @@ class ChatServiceTest {
     }
 
     @Test
-    fun `maximum valid term and definition fit in session memory`() {
+    fun `maximum valid term stays in task state without creating duplicate memory facts`() {
         val database = temporaryDirectory.resolve("maximum-term.sqlite")
         ChatStore(database).use { store ->
             SqliteIndexRepository(database).use { index ->
@@ -132,7 +175,7 @@ class ChatServiceTest {
                 val saved = service.updateTaskState(sessionId, ChatTaskState(terms = listOf(term)))
 
                 assertEquals(term, saved.terms.single())
-                assertEquals(1_009, service.sessionMemoryFacts(sessionId).single().text.length)
+                assertTrue(store.memoryFacts(sessionId).isEmpty())
             }
         }
     }
@@ -159,6 +202,7 @@ class ChatServiceTest {
                         return ChatTurnCompletion(
                             request.question,
                             ChatTaskStateDelta(clarificationsToAdd = listOf(request.question)),
+                            sessionTitle = if (request.generateTitle) "Synthetic chat" else null,
                         )
                     }
                 }
@@ -201,7 +245,12 @@ class ChatServiceTest {
 
         override fun completeTurn(selection: ModelSelection, request: ChatTurnRequest): ChatTurnCompletion {
             requests += request
-            return requireNotNull(responses.poll())
+            val response = requireNotNull(responses.poll())
+            return if (request.generateTitle && response.sessionTitle == null) {
+                response.copy(sessionTitle = "Synthetic chat")
+            } else {
+                response
+            }
         }
     }
 

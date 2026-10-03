@@ -83,15 +83,30 @@ data class ChatTaskStateDelta(
     val termsToAdd: List<ChatTaskTerm> = emptyList(),
 )
 
+data class ChatMemoryCandidate(val refId: String, val scope: ChatMemoryScope, val text: String)
+
+data class ChatDocumentCandidate(val refId: String, val text: String)
+
+data class ChatMemoryUpdate(val scope: ChatMemoryScope, val content: String)
+
 data class ChatTurnRequest(
     val question: String,
     val previousMessages: List<ChatMessage>,
     val taskState: ChatTaskState,
-    val sharedFacts: List<ChatMemoryFact>,
-    val documentChunks: List<String>,
+    val sessionFacts: List<ChatMemoryCandidate>,
+    val sharedFacts: List<ChatMemoryCandidate>,
+    val documentCandidates: List<ChatDocumentCandidate>,
+    val generateTitle: Boolean,
 )
 
-data class ChatTurnCompletion(val answer: String, val taskStateDelta: ChatTaskStateDelta)
+data class ChatTurnCompletion(
+    val answer: String,
+    val taskStateDelta: ChatTaskStateDelta,
+    val memoryUpdates: List<ChatMemoryUpdate> = emptyList(),
+    val documentCitationRefs: List<String> = emptyList(),
+    val memoryReferenceRefs: List<String> = emptyList(),
+    val sessionTitle: String? = null,
+)
 
 interface ChatTurnGenerator {
     fun completeTurn(selection: dev.localrag.domain.ModelSelection, request: ChatTurnRequest): ChatTurnCompletion
@@ -132,10 +147,19 @@ class ChatStore(databasePath: Path) : AutoCloseable {
                     """CREATE TABLE IF NOT EXISTS chat_sessions (
                         session_id TEXT PRIMARY KEY,
                         title TEXT NOT NULL,
+                        title_generated INTEGER NOT NULL DEFAULT 1,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     )""".trimIndent(),
                 )
+                val hasTitleGenerated = statement.executeQuery("PRAGMA table_info(chat_sessions)").use { rows ->
+                    var found = false
+                    while (rows.next()) if (rows.getString("name") == "title_generated") found = true
+                    found
+                }
+                if (!hasTitleGenerated) {
+                    statement.execute("ALTER TABLE chat_sessions ADD COLUMN title_generated INTEGER NOT NULL DEFAULT 1")
+                }
                 statement.execute(
                     """CREATE TABLE IF NOT EXISTS chat_messages (
                         message_id TEXT PRIMARY KEY,
@@ -197,7 +221,7 @@ class ChatStore(databasePath: Path) : AutoCloseable {
         val now = Instant.now().toString()
         val sessionId = UUID.randomUUID().toString()
         connection.prepareStatement(
-            "INSERT INTO chat_sessions(session_id,title,created_at,updated_at) VALUES (?,?,?,?)",
+            "INSERT INTO chat_sessions(session_id,title,title_generated,created_at,updated_at) VALUES (?,?,0,?,?)",
         ).use { statement ->
             statement.setString(1, sessionId)
             statement.setString(2, NEW_SESSION_TITLE)
@@ -221,6 +245,18 @@ class ChatStore(databasePath: Path) : AutoCloseable {
         return connection.prepareStatement("SELECT 1 FROM chat_sessions WHERE session_id=?").use { statement ->
             statement.setString(1, sessionId)
             statement.executeQuery().use { it.next() }
+        }
+    }
+
+    @Synchronized
+    fun sessionTitleGenerated(sessionId: String): Boolean {
+        requireUuid(sessionId, "session ID")
+        return connection.prepareStatement("SELECT title_generated FROM chat_sessions WHERE session_id=?").use { statement ->
+            statement.setString(1, sessionId)
+            statement.executeQuery().use { rows ->
+                if (!rows.next()) throw ChatSessionNotFoundException()
+                rows.getInt(1) != 0
+            }
         }
     }
 
@@ -309,13 +345,6 @@ class ChatStore(databasePath: Path) : AutoCloseable {
         require(content.isNotBlank() && content.length <= MAX_MESSAGE_LENGTH) {
             "Сообщение должно содержать от 1 до $MAX_MESSAGE_LENGTH символов."
         }
-        val title = connection.prepareStatement("SELECT title FROM chat_sessions WHERE session_id=?").use { statement ->
-            statement.setString(1, sessionId)
-            statement.executeQuery().use { rows ->
-                if (!rows.next()) throw ChatSessionNotFoundException()
-                rows.getString(1)
-            }
-        }
         val existing = connection.prepareStatement(
             "SELECT message_id,content,created_at FROM chat_messages WHERE session_id=? AND turn_id=? AND role='USER'",
         ).use { statement ->
@@ -342,11 +371,9 @@ class ChatStore(databasePath: Path) : AutoCloseable {
             statement.setString(5, now)
             statement.executeUpdate()
         }
-        val nextTitle = if (title == NEW_SESSION_TITLE) content.trim().replace(WHITESPACE, " ").take(MAX_TITLE_LENGTH) else title
-        connection.prepareStatement("UPDATE chat_sessions SET title=?,updated_at=? WHERE session_id=?").use { statement ->
-            statement.setString(1, nextTitle)
-            statement.setString(2, now)
-            statement.setString(3, sessionId)
+        connection.prepareStatement("UPDATE chat_sessions SET updated_at=? WHERE session_id=?").use { statement ->
+            statement.setString(1, now)
+            statement.setString(2, sessionId)
             statement.executeUpdate()
         }
         ChatMessage(messageId, turnId, ChatMessageRole.USER, content, createdAt = now)
@@ -432,6 +459,8 @@ class ChatStore(databasePath: Path) : AutoCloseable {
         memoryReferences: List<ChatMemoryReference>,
         taskState: ChatTaskState,
         sessionFacts: List<ChatMemoryFactDraft> = emptyList(),
+        sharedFacts: List<ChatMemoryFactDraft> = emptyList(),
+        sessionTitle: String? = null,
     ): ChatMessage = transaction {
         requireUuid(sessionId, "session ID")
         requireUuid(turnId, "turn ID")
@@ -498,6 +527,20 @@ class ChatStore(databasePath: Path) : AutoCloseable {
         }
         sessionFacts.forEach { fact ->
             saveMemoryFact(ChatMemoryScope.SESSION, sessionId, fact.content, fact.embedding, fact.embeddingModel)
+        }
+        sharedFacts.forEach { fact ->
+            saveMemoryFact(ChatMemoryScope.SHARED, null, fact.content, fact.embedding, fact.embeddingModel)
+        }
+        if (sessionTitle != null) {
+            require(sessionTitle.isNotBlank() && sessionTitle.length <= MAX_TITLE_LENGTH)
+            connection.prepareStatement(
+                "UPDATE chat_sessions SET title=?,title_generated=1,updated_at=? WHERE session_id=? AND title_generated=0",
+            ).use { statement ->
+                statement.setString(1, sessionTitle)
+                statement.setString(2, now)
+                statement.setString(3, sessionId)
+                require(statement.executeUpdate() == 1) { "Название сессии уже создано." }
+            }
         }
         connection.prepareStatement("UPDATE chat_sessions SET updated_at=? WHERE session_id=?").use { statement ->
             statement.setString(1, now)
@@ -737,7 +780,7 @@ class ChatStore(databasePath: Path) : AutoCloseable {
     class ChatSessionNotFoundException : RuntimeException("Сессия чата не найдена.")
 
     companion object {
-        const val CHAT_SCHEMA_VERSION = 13
+        const val CHAT_SCHEMA_VERSION = 14
         const val MAX_MESSAGE_LENGTH = 4_000
         const val MAX_HISTORY_MESSAGES = 8
         const val MAX_MEMORY_FACT_LENGTH = 1_100

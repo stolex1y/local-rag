@@ -2,7 +2,8 @@ package dev.localrag.generation
 
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
-import dev.localrag.chat.ChatMemoryFact
+import dev.localrag.chat.ChatMemoryCandidate
+import dev.localrag.chat.ChatDocumentCandidate
 import dev.localrag.chat.ChatMemoryScope
 import dev.localrag.chat.ChatMessage
 import dev.localrag.chat.ChatMessageRole
@@ -86,9 +87,9 @@ class ChatCompletionsApiTest {
     }
 
     @Test
-    fun `structured chat sends only selected text and strictly parses task state delta`() {
+    fun `structured chat sends opaque candidates and parses selected memory evidence and title`() {
         val requests = CopyOnWriteArrayList<JsonObject>()
-        val content = """{"answer":"Порог равен 42","task_state_delta":{"goal":null,"clarifications_to_add":["CSV"],"constraints_to_add":[],"terms_to_add":[{"term":"transaction-import","definition":"Импорт операций"}]}}"""
+        val content = """{"answer":"Порог равен 42","task_state_delta":{"goal":null,"clarifications_to_add":["CSV"],"constraints_to_add":[],"terms_to_add":[{"term":"transaction-import","definition":"Импорт операций"}]},"memory_updates":[{"scope":"SHARED","content":"Общий факт"}],"document_citation_refs":["D1"],"memory_reference_refs":["M1"],"session_title":"Порог оплаты"}"""
         val fake = FakeProvider { exchange ->
             requests += Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
             val response = kotlinx.serialization.json.buildJsonObject {
@@ -108,22 +109,28 @@ class ChatCompletionsApiTest {
                     ChatMessage("message-id-secret", "turn-id-secret", ChatMessageRole.USER, "Предыдущая реплика", createdAt = "synthetic-time"),
                 ),
                 taskState = ChatTaskState(goal = "Собрать отчет"),
-                sharedFacts = listOf(ChatMemoryFact(ChatMemoryScope.SHARED, "shared-memory-id-secret", null, "Общий факт", listOf(0f, 1f), "embedding-model-secret", "synthetic-time")),
-                documentChunks = listOf("Из документа: порог 42"),
+                sessionFacts = listOf(ChatMemoryCandidate("S1", ChatMemoryScope.SESSION, "Локальный факт")),
+                sharedFacts = listOf(ChatMemoryCandidate("M1", ChatMemoryScope.SHARED, "Общий факт")),
+                documentCandidates = listOf(ChatDocumentCandidate("D1", "Из документа: порог 42")),
+                generateTitle = true,
             )
             val completion = api.completeTurn(selection, request)
             assertEquals("Порог равен 42", completion.answer)
             assertEquals(listOf("CSV"), completion.taskStateDelta.clarificationsToAdd)
             assertEquals("Импорт операций", completion.taskStateDelta.termsToAdd.single().definition)
+            assertEquals(ChatMemoryScope.SHARED, completion.memoryUpdates.single().scope)
+            assertEquals(listOf("D1"), completion.documentCitationRefs)
+            assertEquals(listOf("M1"), completion.memoryReferenceRefs)
+            assertEquals("Порог оплаты", completion.sessionTitle)
 
             val body = requests.single()
             assertEquals("json_object", body.getValue("response_format").jsonObject.getValue("type").jsonPrimitive.content)
             val userPayload = body.getValue("messages").jsonArray.last().jsonObject.getValue("content").jsonPrimitive.content
             assertContains(userPayload, "Предыдущая реплика")
-            assertFalse("Локальный факт" in userPayload)
+            assertContains(userPayload, "Локальный факт")
             assertContains(userPayload, "Общий факт")
             assertContains(userPayload, "Из документа: порог 42")
-            listOf("message-id-secret", "turn-id-secret", "shared-memory-id-secret", "session-secret", "embedding-model-secret", "1.0", "0.0")
+            listOf("message-id-secret", "turn-id-secret", "shared-memory-id-secret", "embedding-model-secret", "1.0", "0.0", "private-source-name.pdf", "private-source-id", "private-section")
                 .forEach { secret -> assertFalse(secret in userPayload, "Generator payload contained $secret") }
         }
     }
@@ -131,9 +138,10 @@ class ChatCompletionsApiTest {
     @Test
     fun `structured chat rejects missing extra and oversized task state fields`() {
         val malformedResponses = listOf(
-            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[]}}""",
-            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[],"terms_to_add":[]},"extra":true}""",
-            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":["${"x".repeat(501)}"],"constraints_to_add":[],"terms_to_add":[]}}""",
+            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[]},"memory_updates":[],"document_citation_refs":[],"memory_reference_refs":[],"session_title":null}""",
+            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[],"terms_to_add":[]},"memory_updates":[],"document_citation_refs":[],"memory_reference_refs":[],"session_title":null,"extra":true}""",
+            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":["${"x".repeat(501)}"],"constraints_to_add":[],"terms_to_add":[]},"memory_updates":[],"document_citation_refs":[],"memory_reference_refs":[],"session_title":null}""",
+            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[],"terms_to_add":[]},"memory_updates":[{"scope":"UNKNOWN","content":"x"}],"document_citation_refs":[],"memory_reference_refs":[],"session_title":null}""",
         )
         malformedResponses.forEach { content ->
             val fake = FakeProvider { exchange ->
@@ -149,11 +157,15 @@ class ChatCompletionsApiTest {
             fake.use {
                 val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-api-key" }))
                 assertFailsWith<CloudModelException> {
-                    api.completeTurn(selection, ChatTurnRequest("question", emptyList(), ChatTaskState(), emptyList(), emptyList()))
+                    api.completeTurn(
+                        selection,
+                        ChatTurnRequest("question", emptyList(), ChatTaskState(), emptyList(), emptyList(), emptyList(), false),
+                    )
                 }
             }
         }
     }
+
 
     @Test
     fun `missing credential makes no provider request and response errors do not expose bodies`() {
