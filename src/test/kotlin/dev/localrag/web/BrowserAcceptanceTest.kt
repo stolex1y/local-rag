@@ -212,7 +212,10 @@ class BrowserAcceptanceTest {
             assertThat(page.locator(".chat-bubble.user button")).containsText("Повторить этот ход")
 
             page.locator(".chat-bubble.user button").click()
-            assertThat(page.locator(".chat-bubble.assistant")).containsText("Не знаю на основе текущих источников.")
+            assertEquals(
+                "Не знаю на основе текущих источников. Уточните вопрос или добавьте источник.",
+                page.locator(".chat-bubble.assistant .answer-text").innerText(),
+            )
             assertEquals(1, page.locator(".chat-bubble.user").count())
             assertEquals(1, page.locator(".chat-bubble.assistant").count())
             assertThat(page.locator("#task-goal")).hasValue("Prior synthetic goal")
