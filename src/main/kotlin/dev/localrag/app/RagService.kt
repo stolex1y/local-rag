@@ -63,6 +63,18 @@ class RagService(
         )
     }
 
+    internal fun retrieveForChat(
+        question: String,
+        strategy: ChunkStrategy,
+        topK: Int?,
+        selection: ModelSelection,
+    ): RetrievalComparison {
+        validateQuestion(question)
+        val count = validateTopK(topK)
+        if (index.sources(SourceStatus.READY).isEmpty()) return RetrievalComparison(emptyList(), emptyList())
+        return retrieveComparison(question, strategy, count, selection)
+    }
+
     fun baseline(question: String, selection: ModelSelection): String {
         validateQuestion(question)
         return chat.answer(selection, question)

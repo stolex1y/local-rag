@@ -40,6 +40,17 @@ private data class BeginImportRequest(val files: List<dev.localrag.source.Import
 private data class DeleteRequest(val confirm: Boolean)
 
 @Serializable
+private data class ChatTurnHttpRequest(
+    val turnId: String,
+    val question: String,
+    val strategy: ChunkStrategy = ChunkStrategy.STRUCTURAL,
+    val topK: Int? = null,
+)
+
+@Serializable
+private data class ChatMemoryFactRequest(val content: String)
+
+@Serializable
 private data class IndexRequest(
     val confirm: Boolean,
     val sourceIds: List<String>,
@@ -137,7 +148,51 @@ class LocalHttpServer(
                 val request = readJson<ModelSelectionRequest>(exchange)
                 sendJson(exchange, 200, application.selectModel(ModelSelection(request.providerId, request.modelId)))
             }
+            path == "/api/chat/sessions" && method == "GET" -> sendJson(exchange, 200, application.chatSessions())
+            path == "/api/chat/sessions" && method == "POST" -> {
+                requireJsonContentType(exchange)
+                consumeOptionalJson(exchange)
+                sendJson(exchange, 201, application.createChatSession())
+            }
+            parts.size == 4 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && method == "GET" ->
+                sendJson(exchange, 200, application.chatSession(parts[3]))
+            parts.size == 4 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && method == "DELETE" -> {
+                requireJsonContentType(exchange)
+                val request = readJson<DeleteRequest>(exchange)
+                application.deleteChatSession(parts[3], request.confirm)
+                sendJson(exchange, 200, SavedResponse(true))
+            }
+            path == "/api/chat/memory/shared" && method == "GET" -> sendJson(exchange, 200, application.sharedChatFacts())
+            parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "memory" && parts[3] == "shared" && method == "DELETE" -> {
+                requireJsonContentType(exchange)
+                val request = readJson<DeleteRequest>(exchange)
+                application.deleteSharedChatFact(parts[4], request.confirm)
+                sendJson(exchange, 200, SavedResponse(true))
+            }
+            parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "memory" && parts[3] == "shared" && method == "PUT" -> {
+                requireJsonContentType(exchange)
+                val request = readJson<ChatMemoryFactRequest>(exchange)
+                sendJson(exchange, 200, application.updateSharedChatFact(parts[4], request.content))
+            }
+            parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "turns" && method == "POST" -> {
+                requireJsonContentType(exchange)
+                val request = readJson<ChatTurnHttpRequest>(exchange)
+                sendJson(exchange, 200, application.chatTurn(parts[3], request.turnId, request.question, request.strategy, request.topK))
+            }
+            parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "task-state" && method == "PUT" -> {
+                requireJsonContentType(exchange)
+                val state = readJson<dev.localrag.chat.ChatTaskState>(exchange)
+                sendJson(exchange, 200, application.updateChatTaskState(parts[3], state))
+            }
+            parts.size == 7 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" &&
+                parts[4] == "memory" && parts[6] == "share" && method == "POST" -> {
+                requireJsonContentType(exchange)
+                val request = readJson<DeleteRequest>(exchange)
+                sendJson(exchange, 200, application.promoteChatFact(parts[3], parts[5], request.confirm))
+            }
             path == "/api/status" && method == "GET" -> sendJson(exchange, 200, application.status())
+            parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "memory" && method == "GET" ->
+                sendJson(exchange, 200, application.sessionChatMemory(parts[3]))
             path == "/api/sources" && method == "GET" -> sendJson(exchange, 200, application.sources())
             path == "/api/imports" && method == "POST" -> {
                 requireJsonContentType(exchange)

@@ -87,7 +87,6 @@ data class ChatTurnRequest(
     val question: String,
     val previousMessages: List<ChatMessage>,
     val taskState: ChatTaskState,
-    val sessionFacts: List<ChatMemoryFact>,
     val sharedFacts: List<ChatMemoryFact>,
     val documentChunks: List<String>,
 )
@@ -741,7 +740,7 @@ class ChatStore(databasePath: Path) : AutoCloseable {
         const val CHAT_SCHEMA_VERSION = 13
         const val MAX_MESSAGE_LENGTH = 4_000
         const val MAX_HISTORY_MESSAGES = 8
-        const val MAX_MEMORY_FACT_LENGTH = 600
+        const val MAX_MEMORY_FACT_LENGTH = 1_100
         const val MAX_SHARED_FACT_LENGTH = MAX_MEMORY_FACT_LENGTH
         const val MAX_EMBEDDING_MODEL_LENGTH = 120
         const val MAX_TITLE_LENGTH = 60

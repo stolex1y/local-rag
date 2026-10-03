@@ -2,6 +2,12 @@ package dev.localrag.generation
 
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import dev.localrag.chat.ChatMemoryFact
+import dev.localrag.chat.ChatMemoryScope
+import dev.localrag.chat.ChatMessage
+import dev.localrag.chat.ChatMessageRole
+import dev.localrag.chat.ChatTaskState
+import dev.localrag.chat.ChatTurnRequest
 import dev.localrag.domain.ChunkDraft
 import dev.localrag.domain.ChunkStrategy
 import dev.localrag.domain.ModelSelection
@@ -76,6 +82,76 @@ class ChatCompletionsApiTest {
             assertContains(serializedRagPayload, injection)
             listOf(sourceName, sourceId, section, "private-chunk-id", "embedding-model-secret", "pageStart", "0.91")
                 .forEach { secret -> assertFalse(secret in serializedRagPayload, "Provider payload contained $secret") }
+        }
+    }
+
+    @Test
+    fun `structured chat sends only selected text and strictly parses task state delta`() {
+        val requests = CopyOnWriteArrayList<JsonObject>()
+        val content = """{"answer":"Порог равен 42","task_state_delta":{"goal":null,"clarifications_to_add":["CSV"],"constraints_to_add":[],"terms_to_add":[{"term":"transaction-import","definition":"Импорт операций"}]}}"""
+        val fake = FakeProvider { exchange ->
+            requests += Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+            val response = kotlinx.serialization.json.buildJsonObject {
+                put("choices", kotlinx.serialization.json.buildJsonArray {
+                    add(kotlinx.serialization.json.buildJsonObject {
+                        put("message", kotlinx.serialization.json.buildJsonObject { put("content", JsonPrimitive(content)) })
+                    })
+                })
+            }.toString()
+            respond(exchange, 200, response)
+        }
+        fake.use {
+            val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-api-key" }))
+            val request = ChatTurnRequest(
+                question = "Какой порог?",
+                previousMessages = listOf(
+                    ChatMessage("message-id-secret", "turn-id-secret", ChatMessageRole.USER, "Предыдущая реплика", createdAt = "synthetic-time"),
+                ),
+                taskState = ChatTaskState(goal = "Собрать отчет"),
+                sharedFacts = listOf(ChatMemoryFact(ChatMemoryScope.SHARED, "shared-memory-id-secret", null, "Общий факт", listOf(0f, 1f), "embedding-model-secret", "synthetic-time")),
+                documentChunks = listOf("Из документа: порог 42"),
+            )
+            val completion = api.completeTurn(selection, request)
+            assertEquals("Порог равен 42", completion.answer)
+            assertEquals(listOf("CSV"), completion.taskStateDelta.clarificationsToAdd)
+            assertEquals("Импорт операций", completion.taskStateDelta.termsToAdd.single().definition)
+
+            val body = requests.single()
+            assertEquals("json_object", body.getValue("response_format").jsonObject.getValue("type").jsonPrimitive.content)
+            val userPayload = body.getValue("messages").jsonArray.last().jsonObject.getValue("content").jsonPrimitive.content
+            assertContains(userPayload, "Предыдущая реплика")
+            assertFalse("Локальный факт" in userPayload)
+            assertContains(userPayload, "Общий факт")
+            assertContains(userPayload, "Из документа: порог 42")
+            listOf("message-id-secret", "turn-id-secret", "shared-memory-id-secret", "session-secret", "embedding-model-secret", "1.0", "0.0")
+                .forEach { secret -> assertFalse(secret in userPayload, "Generator payload contained $secret") }
+        }
+    }
+
+    @Test
+    fun `structured chat rejects missing extra and oversized task state fields`() {
+        val malformedResponses = listOf(
+            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[]}}""",
+            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[],"terms_to_add":[]},"extra":true}""",
+            """{"answer":"ok","task_state_delta":{"goal":null,"clarifications_to_add":["${"x".repeat(501)}"],"constraints_to_add":[],"terms_to_add":[]}}""",
+        )
+        malformedResponses.forEach { content ->
+            val fake = FakeProvider { exchange ->
+                val response = kotlinx.serialization.json.buildJsonObject {
+                    put("choices", kotlinx.serialization.json.buildJsonArray {
+                        add(kotlinx.serialization.json.buildJsonObject {
+                            put("message", kotlinx.serialization.json.buildJsonObject { put("content", JsonPrimitive(content)) })
+                        })
+                    })
+                }.toString()
+                respond(exchange, 200, response)
+            }
+            fake.use {
+                val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-api-key" }))
+                assertFailsWith<CloudModelException> {
+                    api.completeTurn(selection, ChatTurnRequest("question", emptyList(), ChatTaskState(), emptyList(), emptyList()))
+                }
+            }
         }
     }
 

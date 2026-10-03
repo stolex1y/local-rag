@@ -1,5 +1,8 @@
 package dev.localrag.app
 
+import dev.localrag.chat.ChatStore
+import dev.localrag.chat.ChatService
+
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import dev.localrag.benchmark.BenchmarkExpectedSource
@@ -71,6 +74,62 @@ class ApplicationServiceTest {
     @TempDir
     lateinit var temporaryDirectory: Path
 
+
+    @Test
+    fun `chat session routes create list restore and require delete confirmation`() {
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                val created = api.postJson("/api/chat/sessions", "{}")
+                assertEquals(201, created.statusCode())
+                val sessionId = json(created.body()).jsonObject.getValue("session").jsonObject
+                    .getValue("id").jsonPrimitive.content
+                val detail = api.get("/api/chat/sessions/$sessionId")
+                assertEquals(200, detail.statusCode())
+                assertEquals(0, json(detail.body()).jsonObject.getValue("session").jsonObject
+                    .getValue("messageCount").jsonPrimitive.content.toInt())
+                assertEquals(1, json(api.get("/api/chat/sessions").body()).jsonArray.size)
+                assertEquals(400, api.deleteJson("/api/chat/sessions/$sessionId", """{"confirm":false}""").statusCode())
+                assertEquals(200, api.deleteJson("/api/chat/sessions/$sessionId", """{"confirm":true}""").statusCode())
+                assertEquals(404, api.get("/api/chat/sessions/$sessionId").statusCode())
+                assertEquals(404, api.deleteJson("/api/chat/sessions/$sessionId", """{"confirm":true}""").statusCode())
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `chat turn persists user input abstains without evidence and retries idempotently`() {
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                val sessionId = json(api.postJson("/api/chat/sessions", "{}").body())
+                    .jsonObject.getValue("session").jsonObject.getValue("id").jsonPrimitive.content
+                val turnId = java.util.UUID.randomUUID().toString()
+                val body = """{"turnId":"$turnId","question":"Какая дата оплаты?","strategy":"STRUCTURAL"}"""
+                val first = api.postJson("/api/chat/sessions/$sessionId/turns", body)
+                assertEquals(200, first.statusCode(), first.body())
+                val firstMessage = json(first.body()).jsonObject.getValue("message").jsonObject
+                assertEquals(dev.localrag.chat.ChatService.ABSTENTION, firstMessage.getValue("content").jsonPrimitive.content)
+                assertEquals(0, firstMessage.getValue("documentCitations").jsonArray.size)
+                assertEquals(0, firstMessage.getValue("memoryReferences").jsonArray.size)
+
+                val retried = api.postJson("/api/chat/sessions/$sessionId/turns", body)
+                assertEquals(200, retried.statusCode())
+                val retriedMessage = json(retried.body()).jsonObject.getValue("message").jsonObject
+                assertEquals(firstMessage.getValue("id"), retriedMessage.getValue("id"))
+                val detail = json(api.get("/api/chat/sessions/$sessionId").body()).jsonObject
+                assertEquals(2, detail.getValue("messages").jsonArray.size)
+            } finally {
+                fixture.close()
+            }
+        }
+    }
     @Test
     fun `HTTP flow imports additively indexes queries benchmarks and deletes referenced source data`() {
         FakeOllama().use { ollama ->
@@ -846,6 +905,7 @@ class ApplicationServiceTest {
         val rerankCalls = AtomicInteger()
         val index = SqliteIndexRepository(database)
         val store = BenchmarkStore(database)
+        private val chatStore = ChatStore(database)
         private val jobs = JobManager()
         private val api = ollama.client()
         private val embeddings = OllamaEmbeddingPort(api)
@@ -884,7 +944,8 @@ class ApplicationServiceTest {
             sourcesDirectory = sourcesDirectory,
         )
         private val benchmark = BenchmarkRunner(rag, store, index)
-        private val application = ApplicationService(index, store, catalog, jobs, indexing, rag, benchmark, api, modelConfiguration)
+        private val chatService = ChatService(chatStore, rag, chat, embeddings)
+        private val application = ApplicationService(index, store, catalog, jobs, indexing, rag, benchmark, api, modelConfiguration, chatStore, chatService)
         val server = LocalHttpServer(application, port = 0)
         fun seedSparsePdf(): String {
             val record = SourceRecord(
@@ -919,6 +980,7 @@ class ApplicationServiceTest {
         override fun close() {
             server.close()
             jobs.close()
+            chatStore.close()
             store.close()
             index.close()
         }
@@ -1000,7 +1062,7 @@ class ApplicationServiceTest {
         }
     }
 
-    private class FixtureChat(private val calls: AtomicInteger) : ChatPort {
+    private class FixtureChat(private val calls: AtomicInteger) : ChatPort, dev.localrag.chat.ChatTurnGenerator {
         val selections = CopyOnWriteArrayList<ModelSelection>()
         private val nextGate = AtomicReference<Gate?>()
 
@@ -1017,6 +1079,11 @@ class ApplicationServiceTest {
             return if (context.isEmpty()) "Baseline answer without indexed sources."
             else "RAG answer grounded in imported context."
         }
+        override fun completeTurn(
+            selection: ModelSelection,
+            request: dev.localrag.chat.ChatTurnRequest,
+        ): dev.localrag.chat.ChatTurnCompletion =
+            dev.localrag.chat.ChatTurnCompletion("Synthetic fixture answer.", dev.localrag.chat.ChatTaskStateDelta())
     }
 
     private class FixtureReranker(private val calls: AtomicInteger) : RerankPort {

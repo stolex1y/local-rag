@@ -1,4 +1,12 @@
 package dev.localrag.app
+import dev.localrag.chat.ChatSession
+import dev.localrag.chat.ChatSessionDetail
+import dev.localrag.chat.ChatStore
+import dev.localrag.chat.ChatMemoryFactSummary
+import dev.localrag.chat.ChatService
+import dev.localrag.chat.ChatTaskState
+import dev.localrag.chat.ChatTurnResponse
+
 
 import dev.localrag.benchmark.BenchmarkQuestion
 import dev.localrag.benchmark.BenchmarkQuestionSet
@@ -93,6 +101,8 @@ class ApplicationService(
     private val benchmark: BenchmarkRunner,
     private val ollama: OllamaApi,
     private val modelConfiguration: ModelConfiguration,
+    private val chatStore: ChatStore,
+    private val chatService: ChatService,
 ) {
 
     private val operationLock = Any()
@@ -114,7 +124,56 @@ class ApplicationService(
     }
 
     fun sources(): List<SourceRecord> = catalog.sources()
+    fun chatSessions(): List<ChatSession> = chatStore.sessions()
+    fun createChatSession(): ChatSessionDetail = chatStore.createSession()
 
+    fun chatSession(sessionId: String): ChatSessionDetail =
+        chatStore.sessionDetail(sessionId) ?: throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
+
+    fun deleteChatSession(sessionId: String, confirmed: Boolean) {
+        if (!confirmed) throw ApiException(400, "confirmation_required", "Удаление сессии требует отдельного подтверждения.")
+        if (!chatStore.deleteSession(sessionId)) throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
+    }
+
+    fun chatTurn(
+        sessionId: String,
+        turnId: String,
+        question: String,
+        strategy: ChunkStrategy,
+        topK: Int?,
+    ): ChatTurnResponse {
+        chatSession(sessionId)
+        val configuration = modelConfiguration.options()
+        return chatService.turn(
+            sessionId,
+            turnId,
+            question,
+            strategy,
+            ModelSelection(configuration.selectedProviderId, configuration.selectedModelId),
+            topK,
+        )
+    }
+
+    fun promoteChatFact(sessionId: String, memoryId: String, confirmed: Boolean): ChatMemoryFactSummary {
+        chatSession(sessionId)
+        return chatService.promoteSessionFact(sessionId, memoryId, confirmed)
+    }
+
+    fun sharedChatFacts(): List<ChatMemoryFactSummary> = chatService.sharedFacts()
+
+    fun sessionChatMemory(sessionId: String): List<ChatMemoryFactSummary> {
+        chatSession(sessionId)
+        return chatService.sessionMemoryFacts(sessionId)
+    }
+
+    fun deleteSharedChatFact(memoryId: String, confirmed: Boolean) = chatService.deleteSharedFact(memoryId, confirmed)
+    fun updateSharedChatFact(memoryId: String, content: String): ChatMemoryFactSummary =
+        chatService.updateSharedFact(memoryId, content)
+
+    fun updateChatTaskState(sessionId: String, taskState: ChatTaskState): ChatTaskState {
+        chatSession(sessionId)
+        return chatService.updateTaskState(sessionId, taskState)
+    }
     fun models(): ModelConfigurationResponse = modelConfiguration.options()
 
     fun selectModel(selection: ModelSelection): ModelConfigurationResponse {
