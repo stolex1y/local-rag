@@ -164,7 +164,8 @@ class BrowserAcceptanceTest {
             page.locator("#chat-tab").click()
 
             val sessionA = createChatSession(page)
-            submitChatQuestion(page, "auto-memory-seed session-A")
+            val seedResponse = submitChatQuestion(page, "auto-memory-seed session-A")
+            assertLongTurnCitation(page, seedResponse)
             assertThat(page.locator("#shared-memory-list")).containsText("Shared synthetic preference")
             assertThat(page.locator("#chat-view")).not().containsText("Факты этой сессии")
             assertEquals(0, page.locator("#session-memory-list").count())
@@ -174,12 +175,15 @@ class BrowserAcceptanceTest {
             assertFalse(dialogs.any { "Скопировать этот факт" in it })
 
             val sessionOnlyResponse = submitChatQuestion(page, "session-only memory")
+            assertLongTurnCitation(page, sessionOnlyResponse)
             val sessionOnlyReference = sessionOnlyResponse.getValue("message").jsonObject
                 .getValue("memoryReferences").jsonArray.single().jsonObject
             assertEquals("SESSION", sessionOnlyReference.getValue("scope").jsonPrimitive.content)
             assertEquals("Session-only synthetic marker", sessionOnlyReference.getValue("text").jsonPrimitive.content)
 
-            repeat(10) { submitChatQuestion(page, "session-A turn ${it + 3}") }
+            repeat(10) {
+                assertLongTurnCitation(page, submitChatQuestion(page, "session-A turn ${it + 3}"))
+            }
             assertThat(page.locator(".chat-bubble.user")).hasCount(12)
             assertThat(page.locator(".chat-bubble.assistant")).hasCount(12)
             assertThat(page.locator("#task-goal")).hasValue("Goal A")
@@ -190,6 +194,7 @@ class BrowserAcceptanceTest {
             val sessionB = createChatSession(page)
             assertNotEquals(sessionA, sessionB)
             val sharedResponse = submitChatQuestion(page, "session-B shared memory")
+            assertLongTurnCitation(page, sharedResponse)
             val sharedReference = sharedResponse.getValue("message").jsonObject
                 .getValue("memoryReferences").jsonArray.single().jsonObject
             assertEquals("SHARED", sharedReference.getValue("scope").jsonPrimitive.content)
@@ -200,7 +205,9 @@ class BrowserAcceptanceTest {
             assertTrue(firstRequestB.getValue("previous_messages").jsonArray.isEmpty())
             assertFalse("session-A" in firstRequestB.toString())
 
-            repeat(11) { submitChatQuestion(page, "session-B turn ${it + 2}") }
+            repeat(11) {
+                assertLongTurnCitation(page, submitChatQuestion(page, "session-B turn ${it + 2}"))
+            }
             assertThat(page.locator(".chat-bubble.user")).hasCount(12)
             assertThat(page.locator(".chat-bubble.assistant")).hasCount(12)
             val lastRequestB = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
@@ -292,8 +299,73 @@ class BrowserAcceptanceTest {
     }
 
     @Test
+    fun chatAbstainsWhenNoDocumentOrMemoryEvidence() {
+        withChatBrowser { page, app, fake ->
+            page.locator("#chat-tab").click()
+            page.onDialog { it.accept() }
+            val sessionId = createChatSession(page)
+            val response = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-question").fill("Unsupported synthetic factual question")
+                page.locator("#chat-send").click()
+            }
+            assertEquals(200, response.status())
+            val message = Json.parseToJsonElement(response.text()).jsonObject
+                .getValue("message").jsonObject
+            assertEquals(ChatService.ABSTENTION, message.getValue("content").jsonPrimitive.content)
+            assertTrue(message.getValue("documentCitations").jsonArray.isEmpty())
+            assertTrue(message.getValue("memoryReferences").jsonArray.isEmpty())
+            assertTrue(fake.cloud.chatMessages.isNotEmpty())
+            val emptyEvidencePayload = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
+            assertTrue(emptyEvidencePayload.getValue("document_candidates").jsonArray.isEmpty())
+            assertTrue(emptyEvidencePayload.getValue("session_memory").jsonArray.isEmpty())
+            assertTrue(emptyEvidencePayload.getValue("shared_memory").jsonArray.isEmpty())
+            assertThat(page.locator(".chat-bubble.assistant .answer-text").last())
+                .hasText(ChatService.ABSTENTION)
+            assertThat(page.locator(".chat-bubble.assistant .chat-evidence"))
+                .containsText("Документные фрагменты не найдены.")
+            assertThat(page.locator(".chat-bubble.assistant .chat-evidence"))
+                .containsText("Факты памяти не передавались.")
+
+            val session = Json.parseToJsonElement(
+                page.request().get("http://127.0.0.1:${app.server.port}/api/chat/sessions").text(),
+            ).jsonArray.single().jsonObject
+            assertEquals(sessionId, session.getValue("id").jsonPrimitive.content)
+            page.reload()
+            assertEquals(sessionId, page.url().substringAfter("session="))
+            assertThat(page.locator(".chat-bubble.assistant .answer-text").last())
+                .hasText(ChatService.ABSTENTION)
+            assertEquals(1, page.locator(".chat-bubble.user").count())
+            assertEquals(1, page.locator(".chat-bubble.assistant").count())
+
+            page.locator("#collection-tab").click()
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            val unsupportedResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-question").fill("Unsupported synthetic factual question")
+                page.locator("#chat-send").click()
+            }
+            val unsupportedMessage = Json.parseToJsonElement(unsupportedResponse.text()).jsonObject
+                .getValue("message").jsonObject
+            assertEquals(ChatService.ABSTENTION, unsupportedMessage.getValue("content").jsonPrimitive.content)
+            assertTrue(unsupportedMessage.getValue("documentCitations").jsonArray.isEmpty())
+            assertTrue(unsupportedMessage.getValue("memoryReferences").jsonArray.isEmpty())
+            val requestPayload = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
+            val candidates = requestPayload.getValue("document_candidates").jsonArray
+            assertTrue(candidates.isNotEmpty())
+            assertTrue(candidates.none {
+                "Europa" in it.jsonObject.getValue("text").jsonPrimitive.content
+            })
+            val unsupportedBubble = page.locator(".chat-bubble.assistant").last()
+            assertThat(unsupportedBubble.locator(".answer-text")).hasText(ChatService.ABSTENTION)
+            assertThat(unsupportedBubble.locator(".chat-evidence .citations").first())
+                .containsText("Документные фрагменты не найдены.")
+        }
+    }
+
+    @Test
     fun malformedChatResponseKeepsUserTurnAndCanRetryWithoutDuplicate() {
         withChatBrowser { page, _, fake ->
+            page.onDialog { it.accept() }
             page.locator("#chat-tab").click()
             createChatSession(page)
             page.locator("#task-goal").fill("Prior synthetic goal")
@@ -310,7 +382,7 @@ class BrowserAcceptanceTest {
 
             page.locator(".chat-bubble.user button").click()
             assertEquals(
-                "Не знаю на основе текущих источников. Уточните вопрос или добавьте источник.",
+                ChatService.ABSTENTION,
                 page.locator(".chat-bubble.assistant .answer-text").innerText(),
             )
             assertEquals(1, page.locator(".chat-bubble.user").count())
@@ -431,6 +503,14 @@ class BrowserAcceptanceTest {
         }
         assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Synthetic chat answer.")
         return Json.parseToJsonElement(response.text()).jsonObject
+    }
+
+    private fun assertLongTurnCitation(page: Page, response: JsonObject) {
+        val citations = response.getValue("message").jsonObject.getValue("documentCitations").jsonArray
+        assertTrue(citations.isNotEmpty())
+        val sources = citations.map { it.jsonObject.getValue("source").jsonPrimitive.content }
+        assertThat(page.locator(".chat-bubble.assistant").last().locator(".chat-evidence .citations").first())
+            .containsText(sources.joinToString())
     }
 
     @Test
@@ -1928,19 +2008,22 @@ class BrowserAcceptanceTest {
                             (sessionMemory + sharedMemory).firstOrNull()
                         else -> null
                     }
-                    val selectedDocument = if (question.contains("payment date", ignoreCase = true)) {
-                        documentCandidates.firstOrNull {
+                    val selectedDocument = when {
+                        question.contains("Unsupported synthetic factual question", ignoreCase = true) -> null
+                        question.contains("payment date", ignoreCase = true) -> documentCandidates.firstOrNull {
                             "payment date" in it.jsonObject.getValue("text").jsonPrimitive.content.lowercase()
                         } ?: documentCandidates.firstOrNull()
-                    } else {
-                        documentCandidates.firstOrNull()
+                        else -> documentCandidates.firstOrNull()
                     }
                     val structuredContent = if (malformedStructuredResponse.compareAndSet(true, false)) {
                         """{"answer":"Malformed synthetic answer","task_state_delta":{"goal":"broken"}}"""
                     } else {
                         buildJsonObject {
                             val answer = when {
-                                question.contains("conversation-answer", ignoreCase = true) -> "Synthetic conversational answer."
+                                question.contains("Unsupported synthetic factual question", ignoreCase = true) ->
+                                    ChatService.ABSTENTION
+                                question.contains("conversation-answer", ignoreCase = true) ->
+                                    "Synthetic conversational answer."
                                 documentCandidates.isNotEmpty() || selectedMemory != null ->
                                     answerGoal?.let { "Synthetic chat answer. Current goal: $it" } ?: "Synthetic chat answer."
                                 else -> ChatService.ABSTENTION

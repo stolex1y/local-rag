@@ -84,6 +84,53 @@ class ChatServiceTest {
     }
 
     @Test
+    fun turnAbstainsAndStillClassifiesNewMemoryWithoutEvidence() {
+        val database = temporaryDirectory.resolve("no-chat-evidence.sqlite")
+        ChatStore(database).use { store ->
+            SqliteIndexRepository(database).use { index ->
+                val embeddings = FixtureEmbeddings()
+                val generator = FixtureGenerator()
+                generator.enqueue(
+                    ChatTurnCompletion(
+                        ChatService.ABSTENTION,
+                        ChatTaskStateDelta(),
+                        memoryUpdates = listOf(ChatMemoryUpdate(ChatMemoryScope.SHARED, "User prefers synthetic tea")),
+                    ),
+                )
+                val service = ChatService(store, RagService(index, embeddings, EmptyChatPort, EmptyReranker), generator, embeddings)
+                val sessionId = store.createSession().session.id
+                store.saveSessionFact(sessionId, "Unrelated session fact", listOf(0f, 1f), embeddings.modelName)
+                store.saveSharedFact("Unrelated shared fact", listOf(0f, 1f), embeddings.modelName)
+
+                val response = service.turn(
+                    sessionId,
+                    UUID.randomUUID().toString(),
+                    "I prefer tea. What supports this unsupported claim?",
+                    ChunkStrategy.STRUCTURAL,
+                    SELECTION,
+                )
+
+                assertEquals(ChatService.ABSTENTION, response.message.content)
+                assertTrue(response.message.documentCitations.isEmpty())
+                assertTrue(response.message.memoryReferences.isEmpty())
+                assertEquals(ChatTaskState(), response.taskState)
+                assertEquals(1, generator.requests.size)
+                assertTrue(generator.requests.single().documentCandidates.isEmpty())
+                assertTrue(generator.requests.single().sessionFacts.isEmpty())
+                assertTrue(generator.requests.single().sharedFacts.isEmpty())
+                assertEquals(
+                    setOf("Unrelated session fact", "Unrelated shared fact", "User prefers synthetic tea"),
+                    store.memoryFacts(sessionId).map { it.text }.toSet(),
+                )
+                assertTrue(store.sessionTitleGenerated(sessionId))
+                val messages = requireNotNull(store.sessionDetail(sessionId)).messages
+                assertEquals(listOf(ChatMessageRole.USER, ChatMessageRole.ASSISTANT), messages.map { it.role })
+                assertEquals(ChatService.ABSTENTION, messages.last().content)
+            }
+        }
+    }
+
+    @Test
     fun `invalid selected reference leaves completion updates atomic and retry reuses user turn`() {
         val database = temporaryDirectory.resolve("invalid-reference.sqlite")
         ChatStore(database).use { store ->
@@ -232,6 +279,7 @@ class ChatServiceTest {
             }
         }
     }
+
     private class FixtureEmbeddings : EmbeddingPort {
         override val modelName = "fixture-embedding"
         override fun embed(texts: List<String>): List<List<Float>> = texts.map { listOf(1f, 0f) }
