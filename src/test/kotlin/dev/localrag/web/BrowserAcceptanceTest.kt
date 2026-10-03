@@ -207,6 +207,27 @@ class BrowserAcceptanceTest {
             assertTrue("Shared synthetic preference" in lastRequestB.toString())
             assertThat(page.locator("#task-goal")).hasValue("Goal B")
             assertThat(page.locator("#shared-memory-list")).containsText("Shared synthetic preference")
+            val origin = page.url().substringBefore('?').trimEnd('/')
+            page.navigate("$origin?tab=chat&session=$sessionA")
+            assertThat(page.locator("#task-goal")).hasValue("Goal A")
+            page.locator("#chat-delete-session").click()
+            page.waitForFunction("() => !new URL(location.href).searchParams.has('session')")
+            assertTrue(dialogs.contains("Удалить эту сессию, сообщения, факты и состояние задачи? Общая память останется."))
+            val remainingSessionIds = Json.parseToJsonElement(
+                page.request().get("$origin/api/chat/sessions").text(),
+            ).jsonArray.map { it.jsonObject.getValue("id").jsonPrimitive.content }
+            assertEquals(listOf(sessionB), remainingSessionIds)
+            assertThat(page.locator("#shared-memory-list")).containsText("Shared synthetic preference")
+            assertThat(page.locator("#chat-sessions button")).hasCount(1)
+            page.locator("#chat-sessions button").click()
+            page.waitForFunction(
+                "() => new URL(location.href).searchParams.get('session') === '$sessionB'",
+            )
+            assertThat(page.locator("#chat-messages")).containsText("session-B shared memory")
+            page.reload()
+            assertThat(page.locator("#chat-messages")).containsText("session-B shared memory")
+            assertThat(page.locator("#shared-memory-list")).containsText("Shared synthetic preference")
+            assertEquals("Goal B", page.locator("#task-goal").inputValue())
         }
     }
 
