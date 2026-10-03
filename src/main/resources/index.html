@@ -114,7 +114,7 @@
     .app-tabs button[aria-selected="false"] { color: var(--accent-dark); background: #fff; }
     .chat-grid { display: grid; grid-template-columns: minmax(13rem, .28fr) minmax(0, 1fr); gap: .8rem; margin-top: 1rem; }
     .chat-main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(16rem, .38fr); gap: .8rem; min-width: 0; }
-    .chat-sidebar, .chat-messages, .chat-state, .chat-memory { min-width: 0; padding: .8rem; border: 1px solid var(--line); border-radius: .65rem; background: #fcfefe; }
+    .chat-sidebar, .chat-messages, .chat-state { min-width: 0; padding: .8rem; border: 1px solid var(--line); border-radius: .65rem; background: #fcfefe; }
     .chat-sidebar { display: flex; flex-direction: column; gap: .5rem; }
     .chat-sidebar h3 { margin: .25rem 0 0; }
     .chat-list { display: grid; gap: .4rem; max-height: 26rem; overflow: auto; }
@@ -284,7 +284,7 @@
             <h3>Сессии</h3>
             <div id="chat-sessions" class="chat-list" aria-live="polite"><p class="empty">Загружаем сессии…</p></div>
             <h3>Общая память</h3>
-            <p class="chat-meta">Общие факты попадают сюда только после отдельного подтверждения.</p>
+            <p class="chat-meta">Модель автоматически выбирает факты для общей памяти; список можно просматривать, изменять и удалять.</p>
             <div id="shared-memory-list" class="memory-items" aria-live="polite"><p class="empty">Загружаем факты…</p></div>
           </aside>
           <div class="chat-main">
@@ -307,11 +307,6 @@
                   <div class="actions"><button id="task-state-save" class="secondary" type="submit" disabled>Сохранить состояние</button></div>
                 </form>
               </section>
-              <section class="chat-memory" aria-labelledby="session-memory-heading">
-                <h3 id="session-memory-heading">Факты этой сессии</h3>
-                <p class="chat-meta">Извлечены из подтверждённого состояния задачи. Передача в общую память — отдельное действие.</p>
-                <div id="session-memory-list" class="memory-items" aria-live="polite"><p class="empty">Пока нет фактов.</p></div>
-              </section>
             </div>
           </div>
         </div>
@@ -325,7 +320,7 @@
 
       const $ = (selector, root = document) => root.querySelector(selector);
       const state = { modelsAvailable: false, embeddingAvailable: false, modelConfiguration: null, modelSelectionPending: false, activeJob: null, sources: [], benchmark: null, results: [] };
-      const chatState = { sessionId: null, detail: null, sessions: [], memoryFacts: [], sharedFacts: [], pendingTurn: null, busy: false, loadingSession: false, sessionLoadGeneration: 0, refreshGeneration: 0, activeTab: "collection" };
+      const chatState = { sessionId: null, detail: null, sessions: [], sharedFacts: [], pendingTurn: null, busy: false, loadingSession: false, sessionLoadGeneration: 0, refreshGeneration: 0, activeTab: "collection" };
       const MAX_FILE_BYTES = 256 * 1024 * 1024;
       const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
       const MAX_BENCHMARK_FILE_BYTES = 1024 * 1024;
@@ -1080,7 +1075,6 @@
         chatState.loadingSession = true;
         chatState.sessionId = requestedSessionId;
         chatState.detail = null;
-        chatState.memoryFacts = [];
         chatState.pendingTurn = null;
         showTab(url.searchParams.get("tab") === "chat" ? "chat" : "collection", false, false);
         renderChatMessages();
@@ -1092,7 +1086,6 @@
           if (generation === chatState.sessionLoadGeneration) {
             chatState.loadingSession = false;
             renderChatSessions();
-            renderSessionMemory();
             renderChatMessages();
             renderTaskState();
             updateChatControls();
@@ -1113,20 +1106,15 @@
         if (sessionId && !sessions.some(session => session.id === sessionId)) {
           chatState.sessionId = null;
           chatState.detail = null;
-          chatState.memoryFacts = [];
           chatState.pendingTurn = null;
           setChatUrl(chatState.activeTab, null, true);
           message("chat-error", "Сессия больше не существует.");
         }
         if (chatState.sessionId) {
           const activeSessionId = chatState.sessionId;
-          const [detail, memoryFacts] = await Promise.all([
-            request(`/api/chat/sessions/${encodeURIComponent(activeSessionId)}`),
-            request(`/api/chat/sessions/${encodeURIComponent(activeSessionId)}/memory`),
-          ]);
+          const detail = await request(`/api/chat/sessions/${encodeURIComponent(activeSessionId)}`);
           if (!isCurrent()) return;
           chatState.detail = detail;
-          chatState.memoryFacts = memoryFacts;
           const completedTurns = new Set(detail.messages
             .filter(item => item.role === "ASSISTANT")
             .map(item => item.turnId));
@@ -1135,13 +1123,11 @@
           $("#chat-status").textContent = `Сессия: ${detail.session.title}`;
         } else {
           chatState.detail = null;
-          chatState.memoryFacts = [];
           chatState.pendingTurn = null;
           $("#chat-status").textContent = "Выберите существующую сессию или создайте новую.";
         }
         renderChatSessions();
         renderSharedFacts();
-        renderSessionMemory();
         renderChatMessages();
         renderTaskState();
         updateChatControls();
@@ -1196,31 +1182,6 @@
         });
       }
 
-      function renderSessionMemory() {
-        const list = $("#session-memory-list");
-        list.replaceChildren();
-        if (!chatState.memoryFacts.length) {
-          list.append(node("p", "Пока нет сохранённых фактов состояния.", "empty"));
-          return;
-        }
-        chatState.memoryFacts.forEach(fact => {
-          const item = node("div", undefined, "memory-item");
-          item.append(node("p", fact.text));
-          const share = node("button", "Поделиться с другими сессиями", "secondary");
-          share.type = "button";
-          share.disabled = chatState.busy;
-          share.addEventListener("click", async () => {
-            if (!window.confirm("Скопировать этот факт в общую память? Он станет доступен другим сессиям.")) return;
-            try {
-              await request(`/api/chat/sessions/${encodeURIComponent(chatState.sessionId)}/memory/${encodeURIComponent(fact.id)}/share`, jsonOptions("POST", { confirm: true }));
-              await refreshChat();
-              message("chat-error", "Факт добавлен в общую память.", "success");
-            } catch (error) { message("chat-error", error.message); }
-          });
-          item.append(share);
-          list.append(item);
-        });
-      }
 
       function renderTaskState() {
         const taskState = chatState.detail?.taskState;
@@ -1257,7 +1218,7 @@
             evidence.append(renderChatDocumentSources(item.documentCitations));
             evidence.append(node("h4", "Память"));
             evidence.append(renderChatMemoryReferences(item.memoryReferences));
-            evidence.append(node("p", "Показан контекст, включённый в запрос; это не доказательство семантической опоры ответа.", "chat-meta"));
+            evidence.append(node("p", "Модель выбрала ссылки, приложение проверило их по кандидатам текущего хода; это не гарантирует, что ответ им следует.", "chat-meta"));
             bubble.append(evidence);
           }
           list.append(bubble);
@@ -1325,7 +1286,6 @@
           if (generation !== chatState.sessionLoadGeneration) return;
           chatState.sessionId = detail.session.id;
           chatState.detail = null;
-          chatState.memoryFacts = [];
           chatState.pendingTurn = null;
           showTab("chat", false);
           setChatUrl("chat", chatState.sessionId);
@@ -1338,7 +1298,6 @@
           if (generation === chatState.sessionLoadGeneration) {
             chatState.loadingSession = false;
             renderChatSessions();
-            renderSessionMemory();
             updateChatControls();
           }
         }
@@ -1350,11 +1309,9 @@
         chatState.loadingSession = true;
         chatState.sessionId = sessionId;
         chatState.detail = null;
-        chatState.memoryFacts = [];
         chatState.pendingTurn = null;
         setChatUrl("chat", sessionId);
         renderChatSessions();
-        renderSessionMemory();
         renderChatMessages();
         renderTaskState();
         updateChatControls();
@@ -1366,7 +1323,6 @@
           if (generation === chatState.sessionLoadGeneration) {
             chatState.loadingSession = false;
             renderChatSessions();
-            renderSessionMemory();
             renderChatMessages();
             renderTaskState();
             updateChatControls();
@@ -1405,8 +1361,8 @@
           message("chat-error", error.message);
         } finally {
           chatState.busy = false;
+          renderChatSessions();
           renderChatMessages();
-          renderSessionMemory();
           updateChatControls();
           $("#chat-status").textContent = chatState.detail ? `Сессия: ${chatState.detail.session.title}` : "Выберите или создайте сессию.";
         }
@@ -1436,7 +1392,11 @@
           await refreshChat();
           message("chat-error", "Состояние задачи сохранено.", "success");
         } catch (error) { message("chat-error", error.message); }
-        finally { chatState.busy = false; renderSessionMemory(); updateChatControls(); }
+        finally {
+          chatState.busy = false;
+          renderChatSessions();
+          updateChatControls();
+        }
       }
 
       async function deleteChatSession() {
@@ -1451,7 +1411,6 @@
           if (chatState.sessionId === deletedSessionId && chatState.sessionLoadGeneration === navigationGeneration) {
             chatState.sessionId = null;
             chatState.detail = null;
-            chatState.memoryFacts = [];
             chatState.pendingTurn = null;
             setChatUrl(chatState.activeTab, null);
             await refreshChat(null);
@@ -1462,7 +1421,6 @@
         finally {
           chatState.busy = false;
           renderChatSessions();
-          renderSessionMemory();
           renderChatMessages();
           renderTaskState();
           updateChatControls();

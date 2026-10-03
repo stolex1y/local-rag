@@ -73,10 +73,11 @@ class BrowserAcceptanceTest {
     lateinit var temporaryDirectory: Path
 
     @Test
-    fun chatSessionDisplaysRetrievedCitationsAndRestoresDirectUrl() {
+    fun chatDisplaysOnlyModelSelectedDocumentCitations() {
         withChatBrowser { page, app, fake ->
             page.onDialog { it.accept() }
             indexSyntheticGreenhouseSource(page)
+            indexSyntheticCitationNoise(page)
             page.locator("#chat-tab").click()
             val sessionId = createChatSession(page)
             val turnResponse = submitChatQuestion(page, "greenhouse payment date?")
@@ -95,11 +96,15 @@ class BrowserAcceptanceTest {
             val quote = citationData.getValue("quote").jsonPrimitive.content
             assertTrue("2026-03-15" in quote)
             val providerPayload = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
-            assertTrue(providerPayload.getValue("document_chunks").jsonArray.any { quote in it.jsonPrimitive.content })
+            val candidates = providerPayload.getValue("document_candidates").jsonArray
+            assertTrue(candidates.size >= 2)
+            assertTrue(candidates.any { quote in it.jsonObject.getValue("text").jsonPrimitive.content })
+            assertTrue(candidates.all { it.jsonObject.getValue("ref_id").jsonPrimitive.content.matches(Regex("D\\d+")) })
             assertFalse(providerPayload.toString().contains("greenhouse-chat.md"))
             val citation = page.locator(".chat-bubble.assistant .chat-evidence .citations")
                 .first().locator("li").first()
             assertThat(citation).containsText("greenhouse-chat.md · Greenhouse · строки 1–2")
+            assertThat(page.locator(".chat-bubble.assistant .chat-evidence")).not().containsText("Synthetic Observatory")
             assertThat(citation).containsText("2026-03-15")
             assertThat(page.locator(".chat-bubble.assistant .chat-evidence")).containsText("Источники документов")
             assertThat(page.locator(".chat-bubble.assistant .chat-evidence")).containsText("Память")
@@ -112,96 +117,156 @@ class BrowserAcceptanceTest {
     }
 
     @Test
-    fun chatMaintainsGoalAndCitationsAcrossTwelveTurnsInTwoScenariosWithIsolatedMemory() {
+    fun chatSessionCanSwitchAfterAssistantTurnCompletes() {
+        withChatBrowser { page, _, _ ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+
+            val sessionA = createChatSession(page)
+            submitChatQuestion(page, "session-A switch marker")
+            val sessionB = createChatSession(page)
+            submitChatQuestion(page, "session-B switch marker")
+            assertNotEquals(sessionA, sessionB)
+
+            val sessionAButton = page.locator("#chat-sessions button:not([aria-current='page'])").first()
+            assertFalse(sessionAButton.isDisabled())
+            sessionAButton.click()
+
+            page.waitForFunction(
+                "() => new URL(location.href).searchParams.get('session') === '$sessionA'",
+            )
+            assertThat(page.locator("#chat-messages")).containsText("session-A switch marker")
+            assertThat(page.locator("#chat-messages")).not().containsText("session-B switch marker")
+            assertEquals("Goal A", page.locator("#task-goal").inputValue())
+            assertThat(page.locator("#task-goal")).not().hasValue("Goal B")
+
+            val sessionBButton = page.locator("#chat-sessions button:not([aria-current='page'])").first()
+            sessionBButton.click()
+            page.waitForFunction(
+                "() => new URL(location.href).searchParams.get('session') === '$sessionB'",
+            )
+            assertThat(page.locator("#chat-messages")).containsText("session-B switch marker")
+            assertThat(page.locator("#chat-messages")).not().containsText("session-A switch marker")
+            assertEquals("Goal B", page.locator("#task-goal").inputValue())
+        }
+    }
+
+    @Test
+    fun chatAutoClassifiesMemoryAndIsolatesSessions() {
         withChatBrowser { page, _, fake ->
-            val dialogMessages = CopyOnWriteArrayList<String>()
+            val dialogs = CopyOnWriteArrayList<String>()
             page.onDialog {
-                dialogMessages.add(it.message())
+                dialogs.add(it.message())
                 it.accept()
             }
             indexSyntheticGreenhouseSource(page)
             page.locator("#chat-tab").click()
-            val taskSessionA = createChatSession(page)
-            for (turn in 1..12) {
-                submitChatQuestion(page, if (turn == 1) "session-A goal" else "session-A turn $turn")
-            }
+
+            val sessionA = createChatSession(page)
+            submitChatQuestion(page, "auto-memory-seed session-A")
+            assertThat(page.locator("#shared-memory-list")).containsText("Shared synthetic preference")
+            assertThat(page.locator("#chat-view")).not().containsText("Факты этой сессии")
+            assertEquals(0, page.locator("#session-memory-list").count())
+            assertEquals(0, page.locator("button").filter(
+                com.microsoft.playwright.Locator.FilterOptions().setHasText("Поделиться с другими сессиями"),
+            ).count())
+            assertFalse(dialogs.any { "Скопировать этот факт" in it })
+
+            val sessionOnlyResponse = submitChatQuestion(page, "session-only memory")
+            val sessionOnlyReference = sessionOnlyResponse.getValue("message").jsonObject
+                .getValue("memoryReferences").jsonArray.single().jsonObject
+            assertEquals("SESSION", sessionOnlyReference.getValue("scope").jsonPrimitive.content)
+            assertEquals("Session-only synthetic marker", sessionOnlyReference.getValue("text").jsonPrimitive.content)
+
+            repeat(10) { submitChatQuestion(page, "session-A turn ${it + 3}") }
             assertThat(page.locator(".chat-bubble.user")).hasCount(12)
             assertThat(page.locator(".chat-bubble.assistant")).hasCount(12)
             assertThat(page.locator("#task-goal")).hasValue("Goal A")
-            assertThat(page.locator("#task-clarifications")).hasValue("Clarification A")
-            assertThat(page.locator("#task-constraints")).hasValue("Constraint A")
-            assertThat(page.locator("#task-terms")).hasValue("A-term — Term A")
             val lastRequestA = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
-            assertEquals(8, lastRequestA.getValue("previous_messages").jsonArray.size)
-            assertEquals("Goal A", lastRequestA.getValue("task_state").jsonObject.getValue("goal").jsonPrimitive.content)
-            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Current goal: Goal A")
-            repeat(12) { index ->
-                assertThat(page.locator(".chat-bubble.assistant").nth(index).locator(".chat-evidence"))
-                    .containsText("greenhouse-chat.md")
-            }
+            assertTrue("Session-only synthetic marker" in lastRequestA.toString())
+            assertTrue(lastRequestA.getValue("previous_messages").jsonArray.size <= 8)
 
-            page.reload()
-            assertThat(page.locator("#task-goal")).hasValue("Goal A")
-            assertThat(page.locator("#task-clarifications")).hasValue("Clarification A")
-            assertThat(page.locator("#task-constraints")).hasValue("Constraint A")
-            assertThat(page.locator("#task-terms")).hasValue("A-term — Term A")
-            val memoryEvidence = page.locator(".chat-bubble.assistant").last()
-                .locator(".chat-evidence .citations").nth(1)
-            assertThat(memoryEvidence).containsText("Факты памяти не передавались.")
-            page.locator(".memory-item").filter(
-                com.microsoft.playwright.Locator.FilterOptions().setHasText("Цель задачи: Goal A"),
-            ).locator("button").click()
-            assertThat(page.locator("#chat-error")).containsText("добавлен в общую память")
+            val sessionB = createChatSession(page)
+            assertNotEquals(sessionA, sessionB)
+            val sharedResponse = submitChatQuestion(page, "session-B shared memory")
+            val sharedReference = sharedResponse.getValue("message").jsonObject
+                .getValue("memoryReferences").jsonArray.single().jsonObject
+            assertEquals("SHARED", sharedReference.getValue("scope").jsonPrimitive.content)
+            assertEquals("Shared synthetic preference", sharedReference.getValue("text").jsonPrimitive.content)
+            val firstRequestB = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
+            assertTrue("Shared synthetic preference" in firstRequestB.toString())
+            assertFalse("Session-only synthetic marker" in firstRequestB.toString())
+            assertTrue(firstRequestB.getValue("previous_messages").jsonArray.isEmpty())
+            assertFalse("session-A" in firstRequestB.toString())
 
-            val taskSessionB = createChatSession(page)
-            assertNotEquals(taskSessionA, taskSessionB)
-            for (turn in 1..12) {
-                val turnResponse = submitChatQuestion(page, if (turn == 1) "session-B goal" else "session-B turn $turn")
-                if (turn == 1) {
-                    val memoryReference = turnResponse.getValue("message").jsonObject
-                        .getValue("memoryReferences").jsonArray.single().jsonObject
-                    assertEquals("SHARED", memoryReference.getValue("scope").jsonPrimitive.content)
-                    assertEquals("Цель задачи: Goal A", memoryReference.getValue("text").jsonPrimitive.content)
-                    val referenceId = memoryReference.getValue("id").jsonPrimitive.content
-                    val firstRequestB = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
-                    val firstContext = firstRequestB.toString()
-                    assertTrue("Цель задачи: Goal A" in firstContext)
-                    assertFalse("Clarification A" in firstContext)
-                    assertFalse("Constraint A" in firstContext)
-                    assertFalse("A-term" in firstContext)
-                    assertTrue(firstRequestB.getValue("previous_messages").jsonArray.isEmpty())
-                    val sharedEvidence = page.locator(".chat-bubble.assistant").last()
-                        .locator(".chat-evidence .citations").nth(1)
-                    assertEquals(
-                        "Общая память · $referenceId: Цель задачи: Goal A",
-                        sharedEvidence.locator("li").innerText(),
-                    )
-                }
-            }
+            repeat(11) { submitChatQuestion(page, "session-B turn ${it + 2}") }
             assertThat(page.locator(".chat-bubble.user")).hasCount(12)
             assertThat(page.locator(".chat-bubble.assistant")).hasCount(12)
             val lastRequestB = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
-            val sessionBContext = lastRequestB.toString()
-            assertTrue("Цель задачи: Goal A" in sessionBContext)
-            assertFalse("Clarification A" in sessionBContext)
-            assertFalse("Constraint A" in sessionBContext)
-            assertFalse("A-term" in sessionBContext)
-            assertEquals(8, lastRequestB.getValue("previous_messages").jsonArray.size)
-            assertEquals("Goal B", page.locator("#task-goal").inputValue())
-            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Current goal: Goal B")
-            repeat(12) { index ->
-                assertThat(page.locator(".chat-bubble.assistant").nth(index).locator(".chat-evidence"))
-                    .containsText("greenhouse-chat.md")
+            assertTrue("Shared synthetic preference" in lastRequestB.toString())
+            assertThat(page.locator("#task-goal")).hasValue("Goal B")
+            assertThat(page.locator("#shared-memory-list")).containsText("Shared synthetic preference")
+        }
+    }
+
+    @Test
+    fun chatUpdatesGoalAndFreezesModelGeneratedSessionTitle() {
+        withChatBrowser { page, _, fake ->
+            page.onDialog {
+                if (it.type() == "prompt") it.accept("Edited synthetic preference") else it.accept()
             }
-            assertTrue(dialogMessages.contains("Скопировать этот факт в общую память? Он станет доступен другим сессиям."))
-            page.navigate("${page.url().substringBefore('?')}?tab=chat&session=$taskSessionA")
-            assertThat(page.locator("#task-goal")).hasValue("Goal A")
-            page.locator("#chat-delete-session").click()
-            page.waitForFunction("() => !new URL(location.href).searchParams.has('session')")
-            assertTrue(dialogMessages.contains("Удалить эту сессию, сообщения, факты и состояние задачи? Общая память останется."))
-            assertThat(page.locator("#chat-sessions")).not().containsText("session-A goal")
-            assertThat(page.locator("#chat-sessions")).containsText("session-B goal")
-            assertThat(page.locator("#shared-memory-list")).containsText("Цель задачи: Goal A")
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            createChatSession(page)
+
+            submitChatQuestion(page, "auto-memory-seed describe initial context")
+            assertThat(page.locator("#chat-status")).containsText("Synthetic context summary")
+            val title = page.locator("#chat-status").textContent()
+            assertTrue(title.orEmpty().contains("auto-memory-seed"))
+            assertEquals(1, fake.cloud.titleGenerationRequests.get())
+            submitChatQuestion(page, "explicit goal-shift to a new synthetic objective")
+            assertThat(page.locator("#task-goal")).hasValue("Updated synthetic goal")
+            assertThat(page.locator("#chat-status")).containsText("Synthetic context summary")
+            assertEquals(title, page.locator("#chat-status").textContent())
+            assertEquals(1, fake.cloud.titleGenerationRequests.get())
+
+            page.locator("#task-goal").fill("Manually refined synthetic goal")
+            page.locator("#task-state-save").click()
+            assertThat(page.locator("#chat-error")).containsText("Состояние задачи сохранено.")
+            assertThat(page.locator("#task-goal")).hasValue("Manually refined synthetic goal")
+            assertEquals(title, page.locator("#chat-status").textContent())
+            assertTrue(page.locator("#chat-send").isEnabled())
+            submitChatQuestion(page, "conversation-answer after manual state edit")
+            assertThat(page.locator("#task-goal")).hasValue("Manually refined synthetic goal")
+            assertEquals(1, fake.cloud.titleGenerationRequests.get())
+            assertEquals(0, page.locator("#session-memory-heading").count())
+
+            val sharedFact = page.locator("#shared-memory-list .memory-item").filter(
+                com.microsoft.playwright.Locator.FilterOptions().setHasText("Shared synthetic preference"),
+            )
+            assertThat(sharedFact).containsText("Shared synthetic preference")
+            sharedFact.locator("button").filter(
+                com.microsoft.playwright.Locator.FilterOptions().setHasText("Изменить"),
+            ).click()
+            assertThat(page.locator("#shared-memory-list")).containsText("Edited synthetic preference")
+            val editedFact = page.locator("#shared-memory-list .memory-item").filter(
+                com.microsoft.playwright.Locator.FilterOptions().setHasText("Edited synthetic preference"),
+            )
+            editedFact.locator("button").filter(
+                com.microsoft.playwright.Locator.FilterOptions().setHasText("Удалить"),
+            ).click()
+            assertThat(page.locator("#shared-memory-list")).not().containsText("Edited synthetic preference")
+
+            page.reload()
+            assertThat(page.locator("#task-goal")).hasValue("Manually refined synthetic goal")
+            assertThat(page.locator("#chat-status")).containsText("Synthetic context summary")
+            assertEquals(title, page.locator("#chat-status").textContent())
+            assertEquals(1, fake.cloud.titleGenerationRequests.get())
+            assertThat(page.locator("#chat-view")).not().containsText("Факты этой сессии")
+            assertEquals(0, page.locator("button").filter(
+                com.microsoft.playwright.Locator.FilterOptions().setHasText("Поделиться с другими сессиями"),
+            ).count())
         }
     }
 
@@ -311,6 +376,15 @@ class BrowserAcceptanceTest {
     private fun indexSyntheticGreenhouseSource(page: Page) {
         val source = temporaryDirectory.resolve("greenhouse-chat.md")
         Files.writeString(source, "# Greenhouse\nThe greenhouse payment date is 2026-03-15.\n")
+        page.locator("#source-files").setInputFiles(source)
+        page.locator("#upload-button").click()
+        assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+        page.locator("#index-button").click()
+        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+    }
+    private fun indexSyntheticCitationNoise(page: Page) {
+        val source = temporaryDirectory.resolve("synthetic-observatory.md")
+        Files.writeString(source, "# Synthetic Observatory\nCalibration note: the beacon threshold is 14 units.\n")
         page.locator("#source-files").setInputFiles(source)
         page.locator("#upload-button").click()
         assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
@@ -1740,6 +1814,7 @@ class BrowserAcceptanceTest {
         val failReranker = AtomicBoolean(false)
         val credentialConfigured = AtomicBoolean(true)
         val chatMessages = CopyOnWriteArrayList<List<String>>()
+        val titleGenerationRequests = AtomicInteger(0)
         val chatModels = CopyOnWriteArrayList<String>()
         val rerankMessages = CopyOnWriteArrayList<List<String>>()
         val holdNextChat = AtomicBoolean(false)
@@ -1771,12 +1846,15 @@ class BrowserAcceptanceTest {
                 } else if (request.containsKey("response_format")) {
                     val payload = Json.parseToJsonElement(messages.last()).jsonObject
                     val question = payload.getValue("question").jsonPrimitive.content
+                    val generateTitle = payload.getValue("generate_title").jsonPrimitive.content.toBoolean()
+                    val titleRequestNumber = if (generateTitle) titleGenerationRequests.incrementAndGet() else 0
                     val currentGoal = payload.getValue("task_state").jsonObject.getValue("goal")
                     val firstSessionA = currentGoal == kotlinx.serialization.json.JsonNull && question.contains("session-A", ignoreCase = true)
                     val firstSessionB = currentGoal == kotlinx.serialization.json.JsonNull && question.contains("session-B", ignoreCase = true)
                     val answerGoal = when {
                         firstSessionA -> "Goal A"
                         firstSessionB -> "Goal B"
+                        question.contains("goal-shift", ignoreCase = true) -> "Updated synthetic goal"
                         currentGoal != kotlinx.serialization.json.JsonNull -> currentGoal.jsonPrimitive.content
                         else -> null
                     }
@@ -1784,6 +1862,7 @@ class BrowserAcceptanceTest {
                         put("goal", when {
                             firstSessionA -> JsonPrimitive("Goal A")
                             firstSessionB -> JsonPrimitive("Goal B")
+                            question.contains("goal-shift", ignoreCase = true) -> JsonPrimitive("Updated synthetic goal")
                             else -> kotlinx.serialization.json.JsonNull
                         })
                         put("clarifications_to_add", buildJsonArray {
@@ -1799,12 +1878,69 @@ class BrowserAcceptanceTest {
                             if (firstSessionB) add(buildJsonObject { put("term", "B-term"); put("definition", "Term B") })
                         })
                     }
+                    val sessionMemory = payload.getValue("session_memory").jsonArray
+                    val sharedMemory = payload.getValue("shared_memory").jsonArray
+                    val documentCandidates = payload.getValue("document_candidates").jsonArray
+                    val memoryUpdates = buildJsonArray {
+                        if (firstSessionA) {
+                            add(buildJsonObject {
+                                put("scope", "SHARED")
+                                put("content", "Цель задачи: Goal A")
+                            })
+                        }
+                        if (question.contains("auto-memory-seed", ignoreCase = true)) {
+                            add(buildJsonObject {
+                                put("scope", "SESSION")
+                                put("content", "Session-only synthetic marker")
+                            })
+                            add(buildJsonObject {
+                                put("scope", "SHARED")
+                                put("content", "Shared synthetic preference")
+                            })
+                        }
+                    }
+                    val selectedMemory = when {
+                        firstSessionB -> sharedMemory.firstOrNull {
+                            it.jsonObject.getValue("text").jsonPrimitive.content == "Shared synthetic preference"
+                        }
+                        question.contains("memory", ignoreCase = true) ->
+                            (sessionMemory + sharedMemory).firstOrNull()
+                        else -> null
+                    }
+                    val selectedDocument = if (question.contains("payment date", ignoreCase = true)) {
+                        documentCandidates.firstOrNull {
+                            "payment date" in it.jsonObject.getValue("text").jsonPrimitive.content.lowercase()
+                        } ?: documentCandidates.firstOrNull()
+                    } else {
+                        documentCandidates.firstOrNull()
+                    }
                     val structuredContent = if (malformedStructuredResponse.compareAndSet(true, false)) {
                         """{"answer":"Malformed synthetic answer","task_state_delta":{"goal":"broken"}}"""
                     } else {
                         buildJsonObject {
-                            put("answer", answerGoal?.let { "Synthetic chat answer. Current goal: $it" } ?: "Synthetic chat answer.")
+                            val answer = when {
+                                question.contains("conversation-answer", ignoreCase = true) -> "Synthetic conversational answer."
+                                documentCandidates.isNotEmpty() || selectedMemory != null ->
+                                    answerGoal?.let { "Synthetic chat answer. Current goal: $it" } ?: "Synthetic chat answer."
+                                else -> ChatService.ABSTENTION
+                            }
+                            put("answer", answer)
                             put("task_state_delta", delta)
+                            put("memory_updates", memoryUpdates)
+                            put("document_citation_refs", buildJsonArray {
+                                selectedDocument?.jsonObject?.get("ref_id")?.let { add(it) }
+                            })
+                            put("memory_reference_refs", buildJsonArray {
+                                selectedMemory?.jsonObject?.get("ref_id")?.let { add(it) }
+                            })
+                            put(
+                                "session_title",
+                                if (generateTitle) {
+                                    JsonPrimitive("Synthetic context summary ${question.take(24)} #$titleRequestNumber")
+                                } else {
+                                    kotlinx.serialization.json.JsonNull
+                                },
+                            )
                         }.toString()
                     }
                     val response = buildJsonObject {
