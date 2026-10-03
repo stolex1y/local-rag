@@ -112,7 +112,7 @@ class BrowserAcceptanceTest {
     }
 
     @Test
-    fun chatSessionsKeepLongTaskStatePrivateAndExposeOnlyExplicitlySharedMemory() {
+    fun chatMaintainsGoalAndCitationsAcrossTwelveTurnsInTwoScenariosWithIsolatedMemory() {
         withChatBrowser { page, _, fake ->
             val dialogMessages = CopyOnWriteArrayList<String>()
             page.onDialog {
@@ -125,6 +125,8 @@ class BrowserAcceptanceTest {
             for (turn in 1..12) {
                 submitChatQuestion(page, if (turn == 1) "session-A goal" else "session-A turn $turn")
             }
+            assertThat(page.locator(".chat-bubble.user")).hasCount(12)
+            assertThat(page.locator(".chat-bubble.assistant")).hasCount(12)
             assertThat(page.locator("#task-goal")).hasValue("Goal A")
             assertThat(page.locator("#task-clarifications")).hasValue("Clarification A")
             assertThat(page.locator("#task-constraints")).hasValue("Constraint A")
@@ -154,8 +156,13 @@ class BrowserAcceptanceTest {
             val taskSessionB = createChatSession(page)
             assertNotEquals(taskSessionA, taskSessionB)
             for (turn in 1..12) {
-                submitChatQuestion(page, if (turn == 1) "session-B goal" else "session-B turn $turn")
+                val turnResponse = submitChatQuestion(page, if (turn == 1) "session-B goal" else "session-B turn $turn")
                 if (turn == 1) {
+                    val memoryReference = turnResponse.getValue("message").jsonObject
+                        .getValue("memoryReferences").jsonArray.single().jsonObject
+                    assertEquals("SHARED", memoryReference.getValue("scope").jsonPrimitive.content)
+                    assertEquals("Цель задачи: Goal A", memoryReference.getValue("text").jsonPrimitive.content)
+                    val referenceId = memoryReference.getValue("id").jsonPrimitive.content
                     val firstRequestB = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
                     val firstContext = firstRequestB.toString()
                     assertTrue("Цель задачи: Goal A" in firstContext)
@@ -165,10 +172,14 @@ class BrowserAcceptanceTest {
                     assertTrue(firstRequestB.getValue("previous_messages").jsonArray.isEmpty())
                     val sharedEvidence = page.locator(".chat-bubble.assistant").last()
                         .locator(".chat-evidence .citations").nth(1)
-                    assertThat(sharedEvidence).containsText("Общая память ·")
-                    assertThat(sharedEvidence).containsText("Цель задачи: Goal A")
+                    assertEquals(
+                        "Общая память · $referenceId: Цель задачи: Goal A",
+                        sharedEvidence.locator("li").innerText(),
+                    )
                 }
             }
+            assertThat(page.locator(".chat-bubble.user")).hasCount(12)
+            assertThat(page.locator(".chat-bubble.assistant")).hasCount(12)
             val lastRequestB = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
             val sessionBContext = lastRequestB.toString()
             assertTrue("Цель задачи: Goal A" in sessionBContext)
