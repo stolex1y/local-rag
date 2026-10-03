@@ -85,7 +85,10 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
             )
             statement.execute("CREATE INDEX IF NOT EXISTS chunks_search_idx ON chunks(strategy, embedding_model, source_id)")
             statement.execute("CREATE INDEX IF NOT EXISTS sources_status_idx ON sources(status, created_at)")
-            statement.execute("PRAGMA user_version=12")
+            val schemaVersion = statement.executeQuery("PRAGMA user_version").use { rows ->
+                if (rows.next()) rows.getInt(1) else 0
+            }
+            if (schemaVersion < INDEX_SCHEMA_VERSION) statement.execute("PRAGMA user_version=$INDEX_SCHEMA_VERSION")
         }
     }
 
@@ -473,6 +476,7 @@ class SqliteIndexRepository(databasePath: Path = defaultDatabasePath()) : IndexR
     override fun close() = connection.close()
 
     companion object {
+        private const val INDEX_SCHEMA_VERSION = 12
         const val MAX_SEARCH_RESULTS = 100
         private const val MAX_ERROR_LENGTH = 240
         private val TOKEN_UNIT = Regex("\\S+")
