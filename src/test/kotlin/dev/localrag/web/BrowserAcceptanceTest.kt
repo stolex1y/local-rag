@@ -1067,14 +1067,20 @@ class BrowserAcceptanceTest {
         withChatBrowser { page, app, fake ->
             page.onDialog { it.accept() }
             indexSyntheticGreenhouseSource(page)
+            indexSyntheticCollectionDecoy(page)
             page.locator("#chat-tab").click()
             createChatSession(page)
             submitChatQuestion(page, "greenhouse payment date?")
 
+            val cloudRequestsBeforeCollection = fake.cloud.chatRequests.size
             page.locator("#collection-tab").click()
             assertThat(page.locator("#source-list")).containsText("greenhouse-chat.md")
+            assertThat(page.locator("#source-list")).containsText("collection-decoy.md")
             assertThat(page.locator("#model-select")).hasValue("deepseek-flash")
-            page.locator("#question").fill("What is the greenhouse payment date?")
+            val collectionQuestion = "What is the greenhouse payment date?"
+            page.locator("#question").fill(collectionQuestion)
+            assertEquals(cloudRequestsBeforeCollection, fake.cloud.chatRequests.size)
+            val cloudRequestsBeforeQuery = fake.cloud.chatRequests.size
             val queryResponse = page.waitForResponse("**/api/query") {
                 page.locator("#query-button").click()
             }
@@ -1082,6 +1088,52 @@ class BrowserAcceptanceTest {
             assertThat(page.locator("#query-results")).containsText("greenhouse-chat.md")
             assertThat(page.locator("#query-results")).containsText("строки 1–2")
             assertThat(page.locator("#query-results")).containsText("2026-03-15")
+
+            val sourceRecords = Json.parseToJsonElement(
+                page.request().get("http://127.0.0.1:${app.server.port}/api/sources").text(),
+            ).jsonArray.map { it.jsonObject }
+            assertEquals(
+                setOf("greenhouse-chat.md", "collection-decoy.md"),
+                sourceRecords.map { it.getValue("name").jsonPrimitive.content }.toSet(),
+            )
+            assertTrue(sourceRecords.all { it.getValue("status").jsonPrimitive.content == "READY" })
+            val retrievedSources = Json.parseToJsonElement(queryResponse.text()).jsonObject
+                .getValue("rag").jsonObject.getValue("sources").jsonArray.map { it.jsonObject }
+            assertEquals(1, retrievedSources.size)
+            assertEquals("greenhouse-chat.md", retrievedSources.single().getValue("source").jsonPrimitive.content)
+            val retrievedQuote = retrievedSources.single().getValue("quote").jsonPrimitive.content
+            val collectionRequests = fake.cloud.chatRequests.drop(cloudRequestsBeforeQuery)
+            assertEquals(2, collectionRequests.size)
+            val collectionMessages = collectionRequests.map { request ->
+                assertEquals(setOf("model", "stream", "messages"), request.keys)
+                assertEquals("deepseek-flash", request.getValue("model").jsonPrimitive.content)
+                val messages = request.getValue("messages").jsonArray.map { it.jsonObject }
+                assertEquals(2, messages.size)
+                messages.forEach { assertEquals(setOf("role", "content"), it.keys) }
+                assertEquals(
+                    listOf("system", "user"),
+                    messages.map { it.getValue("role").jsonPrimitive.content },
+                )
+                messages
+            }
+            val collectionSystemMessages = collectionMessages.map {
+                it.first().getValue("content").jsonPrimitive.content
+            }
+            val collectionUserMessages = collectionMessages.map {
+                it.last().getValue("content").jsonPrimitive.content
+            }
+            assertEquals(collectionQuestion, collectionUserMessages.first())
+            assertTrue(collectionQuestion in collectionUserMessages.last())
+            assertTrue(retrievedQuote in collectionUserMessages.last())
+            assertTrue(collectionSystemMessages.none { collectionQuestion in it })
+            assertTrue(collectionSystemMessages.none { retrievedQuote in it })
+            val serializedCollectionRequests = collectionRequests.joinToString("\n") { it.toString() }
+            assertFalse("UNRELATED_PRIVATE_INDEX_SENTINEL" in serializedCollectionRequests)
+            sourceRecords.forEach { source ->
+                assertFalse(source.getValue("name").jsonPrimitive.content in serializedCollectionRequests)
+                assertFalse(source.getValue("sourceId").jsonPrimitive.content in serializedCollectionRequests)
+            }
+            assertEquals(cloudRequestsBeforeQuery + 2, fake.cloud.chatRequests.size)
 
             val localProviderResponse = page.waitForResponse("**/api/models/selection") {
                 page.locator("#provider-select").selectOption("ollama")
@@ -1091,10 +1143,9 @@ class BrowserAcceptanceTest {
             val benchmarkCloudStart = fake.cloud.chatModels.size
             val benchmarkGenerationStart = fake.localGenerationCalls.get()
             val benchmarkRerankStart = fake.rerankRequests.size
-            val source = Json.parseToJsonElement(
-                page.request().get("http://127.0.0.1:${app.server.port}/api/sources").text(),
-            ).jsonArray.single { it.jsonObject.getValue("name").jsonPrimitive.content == "greenhouse-chat.md" }
-                .jsonObject
+            val source = sourceRecords.single {
+                it.getValue("name").jsonPrimitive.content == "greenhouse-chat.md"
+            }
             val sourceId = source.getValue("sourceId").jsonPrimitive.content
             val questionsFile = temporaryDirectory.resolve("chat-followup-benchmark.json")
             Files.writeString(
@@ -1103,7 +1154,7 @@ class BrowserAcceptanceTest {
                     sourceId,
                     2,
                     "The greenhouse payment date is 2026-03-15.",
-                    questionText = "What is the greenhouse payment date?",
+                    questionText = collectionQuestion,
                     questionCount = 10,
                 ),
                 UTF_8,
@@ -1139,6 +1190,7 @@ class BrowserAcceptanceTest {
             assertEquals(resultsBeforeModelChange, resultsAfterModelChange)
         }
     }
+
     private fun withChatBrowser(block: (Page, BrowserAppFixture, FakeOllama) -> Unit) {
         FakeOllama().use { fake ->
             val paths = LocalRagPaths(temporaryDirectory.resolve("chat-browser-app-data"))
@@ -1166,6 +1218,19 @@ class BrowserAcceptanceTest {
     private fun indexSyntheticGreenhouseSource(page: Page) {
         val source = temporaryDirectory.resolve("greenhouse-chat.md")
         Files.writeString(source, "# Greenhouse\nThe greenhouse payment date is 2026-03-15.\n")
+        page.locator("#source-files").setInputFiles(source)
+        page.locator("#upload-button").click()
+        assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+        page.locator("#index-button").click()
+        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+    }
+    private fun indexSyntheticCollectionDecoy(page: Page) {
+        val source = temporaryDirectory.resolve("collection-decoy.md")
+        Files.writeString(
+            source,
+            "# Penguin archive\nUNRELATED_PRIVATE_INDEX_SENTINEL penguin breeding notes.\n",
+            UTF_8,
+        )
         page.locator("#source-files").setInputFiles(source)
         page.locator("#upload-button").click()
         assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
@@ -2824,6 +2889,7 @@ class BrowserAcceptanceTest {
         val malformedStructuredResponse = AtomicBoolean(false)
         val credentialConfigured = AtomicBoolean(true)
         val chatMessages = CopyOnWriteArrayList<List<String>>()
+        val chatRequests = CopyOnWriteArrayList<JsonObject>()
         val titleGenerationRequests = AtomicInteger(0)
         val chatModels = CopyOnWriteArrayList<String>()
         val holdNextChat = AtomicBoolean(false)
@@ -2834,6 +2900,7 @@ class BrowserAcceptanceTest {
             this.executor = this@FakeDeepSeek.executor
             createContext("/chat/completions") { exchange ->
                 val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+                chatRequests.add(request)
                 val messages = request.getValue("messages").jsonArray.map {
                     it.jsonObject.getValue("content").jsonPrimitive.content
                 }
