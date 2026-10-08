@@ -136,6 +136,62 @@ class BrowserAcceptanceTest {
     }
 
     @Test
+    fun chatDeepSeekPayloadUsesExactTaskStateAndLastEightSessionMessages() {
+        withChatBrowser { page, _, fake ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+
+            val foreignSession = createChatSession(page)
+            submitChatQuestion(page, "FOREIGN_SESSION_MESSAGE_DO_NOT_TRANSMIT greenhouse")
+            val targetSession = createChatSession(page)
+            assertNotEquals(foreignSession, targetSession)
+            assertEquals(targetSession, page.url().substringAfter("session="))
+            page.locator("#task-goal").fill("Target-session payload goal")
+            page.locator("#task-state-save").click()
+            assertThat(page.locator("#chat-error")).containsText("Состояние задачи сохранено.")
+            assertThat(page.locator("#task-goal")).hasValue("Target-session payload goal")
+
+            repeat(5) { turn ->
+                submitChatQuestion(page, "greenhouse target turn ${turn + 1} marker")
+            }
+            val currentQuestion = "greenhouse final payload question"
+            submitChatQuestion(page, currentQuestion)
+
+            val request = fake.cloud.chatRequests.last()
+            assertEquals("deepseek-flash", request.getValue("model").jsonPrimitive.content)
+            val modelMessages = request.getValue("messages").jsonArray.map { it.jsonObject }
+            assertEquals("user", modelMessages.last().getValue("role").jsonPrimitive.content)
+            val payload = Json.parseToJsonElement(
+                modelMessages.last().getValue("content").jsonPrimitive.content,
+            ).jsonObject
+            assertEquals(currentQuestion, payload.getValue("question").jsonPrimitive.content)
+            val expectedTaskState = buildJsonObject {
+                put("goal", "Target-session payload goal")
+                put("clarifications", buildJsonArray { })
+                put("constraints", buildJsonArray { })
+                put("terms", buildJsonArray { })
+            }
+            assertEquals(expectedTaskState, payload.getValue("task_state").jsonObject)
+
+            val previousMessages = payload.getValue("previous_messages").jsonArray.map { item ->
+                val message = item.jsonObject
+                message.getValue("role").jsonPrimitive.content to
+                    message.getValue("content").jsonPrimitive.content
+            }
+            val expectedPreviousMessages = buildList {
+                for (turn in 2..5) {
+                    add("user" to "greenhouse target turn $turn marker")
+                    add("assistant" to "Synthetic chat answer. Current goal: Target-session payload goal")
+                }
+            }
+            assertEquals(8, previousMessages.size)
+            assertEquals(expectedPreviousMessages, previousMessages)
+            assertFalse(payload.toString().contains("FOREIGN_SESSION_MESSAGE_DO_NOT_TRANSMIT"))
+        }
+    }
+
+    @Test
     fun chatSessionCanSwitchAfterAssistantTurnCompletes() {
         withChatBrowser { page, _, _ ->
             page.onDialog { it.accept() }
@@ -1459,7 +1515,21 @@ class BrowserAcceptanceTest {
                         assertEquals("qwen2.5:7b", selection.getValue("modelId").jsonPrimitive.content)
                         val rag = result.getValue("rag").jsonObject
                         assertEquals("Synthetic local answer.", rag.getValue("answer").jsonPrimitive.content)
-                        assertTrue(rag.getValue("sources").jsonArray.isNotEmpty())
+                        val citations = rag.getValue("sources").jsonArray.map { it.jsonObject }
+                        assertEquals(1, citations.size)
+                        val citation = citations.single()
+                        val expectedSource = sourceRecordsBefore.single().jsonObject
+                        assertEquals("READY", expectedSource.getValue("status").jsonPrimitive.content)
+                        assertEquals(
+                            expectedSource.getValue("sourceId").jsonPrimitive.content,
+                            citation.getValue("sourceId").jsonPrimitive.content,
+                        )
+                        assertEquals("local-provider-greenhouse.txt", citation.getValue("source").jsonPrimitive.content)
+                        val location = citation.getValue("location").jsonObject
+                        assertEquals(1, location.getValue("lineStart").jsonPrimitive.content.toInt())
+                        assertEquals(1, location.getValue("lineEnd").jsonPrimitive.content.toInt())
+                        assertThat(page.locator("#query-results")).containsText("local-provider-greenhouse.txt")
+                        assertThat(page.locator("#query-results")).containsText("строки 1 · Document body")
                         assertEquals(cloudStart, fake.cloud.chatMessages.size)
                         assertEquals(2, fake.localGenerationCalls.get() - localGenerationStart)
                         val localModels = fake.localModels.drop(localModelStart)
