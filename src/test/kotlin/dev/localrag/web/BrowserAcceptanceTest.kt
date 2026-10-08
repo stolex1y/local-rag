@@ -156,6 +156,611 @@ class BrowserAcceptanceTest {
     }
 
     @Test
+    fun chatSessionsKeepIndependentProviderAndModelChoices() {
+        withChatBrowser { page, app, fake ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            val cloudSession = createChatSession(page)
+            assertThat(page.locator("#chat-provider-select")).hasValue("fixture")
+            assertThat(page.locator("#chat-model-select")).hasValue("deepseek-flash")
+            val cloudStart = fake.cloud.chatModels.size
+            val cloudResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-question").fill("session-A compare model")
+                page.locator("#chat-send").click()
+            }
+            assertEquals(200, cloudResponse.status())
+            val cloudMessage = Json.parseToJsonElement(cloudResponse.text()).jsonObject
+                .getValue("message").jsonObject
+            assertEquals("fixture", cloudMessage.getValue("modelSelection").jsonObject
+                .getValue("providerId").jsonPrimitive.content)
+            assertEquals("deepseek-flash", cloudMessage.getValue("modelSelection").jsonObject
+                .getValue("modelId").jsonPrimitive.content)
+            assertEquals(listOf("deepseek-flash"), fake.cloud.chatModels.drop(cloudStart))
+
+            val localSession = createChatSession(page)
+            val providerResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
+                page.locator("#chat-provider-select").selectOption("ollama")
+            }
+            assertEquals(200, providerResponse.status())
+            assertThat(page.locator("#chat-model-select")).hasValue("qwen2.5:3b")
+            val modelResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
+                page.locator("#chat-model-select").selectOption("qwen2.5:7b")
+            }
+            assertEquals(200, modelResponse.status())
+            val localGenerationStart = fake.localGenerationCalls.get()
+            val localModelsStart = fake.localModels.size
+            val localResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-question").fill("What is the greenhouse payment date?")
+                page.locator("#chat-send").click()
+            }
+            assertEquals(200, localResponse.status())
+            val localMessage = Json.parseToJsonElement(localResponse.text()).jsonObject
+                .getValue("message").jsonObject
+            val localSelection = localMessage.getValue("modelSelection").jsonObject
+            assertEquals("ollama", localSelection.getValue("providerId").jsonPrimitive.content)
+            assertEquals("qwen2.5:7b", localSelection.getValue("modelId").jsonPrimitive.content)
+            assertTrue(localMessage.getValue("elapsedMs").jsonPrimitive.content.toLong() >= 0)
+            assertEquals(1, fake.localGenerationCalls.get() - localGenerationStart)
+            assertTrue(fake.localModels.drop(localModelsStart).contains("qwen2.5:7b"))
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:7b")
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Время обработки хода:")
+            val changedModelResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
+                page.locator("#chat-model-select").selectOption("qwen2.5:3b")
+            }
+            assertEquals(200, changedModelResponse.status())
+            val changedGenerationStart = fake.localGenerationCalls.get()
+            val changedModelsStart = fake.localModels.size
+            val changedTurnResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-question").fill("Second turn after changing the session model")
+                page.locator("#chat-send").click()
+            }
+            assertEquals(200, changedTurnResponse.status())
+            val changedMessage = Json.parseToJsonElement(changedTurnResponse.text()).jsonObject
+                .getValue("message").jsonObject
+            assertEquals(
+                "qwen2.5:3b",
+                changedMessage.getValue("modelSelection").jsonObject.getValue("modelId").jsonPrimitive.content,
+            )
+            assertEquals(1, fake.localGenerationCalls.get() - changedGenerationStart)
+            assertTrue(fake.localModels.drop(changedModelsStart).contains("qwen2.5:3b"))
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
+
+            page.locator("#collection-tab").click()
+            assertThat(page.locator("#provider-select")).hasValue("fixture")
+            assertThat(page.locator("#model-select")).hasValue("deepseek-flash")
+            page.locator("#chat-tab").click()
+            val cloudSessionButton = page.locator("#chat-sessions button:not([aria-current='page'])").first()
+            cloudSessionButton.click()
+            page.waitForFunction("() => new URL(location.href).searchParams.get('session') === '$cloudSession'")
+            assertThat(page.locator("#chat-provider-select")).hasValue("fixture")
+            assertThat(page.locator("#chat-model-select")).hasValue("deepseek-flash")
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("fixture/deepseek-flash")
+
+            page.locator("#chat-sessions button:not([aria-current='page'])").first().click()
+            page.waitForFunction("() => new URL(location.href).searchParams.get('session') === '$localSession'")
+            assertThat(page.locator("#chat-provider-select")).hasValue("ollama")
+            assertThat(page.locator("#chat-model-select")).hasValue("qwen2.5:3b")
+            assertThat(page.locator(".chat-bubble.assistant").first()).containsText("ollama/qwen2.5:7b")
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
+
+            val origin = "http://127.0.0.1:${app.server.port}"
+            val firstChoice = Json.parseToJsonElement(
+                page.request().get("$origin/api/chat/sessions/$cloudSession").text(),
+            ).jsonObject.getValue("session").jsonObject.getValue("modelSelection").jsonObject
+            val secondChoice = Json.parseToJsonElement(
+                page.request().get("$origin/api/chat/sessions/$localSession").text(),
+            ).jsonObject.getValue("session").jsonObject.getValue("modelSelection").jsonObject
+            assertEquals("fixture", firstChoice.getValue("providerId").jsonPrimitive.content)
+            assertEquals("ollama", secondChoice.getValue("providerId").jsonPrimitive.content)
+        }
+    }
+
+    @Test
+    fun chatRetryWaitsForModelSelectionAndIgnoresStaleSessionRefresh() {
+        withChatBrowser { page, _, fake ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            val sessionId = createChatSession(page)
+
+            fake.cloud.failChat.set(true)
+            val failedTurn = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-question").fill("Retry after selecting a local provider")
+                page.locator("#chat-send").click()
+            }
+            assertTrue(failedTurn.status() >= 400)
+            fake.cloud.failChat.set(false)
+            val retry = page.locator(".chat-bubble.user").last().locator("button")
+            assertThat(retry).isEnabled()
+
+            page.evaluate(
+                """sessionId => {
+                    const gate = window.__chatDetailGate = {
+                        path: `/api/chat/sessions/${sessionId}`,
+                        held: false,
+                        delivered: false,
+                        release: null,
+                        selectionHeld: false,
+                        releaseSelection: null,
+                    };
+                    const originalFetch = window.fetch.bind(window);
+                    window.fetch = async (input, init = {}) => {
+                        const url = typeof input === "string" ? input : input.url;
+                        const method = (init.method || (typeof input === "string" ? "GET" : input.method)).toUpperCase();
+                        const path = new URL(url, location.href).pathname;
+                        if (method === "PUT" && path.endsWith("/model-selection")) {
+                            gate.selectionHeld = true;
+                            await new Promise(resolve => { gate.releaseSelection = resolve; });
+                        }
+                        const response = await originalFetch(input, init);
+                        if (method === "GET" && path === gate.path && !gate.held) {
+                            gate.held = true;
+                            await new Promise(resolve => {
+                                gate.release = () => {
+                                    gate.delivered = true;
+                                    resolve();
+                                };
+                            });
+                        }
+                        return response;
+                    };
+                }""".trimIndent(),
+                sessionId,
+            )
+            page.locator("#collection-tab").click()
+            page.locator("#chat-tab").click()
+            page.waitForFunction("() => window.__chatDetailGate.held === true")
+            page.locator("#chat-provider-select").selectOption("ollama")
+            page.waitForFunction("() => window.__chatDetailGate.selectionHeld === true")
+            assertThat(retry).isDisabled()
+
+            val providerResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
+                page.evaluate("() => window.__chatDetailGate.releaseSelection()")
+            }
+            assertEquals(200, providerResponse.status())
+            assertThat(page.locator("#chat-provider-select")).hasValue("ollama")
+            assertThat(retry).isEnabled()
+
+            page.evaluate("() => window.__chatDetailGate.release()")
+            page.waitForFunction(
+                "() => window.__chatDetailGate.delivered && document.querySelector('#chat-provider-select').value === 'ollama'",
+            )
+            val cloudCallsBeforeRetry = fake.cloud.chatModels.size
+            val localCallsBeforeRetry = fake.localGenerationCalls.get()
+            val retryResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                retry.click()
+            }
+            assertEquals(200, retryResponse.status())
+            assertEquals(cloudCallsBeforeRetry, fake.cloud.chatModels.size)
+            assertTrue(fake.localGenerationCalls.get() > localCallsBeforeRetry)
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
+            fake.failLocalGeneration.set(true)
+            val cloudCallsBeforeLocalFailure = fake.cloud.chatModels.size
+            val localFailure = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-question").fill("Local generation failure must not route to Cloud")
+                page.locator("#chat-send").click()
+            }
+            assertTrue(localFailure.status() >= 400)
+            assertEquals(cloudCallsBeforeLocalFailure, fake.cloud.chatModels.size)
+        }
+    }
+
+    @Test
+    fun chatBackNavigationLoadsAnotherSessionDuringSelectionUpdate() {
+        withChatBrowser { page, _, fake ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            val firstSession = createChatSession(page)
+            page.locator("#task-goal").fill("Goal from the first session")
+            page.locator("#task-clarifications").fill("Clarification from the first session")
+            page.locator("#task-constraints").fill("Constraint from the first session")
+            page.locator("#task-terms").fill("term-first — definition-first")
+            val firstSaveResponse = page.waitForResponse("**/api/chat/sessions/$firstSession/task-state") {
+                page.locator("#task-state-save").click()
+            }
+            assertEquals(200, firstSaveResponse.status())
+            assertThat(page.locator("#chat-error")).containsText("Состояние задачи сохранено.")
+            page.waitForFunction("() => !document.querySelector('#task-state-save').disabled")
+
+            val secondSession = createChatSession(page)
+            page.locator("#task-goal").fill("Goal from the second session")
+            page.locator("#task-clarifications").fill("Clarification from the second session")
+            page.locator("#task-constraints").fill("Constraint from the second session")
+            page.locator("#task-terms").fill("term-second — definition-second")
+            val secondSaveResponse = page.waitForResponse("**/api/chat/sessions/$secondSession/task-state") {
+                page.locator("#task-state-save").click()
+            }
+            assertEquals(200, secondSaveResponse.status())
+            assertThat(page.locator("#chat-error")).containsText("Состояние задачи сохранено.")
+            page.waitForFunction("() => !document.querySelector('#task-state-save').disabled")
+            fake.cloud.failChat.set(true)
+            val failedTurn = page.waitForResponse("**/api/chat/sessions/$secondSession/turns") {
+                page.locator("#chat-question").fill("Retry this unfinished turn after changing models")
+                page.locator("#chat-send").click()
+            }
+            assertTrue(failedTurn.status() >= 400)
+            fake.cloud.failChat.set(false)
+            val retry = page.locator(".chat-bubble.user").last().locator("button")
+            assertThat(retry).isEnabled()
+
+
+            page.evaluate(
+                """
+                    () => {
+                      const gate = window.__selectionUpdateGate = {
+                        selectionHeld: false,
+                        releaseSelection: null,
+                        detailHeld: false,
+                        detailHeldOnce: false,
+                        releaseDetail: null,
+                        detailProcessed: false
+                      };
+                      const originalFetch = window.fetch.bind(window);
+                      window.fetch = async (input, init = {}) => {
+                        const url = typeof input === "string" ? input : input.url;
+                        const method = (init.method || (typeof input === "string" ? "GET" : input.method)).toUpperCase();
+                        const path = new URL(url, location.href).pathname;
+                        if (method === "PUT" && path.endsWith("/model-selection")) {
+                          gate.selectionHeld = true;
+                          await new Promise(resolve => { gate.releaseSelection = resolve; });
+                        }
+                        const isDestinationDetail =
+                          method === "GET" &&
+                          path === "/api/chat/sessions/$secondSession" &&
+                          !gate.detailHeldOnce;
+                        if (isDestinationDetail) {
+                          gate.detailHeldOnce = true;
+                          gate.detailHeld = true;
+                          await new Promise(resolve => { gate.releaseDetail = resolve; });
+                        }
+                        const response = await originalFetch(input, init);
+                        if (isDestinationDetail) {
+                          setTimeout(() => { gate.detailProcessed = true; }, 0);
+                        }
+                        return response;
+                      };
+                    }
+                """.trimIndent(),
+            )
+            page.locator("#chat-provider-select").selectOption("ollama")
+            page.waitForFunction("() => window.__selectionUpdateGate.selectionHeld")
+
+            page.evaluate("() => window.history.back()")
+            page.waitForFunction(
+                "() => new URL(location.href).searchParams.get('session') === '$firstSession'",
+            )
+            assertThat(page.locator("#task-goal")).hasValue("Goal from the first session")
+            assertThat(page.locator("#task-clarifications")).hasValue("Clarification from the first session")
+            assertThat(page.locator("#task-constraints")).hasValue("Constraint from the first session")
+            assertThat(page.locator("#task-terms")).hasValue("term-first — definition-first")
+
+            page.evaluate("() => window.history.forward()")
+            page.waitForFunction(
+                "() => new URL(location.href).searchParams.get('session') === '$secondSession'",
+            )
+            page.waitForFunction("() => window.__selectionUpdateGate.detailHeld")
+            val detailResponse = page.waitForResponse("**/api/chat/sessions/$secondSession") {
+                page.evaluate("() => window.__selectionUpdateGate.releaseDetail()")
+            }
+            assertEquals(200, detailResponse.status())
+            page.waitForFunction("() => window.__selectionUpdateGate.detailProcessed")
+            assertThat(page.locator("#task-goal")).hasValue("")
+
+            val selectionResponse = page.waitForResponse("**/api/chat/sessions/$secondSession/model-selection") {
+                page.evaluate("() => window.__selectionUpdateGate.releaseSelection()")
+            }
+            assertEquals(200, selectionResponse.status())
+            page.waitForFunction(
+                "() => document.querySelector('#chat-provider-select').value === 'ollama' && " +
+                    "!document.querySelector('#chat-provider-select').disabled",
+            )
+            assertThat(page.locator("#task-goal")).hasValue("Goal from the second session")
+            assertThat(page.locator("#task-clarifications")).hasValue("Clarification from the second session")
+            assertThat(page.locator("#task-constraints")).hasValue("Constraint from the second session")
+            assertThat(page.locator("#task-terms")).hasValue("term-second — definition-second")
+            assertThat(retry).isEnabled()
+            assertThat(page.locator("#chat-send")).isDisabled()
+            assertThat(page.locator("#chat-question")).isDisabled()
+
+
+            val saveResponse = page.waitForResponse("**/api/chat/sessions/$secondSession/task-state") {
+                page.locator("#task-state-save").click()
+            }
+            assertEquals(200, saveResponse.status())
+            assertThat(page.locator("#chat-error")).containsText("Состояние задачи сохранено.")
+            page.reload()
+            assertThat(page.locator("#task-goal")).hasValue("Goal from the second session")
+            assertThat(page.locator("#task-clarifications")).hasValue("Clarification from the second session")
+            assertThat(page.locator("#task-constraints")).hasValue("Constraint from the second session")
+            assertThat(page.locator("#task-terms")).hasValue("term-second — definition-second")
+            assertThat(page.locator(".chat-bubble.user").last().locator("button")).isEnabled()
+            assertThat(page.locator("#chat-send")).isDisabled()
+            assertThat(page.locator("#chat-question")).isDisabled()
+            assertNotEquals(firstSession, secondSession)
+        }
+    }
+
+    @Test
+    fun legacyChatMigrationPreservesUnknownProvenanceStateAndMemory() {
+        val paths = LocalRagPaths(temporaryDirectory.resolve("legacy-chat-browser-data"))
+        Files.createDirectories(paths.dataDirectory)
+        val sessionId = java.util.UUID.randomUUID().toString()
+        val turnId = java.util.UUID.randomUUID().toString()
+        val userMessageId = java.util.UUID.randomUUID().toString()
+        val assistantMessageId = java.util.UUID.randomUUID().toString()
+        val sessionFactId = java.util.UUID.randomUUID().toString()
+        val sharedFactId = java.util.UUID.randomUUID().toString()
+        val timestamp = "2026-10-01T00:00:00Z"
+        val assistantTimestamp = "2026-10-01T00:00:01Z"
+        val vector = byteArrayOf(0, 0, -128, 63)
+
+        DriverManager.getConnection("jdbc:sqlite:${paths.database.toAbsolutePath()}").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.execute(
+                    """CREATE TABLE chat_sessions(
+                        session_id TEXT PRIMARY KEY,title TEXT NOT NULL,title_generated INTEGER NOT NULL,
+                        created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+                    )""".trimIndent(),
+                )
+                statement.execute(
+                    """CREATE TABLE chat_messages(
+                        message_id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+                        turn_id TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('USER','ASSISTANT')),
+                        content TEXT NOT NULL,document_citations_json TEXT NOT NULL DEFAULT '[]',
+                        memory_references_json TEXT NOT NULL DEFAULT '[]',created_at TEXT NOT NULL,
+                        UNIQUE(session_id,turn_id,role)
+                    )""".trimIndent(),
+                )
+                statement.execute(
+                    """CREATE TABLE chat_task_states(
+                        session_id TEXT PRIMARY KEY REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+                        goal TEXT,clarifications_json TEXT NOT NULL DEFAULT '[]',
+                        constraints_json TEXT NOT NULL DEFAULT '[]',terms_json TEXT NOT NULL DEFAULT '[]',
+                        updated_at TEXT NOT NULL
+                    )""".trimIndent(),
+                )
+                statement.execute(
+                    """CREATE TABLE chat_shared_facts(
+                        memory_id TEXT PRIMARY KEY,content TEXT NOT NULL,embedding BLOB NOT NULL,
+                        embedding_model TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+                    )""".trimIndent(),
+                )
+                statement.execute(
+                    """CREATE TABLE chat_session_facts(
+                        memory_id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+                        content TEXT NOT NULL,embedding BLOB NOT NULL,embedding_model TEXT NOT NULL,
+                        created_at TEXT NOT NULL,UNIQUE(session_id,content)
+                    )""".trimIndent(),
+                )
+                statement.execute("PRAGMA user_version=14")
+            }
+            connection.prepareStatement(
+                "INSERT INTO chat_sessions(session_id,title,title_generated,created_at,updated_at) VALUES (?,?,1,?,?)",
+            ).use { statement ->
+                statement.setString(1, sessionId)
+                statement.setString(2, "Legacy Chat")
+                statement.setString(3, timestamp)
+                statement.setString(4, timestamp)
+                statement.executeUpdate()
+            }
+            connection.prepareStatement(
+                "INSERT INTO chat_messages(message_id,session_id,turn_id,role,content,created_at) VALUES (?,?,?,'USER',?,?)",
+            ).use { statement ->
+                statement.setString(1, userMessageId)
+                statement.setString(2, sessionId)
+                statement.setString(3, turnId)
+                statement.setString(4, "Legacy question")
+                statement.setString(5, timestamp)
+                statement.executeUpdate()
+            }
+            connection.prepareStatement(
+                """INSERT INTO chat_messages(
+                    message_id,session_id,turn_id,role,content,document_citations_json,
+                    memory_references_json,created_at
+                ) VALUES (?,?,?,'ASSISTANT',?,?,?,?)""".trimIndent(),
+            ).use { statement ->
+                statement.setString(1, assistantMessageId)
+                statement.setString(2, sessionId)
+                statement.setString(3, turnId)
+                statement.setString(4, "Legacy answer")
+                statement.setString(
+                    5,
+                    """[{"sourceId":"legacy-source-id","source":"legacy-source.md","section":"Legacy section","chunkId":"legacy-chunk","location":{"pageStart":null,"pageEnd":null,"lineStart":4,"lineEnd":4},"score":0.91,"quote":"Legacy citation excerpt."}]""",
+                )
+                statement.setString(
+                    6,
+                    """[{"scope":"SESSION","id":"$sessionFactId","text":"Legacy session fact"}]""",
+                )
+                statement.setString(7, assistantTimestamp)
+                statement.executeUpdate()
+            }
+            connection.prepareStatement(
+                "INSERT INTO chat_task_states(session_id,goal,clarifications_json,constraints_json,terms_json,updated_at) VALUES (?,?,?,?,?,?)",
+            ).use { statement ->
+                statement.setString(1, sessionId)
+                statement.setString(2, "Legacy task goal")
+                statement.setString(3, """["Legacy clarification"]""")
+                statement.setString(4, """["Legacy constraint"]""")
+                statement.setString(5, """[{"term":"Legacy term","definition":"Legacy definition"}]""")
+                statement.setString(6, timestamp)
+                statement.executeUpdate()
+            }
+            connection.prepareStatement(
+                "INSERT INTO chat_session_facts(memory_id,session_id,content,embedding,embedding_model,created_at) VALUES (?,?,?,?,?,?)",
+            ).use { statement ->
+                statement.setString(1, sessionFactId)
+                statement.setString(2, sessionId)
+                statement.setString(3, "Legacy session fact")
+                statement.setBytes(4, vector)
+                statement.setString(5, "embeddinggemma:300m")
+                statement.setString(6, timestamp)
+                statement.executeUpdate()
+            }
+            connection.prepareStatement(
+                "INSERT INTO chat_shared_facts(memory_id,content,embedding,embedding_model,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+            ).use { statement ->
+                statement.setString(1, sharedFactId)
+                statement.setString(2, "Legacy shared fact")
+                statement.setBytes(3, vector)
+                statement.setString(4, "embeddinggemma:300m")
+                statement.setString(5, timestamp)
+                statement.setString(6, timestamp)
+                statement.executeUpdate()
+            }
+        }
+
+        FakeOllama().use { fake ->
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    page.setDefaultTimeout(30_000.0)
+                    val urlFor: (Int) -> String = { port ->
+                        "http://127.0.0.1:$port/?tab=chat&session=$sessionId"
+                    }
+
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { app ->
+                        page.navigate(urlFor(app.server.port))
+                        assertThat(page.locator("#chat-messages")).containsText("Legacy question")
+                        assertThat(page.locator("#chat-messages")).containsText("Legacy answer")
+                        assertThat(page.locator(".chat-bubble.assistant")).containsText(
+                            "Модель: не записана для исторического ответа",
+                        )
+                        assertThat(page.locator(".chat-bubble.assistant")).containsText(
+                            "Время обработки исторического ответа не записано.",
+                        )
+                        assertThat(page.locator(".chat-bubble.assistant .chat-evidence")).containsText(
+                            "legacy-source.md · Legacy section · строки 4",
+                        )
+                        assertThat(page.locator(".chat-bubble.assistant .chat-evidence")).containsText(
+                            "Legacy citation excerpt.",
+                        )
+                        assertThat(page.locator(".chat-bubble.assistant .chat-evidence")).containsText(
+                            "Legacy session fact",
+                        )
+                        assertThat(page.locator("#task-goal")).hasValue("Legacy task goal")
+                        assertThat(page.locator("#task-clarifications")).hasValue("Legacy clarification")
+                        assertThat(page.locator("#task-constraints")).hasValue("Legacy constraint")
+                        assertThat(page.locator("#task-terms")).hasValue("Legacy term — Legacy definition")
+                        assertThat(page.locator("#shared-memory-list")).containsText("Legacy shared fact")
+                        assertThat(page.locator("#chat-provider-select")).hasValue("fixture")
+                        assertThat(page.locator("#chat-model-select")).hasValue("deepseek-flash")
+
+                        page.locator("#collection-tab").click()
+                        val providerResponse = page.waitForResponse("**/api/models/selection") {
+                            page.locator("#provider-select").selectOption("ollama")
+                        }
+                        assertEquals(200, providerResponse.status())
+                        val modelResponse = page.waitForResponse("**/api/models/selection") {
+                            page.locator("#model-select").selectOption("qwen2.5:7b")
+                        }
+                        assertEquals(200, modelResponse.status())
+                        page.locator("#chat-tab").click()
+                        assertThat(page.locator("#chat-provider-select")).hasValue("fixture")
+                        assertThat(page.locator("#chat-model-select")).hasValue("deepseek-flash")
+
+                        val migrated = Json.parseToJsonElement(
+                            page.request().get(
+                                "http://127.0.0.1:${app.server.port}/api/chat/sessions/$sessionId",
+                            ).text(),
+                        ).jsonObject.getValue("session").jsonObject
+                        assertEquals("fixture", migrated.getValue("modelSelection").jsonObject
+                            .getValue("providerId").jsonPrimitive.content)
+                        val legacyAnswer = Json.parseToJsonElement(
+                            page.request().get(
+                                "http://127.0.0.1:${app.server.port}/api/chat/sessions/$sessionId",
+                            ).text(),
+                        ).jsonObject.getValue("messages").jsonArray.single {
+                            it.jsonObject.getValue("role").jsonPrimitive.content == "ASSISTANT"
+                        }.jsonObject
+                        assertEquals(assistantMessageId, legacyAnswer.getValue("id").jsonPrimitive.content)
+                        assertEquals(JsonNull, legacyAnswer.getValue("modelSelection"))
+                        assertEquals(JsonNull, legacyAnswer.getValue("elapsedMs"))
+                    }
+
+                    ChatStore(paths.database).use { store ->
+                        val persistedFacts = store.memoryFacts(sessionId)
+                        assertEquals(sessionFactId, persistedFacts.single { it.text == "Legacy session fact" }.id)
+                        assertEquals(sharedFactId, store.sharedFacts().single { it.text == "Legacy shared fact" }.id)
+                    }
+
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { restarted ->
+                        page.navigate(urlFor(restarted.server.port))
+                        assertThat(page.locator(".chat-bubble.assistant")).containsText(
+                            "Модель: не записана для исторического ответа",
+                        )
+                        assertThat(page.locator(".chat-bubble.assistant .chat-evidence")).containsText(
+                            "Legacy citation excerpt.",
+                        )
+                        assertThat(page.locator("#task-goal")).hasValue("Legacy task goal")
+                        assertThat(page.locator("#shared-memory-list")).containsText("Legacy shared fact")
+                        assertThat(page.locator("#chat-provider-select")).hasValue("fixture")
+                        assertThat(page.locator("#chat-model-select")).hasValue("deepseek-flash")
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
+
+    @Test
+    fun chatRequiresExplicitSelectionAndReconcilesLostSelectionResponse() {
+        val paths = LocalRagPaths(temporaryDirectory.resolve("chat-browser-app-data"))
+        Files.createDirectories(paths.modelSelection.parent)
+        Files.writeString(paths.modelSelection, """{"providerId":"removed","modelId":"removed-model"}""")
+        withChatBrowser { page, _, fake ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            createChatSession(page)
+            assertThat(page.locator("#chat-provider-select")).hasValue("")
+            assertThat(page.locator("#chat-model-selection-note")).containsText("Выберите провайдера и модель")
+            assertThat(page.locator("#chat-send")).isDisabled()
+
+            page.locator("#collection-tab").click()
+            val collectionRepair = page.waitForResponse("**/api/models/selection") {
+                page.locator("#model-select").selectOption("deepseek-v4-pro")
+            }
+            assertEquals(200, collectionRepair.status())
+            assertThat(page.locator("#model-note")).hasText("")
+            page.locator("#chat-tab").click()
+            assertThat(page.locator("#chat-provider-select")).hasValue("")
+            assertThat(page.locator("#chat-model-selection-note")).containsText("Выберите провайдера и модель")
+            assertThat(page.locator("#chat-send")).isDisabled()
+            page.route("**/api/chat/sessions/*/model-selection") { route ->
+                route.fetch()
+                route.abort()
+            }
+            page.locator("#chat-provider-select").selectOption("ollama")
+            assertThat(page.locator("#chat-error")).containsText("Сохранённый выбор перечитан с сервера.")
+            assertThat(page.locator("#chat-provider-select")).hasValue("ollama")
+            assertThat(page.locator("#chat-model-select")).hasValue("qwen2.5:3b")
+            assertThat(page.locator("#chat-send")).isEnabled()
+
+            val cloudCallsBefore = fake.cloud.chatModels.size
+            val localCallsBefore = fake.localGenerationCalls.get()
+            val response = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-question").fill("What is the greenhouse payment date?")
+                page.locator("#chat-send").click()
+            }
+            assertEquals(200, response.status())
+            assertEquals(cloudCallsBefore, fake.cloud.chatModels.size)
+            assertTrue(fake.localGenerationCalls.get() > localCallsBefore)
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
+        }
+    }
+
+    @Test
     fun chatAutoClassifiesMemoryAndIsolatesSessions() {
         withChatBrowser { page, _, fake ->
             val dialogs = CopyOnWriteArrayList<String>()
@@ -2008,6 +2613,7 @@ class BrowserAcceptanceTest {
     private class FakeOllama : AutoCloseable {
         val cloud = FakeDeepSeek()
         val failReranker = AtomicBoolean(false)
+        val failLocalGeneration = AtomicBoolean(false)
         val rerankRequests = CopyOnWriteArrayList<JsonObject>()
         val localGenerationCalls = AtomicInteger()
         val localModels = CopyOnWriteArrayList<String>()
@@ -2066,6 +2672,10 @@ class BrowserAcceptanceTest {
                     }.toString()
                 } else {
                     localGenerationCalls.incrementAndGet()
+                    if (failLocalGeneration.compareAndSet(true, false)) {
+                        respond(exchange, 503, """{"error":"SYNTHETIC_LOCAL_GENERATION_FAILURE"}""")
+                        return@createContext
+                    }
                     if (request.containsKey("response_format")) {
                         val payload = Json.parseToJsonElement(messages.last()).jsonObject
                         val documentCandidates = payload.getValue("document_candidates").jsonArray

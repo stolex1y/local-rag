@@ -134,10 +134,11 @@
     .chat-form textarea { min-height: 5rem; }
     .chat-state textarea { min-height: 4rem; }
     .chat-state .field { margin-top: .5rem; }
+    .chat-model-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8rem; margin: .8rem 0; }
     .chat-message-error { margin: .5rem 0; }
     .chat-meta { margin-top: .25rem; color: var(--muted); font-size: .82rem; }
     @media (max-width: 720px) {
-      .upload-grid, .form-grid, .answers, .strategy-answers { grid-template-columns: 1fr; }
+      .upload-grid, .form-grid, .chat-model-grid, .answers, .strategy-answers { grid-template-columns: 1fr; }
       .source-row { grid-template-columns: 1fr; }
       .source-row button { width: 100%; }
       .panel-head { align-items: stretch; }
@@ -278,6 +279,17 @@
           </div>
         </div>
         <p id="chat-status" class="notice" role="status" aria-live="polite">Выберите или создайте сессию.</p>
+        <div class="chat-model-grid">
+          <div class="field">
+            <label for="chat-provider-select">Провайдер</label>
+            <select id="chat-provider-select"></select>
+          </div>
+          <div class="field">
+            <label for="chat-model-select">Модель генерации</label>
+            <select id="chat-model-select"></select>
+          </div>
+        </div>
+        <p id="chat-model-selection-note" class="chat-meta" role="status">Выбор провайдера и модели относится к текущей сессии.</p>
         <p id="chat-error" class="error chat-message-error" role="alert" hidden></p>
         <div class="chat-grid">
           <aside class="chat-sidebar" aria-label="Сессии и общая память">
@@ -320,7 +332,7 @@
 
       const $ = (selector, root = document) => root.querySelector(selector);
       const state = { modelsAvailable: false, embeddingAvailable: false, rerankerAvailable: false, modelConfiguration: null, modelSelectionPending: false, activeJob: null, sources: [], benchmark: null, results: [] };
-      const chatState = { sessionId: null, detail: null, sessions: [], sharedFacts: [], pendingTurn: null, busy: false, loadingSession: false, modelSelectionPending: false, sessionLoadGeneration: 0, refreshGeneration: 0, activeTab: "collection" };
+      const chatState = { sessionId: null, detail: null, sessions: [], sharedFacts: [], pendingTurn: null, busy: false, loadingSession: false, modelSelectionPending: false, modelSelectionPendingSessionId: null, modelSelectionUncertain: false, sessionLoadGeneration: 0, refreshGeneration: 0, activeTab: "collection" };
       const MAX_FILE_BYTES = 256 * 1024 * 1024;
       const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
       const MAX_BENCHMARK_FILE_BYTES = 1024 * 1024;
@@ -479,7 +491,135 @@
         const selectionNote = $("#model-selection-note");
         selectionNote.textContent = configuration.warning || "";
         selectionNote.className = configuration.warning ? "notice" : "muted";
+        renderChatModelSelection();
       }
+      function renderChatModelSelection() {
+        const configuration = state.modelConfiguration;
+        const sessionSelection = chatState.detail?.session?.modelSelection;
+        const explicitSelectionRequired = Boolean(
+          chatState.detail?.session?.modelSelectionRequired || (configuration?.warning && !sessionSelection),
+        );
+        const selection = sessionSelection || (!explicitSelectionRequired && configuration
+          ? { providerId: configuration.selectedProviderId, modelId: configuration.selectedModelId }
+          : null);
+        const providerSelect = $("#chat-provider-select");
+        providerSelect.replaceChildren();
+        (configuration?.providers || []).forEach(provider => providerSelect.append(
+          Object.assign(node("option", provider.displayName), { value: provider.id }),
+        ));
+        providerSelect.value = selection?.providerId || "";
+        const provider = configuration?.providers.find(item => item.id === providerSelect.value);
+        const modelSelect = $("#chat-model-select");
+        modelSelect.replaceChildren();
+        (provider?.models || []).forEach(model => {
+          const label = provider.kind === "OLLAMA" && !model.available ? `${model.displayName} · не загружена` : model.displayName;
+          const option = Object.assign(node("option", label), { value: model.id });
+          option.disabled = provider.kind === "OLLAMA" && !model.available;
+          modelSelect.append(option);
+        });
+        modelSelect.value = selection?.modelId || provider?.models.find(model => model.available)?.id || provider?.models[0]?.id || "";
+        const selectedModel = provider?.models.find(model => model.id === modelSelect.value);
+        const note = $("#chat-model-selection-note");
+        if (!chatState.sessionId) {
+          note.textContent = configuration?.warning
+            ? `${configuration.warning} Новая сессия потребует явного выбора модели в Chat.`
+            : "Выберите или создайте сессию; новая сессия унаследует текущий выбор в разделе коллекции.";
+          note.className = configuration?.warning ? "notice chat-meta" : "chat-meta";
+        } else if (chatState.modelSelectionUncertain) {
+          note.textContent = "Сохранённый выбор не подтверждён сервером. Отправка отключена; перечитайте сессию или явно выберите провайдера и модель.";
+          note.className = "notice chat-meta";
+        } else if (explicitSelectionRequired) {
+          note.textContent = configuration?.warning
+            ? `${configuration.warning} Выберите провайдера и модель в этой сессии; автоматического переключения нет.`
+            : "Выберите провайдера и модель в этой сессии; автоматического переключения нет.";
+          note.className = "notice chat-meta";
+        } else if (!selectedModel) {
+          note.textContent = "Сохранённая модель этой сессии недоступна в каталоге. Выберите доступную модель; автоматического переключения нет.";
+          note.className = "notice chat-meta";
+        } else if (!state.embeddingAvailable) {
+          note.textContent = "Для чата нужны локальные embeddings; запустите Ollama и проверьте состояние коллекции.";
+          note.className = "notice chat-meta";
+        } else if (!state.rerankerAvailable) {
+          note.textContent = "Для чата нужен загруженный локальный reranker; другой провайдер автоматически не включается.";
+          note.className = "notice chat-meta";
+        } else if (!selectedModel.available) {
+          note.textContent = provider?.kind === "OLLAMA"
+            ? "Выбранная локальная модель не загружена в Ollama; другой провайдер автоматически не включается."
+            : "У выбранного облачного провайдера не настроен credential.";
+          note.className = "notice chat-meta";
+        } else {
+          note.textContent = "Выбор действует только в этой сессии. Каждый новый ответ сохраняет фактическую модель и время обработки.";
+          note.className = "chat-meta";
+        }
+      }
+
+      async function saveChatModelSelection(providerId, modelId) {
+        if (!chatState.sessionId || chatState.busy || chatState.loadingSession || chatState.modelSelectionPending) return;
+        const sessionId = chatState.sessionId;
+        chatState.modelSelectionPending = true;
+        chatState.modelSelectionPendingSessionId = sessionId;
+        chatState.refreshGeneration += 1;
+        renderChatSessions();
+        renderChatMessages();
+        updateChatControls();
+        try {
+          const detail = await request(
+            `/api/chat/sessions/${encodeURIComponent(sessionId)}/model-selection`,
+            jsonOptions("PUT", { providerId, modelId }),
+          );
+          if (chatState.sessionId === sessionId) {
+            chatState.refreshGeneration += 1;
+            chatState.detail = detail;
+            chatState.pendingTurn = pendingTurnFromDetail(detail);
+            chatState.modelSelectionUncertain = false;
+            renderChatModelSelection();
+            renderChatMessages();
+            renderTaskState();
+            message("chat-error", "");
+          }
+        } catch (error) {
+          if (chatState.sessionId === sessionId) {
+            chatState.refreshGeneration += 1;
+            try {
+              const detail = await request(`/api/chat/sessions/${encodeURIComponent(sessionId)}`);
+              if (chatState.sessionId === sessionId) {
+                chatState.refreshGeneration += 1;
+                chatState.detail = detail;
+                chatState.pendingTurn = pendingTurnFromDetail(detail);
+                chatState.modelSelectionUncertain = false;
+                renderChatModelSelection();
+                renderChatMessages();
+                renderTaskState();
+                message("chat-error", `${error.message} Сохранённый выбор перечитан с сервера.`);
+              }
+            } catch {
+              if (chatState.sessionId === sessionId) {
+                chatState.modelSelectionUncertain = true;
+                renderChatModelSelection();
+                message("chat-error", `${error.message} Не удалось подтвердить сохранённый выбор; отправка заблокирована.`);
+              }
+            }
+          }
+        } finally {
+          chatState.modelSelectionPending = false;
+          chatState.modelSelectionPendingSessionId = null;
+          renderChatSessions();
+          renderChatMessages();
+          updateChatControls();
+        }
+      }
+
+      async function chooseChatProvider() {
+        const provider = state.modelConfiguration?.providers.find(item => item.id === $("#chat-provider-select").value);
+        const model = provider?.models.find(item => item.available) || provider?.models[0];
+        if (!provider || !model) return;
+        await saveChatModelSelection(provider.id, model.id);
+      }
+
+      async function chooseChatModel() {
+        await saveChatModelSelection($("#chat-provider-select").value, $("#chat-model-select").value);
+      }
+
 
       async function saveModelSelection(providerId, modelId) {
         if (state.modelSelectionPending) return;
@@ -551,6 +691,8 @@
         note.className = state.modelsAvailable ? "success" : "notice";
         state.activeJob = status.activeJob && status.activeJob.state !== "completed" && status.activeJob.state !== "failed" ? status.activeJob : null;
         renderJob(state.activeJob);
+        renderChatModelSelection();
+        updateChatControls();
         updateControls();
       }
 
@@ -1105,6 +1247,16 @@
         }
       }
 
+      function pendingTurnFromDetail(detail) {
+        const completedTurns = new Set(detail.messages
+          .filter(item => item.role === "ASSISTANT")
+          .map(item => item.turnId));
+        const pending = [...detail.messages].reverse().find(
+          item => item.role === "USER" && !completedTurns.has(item.turnId),
+        );
+        return pending ? { turnId: pending.turnId, question: pending.content } : null;
+      }
+
       async function refreshChat(sessionId = chatState.sessionId) {
         const generation = ++chatState.refreshGeneration;
         const isCurrent = () => generation === chatState.refreshGeneration && sessionId === chatState.sessionId;
@@ -1125,13 +1277,12 @@
         if (chatState.sessionId) {
           const activeSessionId = chatState.sessionId;
           const detail = await request(`/api/chat/sessions/${encodeURIComponent(activeSessionId)}`);
-          if (!isCurrent()) return;
+          if (!isCurrent() || (
+            chatState.modelSelectionPending && chatState.modelSelectionPendingSessionId === activeSessionId
+          )) return;
           chatState.detail = detail;
-          const completedTurns = new Set(detail.messages
-            .filter(item => item.role === "ASSISTANT")
-            .map(item => item.turnId));
-          const pending = [...detail.messages].reverse().find(item => item.role === "USER" && !completedTurns.has(item.turnId));
-          chatState.pendingTurn = pending ? { turnId: pending.turnId, question: pending.content } : null;
+          chatState.modelSelectionUncertain = false;
+          chatState.pendingTurn = pendingTurnFromDetail(detail);
           $("#chat-status").textContent = `Сессия: ${detail.session.title}`;
         } else {
           chatState.detail = null;
@@ -1143,6 +1294,7 @@
         renderChatMessages();
         renderTaskState();
         updateChatControls();
+        renderChatModelSelection();
       }
 
       function renderChatSessions() {
@@ -1153,7 +1305,7 @@
           const button = node("button", `${session.title} · ${session.messageCount}`);
           button.type = "button";
           button.className = "secondary";
-          button.disabled = chatState.busy || chatState.loadingSession;
+          button.disabled = chatState.busy || chatState.loadingSession || chatState.modelSelectionPending;
           if (session.id === chatState.sessionId) button.setAttribute("aria-current", "page");
           button.addEventListener("click", () => openChatSession(session.id));
           list.append(button);
@@ -1220,11 +1372,18 @@
           if (item.role === "USER" && !completedTurns.has(item.turnId)) {
             const retry = node("button", "Повторить этот ход", "secondary");
             retry.type = "button";
-            retry.disabled = chatState.busy;
+            retry.disabled = chatState.busy || chatState.modelSelectionPending || chatState.modelSelectionUncertain;
             retry.addEventListener("click", () => sendChatTurn(item.turnId, item.content));
             bubble.append(retry);
           }
           if (item.role === "ASSISTANT") {
+            const model = item.modelSelection
+              ? `${item.modelSelection.providerId}/${item.modelSelection.modelId}`
+              : "не записана для исторического ответа";
+            const elapsed = Number.isInteger(item.elapsedMs)
+              ? `Время обработки хода: ${item.elapsedMs} мс (retrieval + генерация).`
+              : "Время обработки исторического ответа не записано.";
+            bubble.append(node("div", `Модель: ${model} · ${elapsed}`, "chat-meta"));
             const evidence = node("section", undefined, "chat-evidence");
             evidence.append(node("h4", "Источники документов"));
             evidence.append(renderChatDocumentSources(item.documentCitations));
@@ -1271,12 +1430,20 @@
       }
 
       function updateChatControls() {
-        const locked = chatState.busy || chatState.loadingSession;
+        const locked = chatState.busy || chatState.loadingSession || chatState.modelSelectionPending;
         const hasSession = Boolean(chatState.sessionId && chatState.detail);
+        const selection = chatState.detail?.session?.modelSelection;
+        const provider = state.modelConfiguration?.providers.find(item => item.id === selection?.providerId);
+        const selectedModel = provider?.models.find(item => item.id === selection?.modelId);
+        const modelAvailable = selectedModel?.available === true;
         const canEditTaskState = hasSession && !locked;
         $("#chat-new-session").disabled = locked;
         $("#chat-delete-session").disabled = !hasSession || locked;
-        $("#chat-send").disabled = !hasSession || locked || Boolean(chatState.pendingTurn);
+        $("#chat-provider-select").disabled = !hasSession || locked || !state.modelConfiguration;
+        $("#chat-model-select").disabled = !hasSession || locked || !state.modelConfiguration;
+        $("#chat-send").disabled = !hasSession || locked || Boolean(chatState.pendingTurn) || !modelAvailable ||
+          chatState.modelSelectionUncertain || Boolean(chatState.detail?.session?.modelSelectionRequired) ||
+          Boolean(state.modelConfiguration?.warning && !selection);
         $("#task-state-save").disabled = !canEditTaskState;
         $("#task-goal").disabled = !canEditTaskState;
         $("#task-clarifications").disabled = !canEditTaskState;
@@ -1343,7 +1510,7 @@
       }
 
       async function sendChatTurn(retryTurnId = null, retryQuestion = null) {
-        if (chatState.busy || chatState.loadingSession) return;
+        if (chatState.busy || chatState.loadingSession || chatState.modelSelectionPending || chatState.modelSelectionUncertain) return;
         if (!chatState.sessionId) {
           await createChatSession();
           if (!chatState.sessionId) return;
@@ -1442,6 +1609,8 @@
       async function initializeTabs() {
         $("#collection-tab").addEventListener("click", () => showTab("collection"));
         $("#chat-tab").addEventListener("click", () => showTab("chat"));
+        $("#chat-provider-select").addEventListener("change", chooseChatProvider);
+        $("#chat-model-select").addEventListener("change", chooseChatModel);
         $("#chat-new-session").addEventListener("click", createChatSession);
         $("#chat-delete-session").addEventListener("click", deleteChatSession);
         $("#chat-form").addEventListener("submit", event => { event.preventDefault(); sendChatTurn(); });

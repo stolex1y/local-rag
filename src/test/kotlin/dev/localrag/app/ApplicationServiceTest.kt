@@ -36,6 +36,7 @@ import dev.localrag.generation.ProviderCatalog
 import dev.localrag.generation.ProviderCredentialSource
 import dev.localrag.generation.ProviderDefinition
 import dev.localrag.generation.ProviderModelDefinition
+import dev.localrag.generation.ProviderKind
 import java.net.InetSocketAddress
 import java.net.URI
 import java.net.http.HttpClient
@@ -95,6 +96,145 @@ class ApplicationServiceTest {
                 assertEquals(200, api.deleteJson("/api/chat/sessions/$sessionId", """{"confirm":true}""").statusCode())
                 assertEquals(404, api.get("/api/chat/sessions/$sessionId").statusCode())
                 assertEquals(404, api.deleteJson("/api/chat/sessions/$sessionId", """{"confirm":true}""").statusCode())
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `chat model choice is session scoped and each answer records model and elapsed time`() {
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                fun createSession(): String = json(api.postJson("/api/chat/sessions", "{}").body())
+                    .jsonObject.getValue("session").jsonObject.getValue("id").jsonPrimitive.content
+                val firstSessionId = createSession()
+                val secondSessionId = createSession()
+
+                val localSelection = api.putJson(
+                    "/api/chat/sessions/$secondSessionId/model-selection",
+                    """{"providerId":"ollama","modelId":"qwen2.5:7b"}""",
+                )
+                assertEquals(200, localSelection.statusCode(), localSelection.body())
+                assertEquals(
+                    "qwen2.5:7b",
+                    json(localSelection.body()).jsonObject.getValue("session").jsonObject
+                        .getValue("modelSelection").jsonObject.getValue("modelId").jsonPrimitive.content,
+                )
+                val globalSelection = api.putJson(
+                    "/api/models/selection",
+                    """{"providerId":"fixture","modelId":"fixture-chat-alt"}""",
+                )
+                assertEquals(200, globalSelection.statusCode(), globalSelection.body())
+
+                val firstTurnId = java.util.UUID.randomUUID().toString()
+                val firstRequest = """{"turnId":"$firstTurnId","question":"First session question","strategy":"STRUCTURAL"}"""
+                val firstResponse = api.postJson("/api/chat/sessions/$firstSessionId/turns", firstRequest)
+                assertEquals(200, firstResponse.statusCode(), firstResponse.body())
+                val firstMessage = json(firstResponse.body()).jsonObject.getValue("message").jsonObject
+                assertEquals("fixture-chat", firstMessage.getValue("modelSelection").jsonObject
+                    .getValue("modelId").jsonPrimitive.content)
+                assertTrue(firstMessage.getValue("elapsedMs").jsonPrimitive.content.toLong() >= 0)
+                val retry = api.postJson("/api/chat/sessions/$firstSessionId/turns", firstRequest)
+                val retryMessage = json(retry.body()).jsonObject.getValue("message").jsonObject
+                assertEquals(firstMessage.getValue("id"), retryMessage.getValue("id"))
+                assertEquals(firstMessage.getValue("elapsedMs"), retryMessage.getValue("elapsedMs"))
+
+                val secondTurnId = java.util.UUID.randomUUID().toString()
+                val secondResponse = api.postJson(
+                    "/api/chat/sessions/$secondSessionId/turns",
+                    """{"turnId":"$secondTurnId","question":"Second session question","strategy":"STRUCTURAL"}""",
+                )
+                assertEquals(200, secondResponse.statusCode(), secondResponse.body())
+                val secondMessage = json(secondResponse.body()).jsonObject.getValue("message").jsonObject
+                val secondModel = secondMessage.getValue("modelSelection").jsonObject
+                assertEquals("ollama", secondModel.getValue("providerId").jsonPrimitive.content)
+                assertEquals("qwen2.5:7b", secondModel.getValue("modelId").jsonPrimitive.content)
+                assertEquals(
+                    listOf(ModelSelection("fixture", "fixture-chat"), ModelSelection("ollama", "qwen2.5:7b")),
+                    fixture.chatTurnSelections,
+                )
+                assertEquals(
+                    "fixture-chat",
+                    json(api.get("/api/chat/sessions/$firstSessionId").body()).jsonObject
+                        .getValue("session").jsonObject.getValue("modelSelection").jsonObject
+                        .getValue("modelId").jsonPrimitive.content,
+                )
+                assertEquals(
+                    "qwen2.5:7b",
+                    json(api.get("/api/chat/sessions/$secondSessionId").body()).jsonObject
+                        .getValue("session").jsonObject.getValue("modelSelection").jsonObject
+                        .getValue("modelId").jsonPrimitive.content,
+                )
+                assertEquals(
+                    400,
+                    api.putJson(
+                        "/api/chat/sessions/$firstSessionId/model-selection",
+                        """{"providerId":"missing","modelId":"unknown"}""",
+                    ).statusCode(),
+                )
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `invalid persisted Collection selection does not become an implicit Chat provider`() {
+        Files.writeString(
+            temporaryDirectory.resolve("model-selection.json"),
+            """{"providerId":"removed","modelId":"removed-model"}""",
+        )
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                val configuration = json(api.get("/api/models").body()).jsonObject
+                assertTrue(configuration.getValue("warning").jsonPrimitive.content.isNotBlank())
+
+                val created = json(api.postJson("/api/chat/sessions", "{}").body()).jsonObject
+                    .getValue("session").jsonObject
+                val sessionId = created.getValue("id").jsonPrimitive.content
+                assertEquals(kotlinx.serialization.json.JsonNull, created.getValue("modelSelection"))
+                assertTrue(created.getValue("modelSelectionRequired").jsonPrimitive.content.toBoolean())
+
+                val repairedCollectionSelection = api.putJson(
+                    "/api/models/selection",
+                    """{"providerId":"fixture","modelId":"fixture-chat"}""",
+                )
+                assertEquals(200, repairedCollectionSelection.statusCode())
+
+                val unresolved = json(api.get("/api/chat/sessions/$sessionId").body()).jsonObject
+                    .getValue("session").jsonObject
+                assertEquals(kotlinx.serialization.json.JsonNull, unresolved.getValue("modelSelection"))
+                assertTrue(unresolved.getValue("modelSelectionRequired").jsonPrimitive.content.toBoolean())
+
+                val turnId = java.util.UUID.randomUUID().toString()
+                val rejected = api.postJson(
+                    "/api/chat/sessions/$sessionId/turns",
+                    """{"turnId":"$turnId","question":"Do not route before selection","strategy":"STRUCTURAL"}""",
+                )
+                assertEquals(409, rejected.statusCode())
+                assertTrue(fixture.chatTurnSelections.isEmpty())
+
+                val selected = api.putJson(
+                    "/api/chat/sessions/$sessionId/model-selection",
+                    """{"providerId":"ollama","modelId":"qwen2.5:7b"}""",
+                )
+                assertEquals(200, selected.statusCode(), selected.body())
+                assertEquals(
+                    "qwen2.5:7b",
+                    json(selected.body()).jsonObject.getValue("session").jsonObject
+                        .getValue("modelSelection").jsonObject.getValue("modelId").jsonPrimitive.content,
+                )
+                assertFalse(
+                    json(selected.body()).jsonObject.getValue("session").jsonObject
+                        .getValue("modelSelectionRequired").jsonPrimitive.content.toBoolean(),
+                )
             } finally {
                 fixture.close()
             }
@@ -923,6 +1063,18 @@ class ApplicationServiceTest {
                         ProviderModelDefinition("fixture-chat-alt", "Fixture chat alternate"),
                     ),
                 ),
+                ProviderDefinition(
+                    "ollama",
+                    "Local / Ollama",
+                    ollama.uri.toString(),
+                    "/v1/chat/completions",
+                    null,
+                    listOf(
+                        ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
+                        ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
+                    ),
+                    ProviderKind.OLLAMA,
+                ),
             ),
             selection,
         )
@@ -933,6 +1085,7 @@ class ApplicationServiceTest {
         )
         private val chat = FixtureChat(generationCalls)
         val generationSelections: List<ModelSelection> get() = chat.selections.toList()
+        val chatTurnSelections: List<ModelSelection> get() = chat.turnSelections.toList()
         fun holdNextGeneration() = chat.holdNext()
         private val rag = RagService(index, embeddings, chat, FixtureReranker(rerankCalls))
         private val catalog = SourceCatalog(sourcesDirectory, index, store::deleteSourceReferences)
@@ -1064,6 +1217,7 @@ class ApplicationServiceTest {
 
     private class FixtureChat(private val calls: AtomicInteger) : ChatPort, dev.localrag.chat.ChatTurnGenerator {
         val selections = CopyOnWriteArrayList<ModelSelection>()
+        val turnSelections = CopyOnWriteArrayList<ModelSelection>()
         private val nextGate = AtomicReference<Gate?>()
 
         fun holdNext() = Gate().also(nextGate::set)
@@ -1083,6 +1237,7 @@ class ApplicationServiceTest {
             selection: ModelSelection,
             request: dev.localrag.chat.ChatTurnRequest,
         ): dev.localrag.chat.ChatTurnCompletion {
+            turnSelections += selection
             val hasEvidence = request.documentCandidates.isNotEmpty() || request.sessionFacts.isNotEmpty() || request.sharedFacts.isNotEmpty()
             return dev.localrag.chat.ChatTurnCompletion(
                 if (hasEvidence) "Synthetic fixture answer." else ChatService.ABSTENTION,
@@ -1109,7 +1264,7 @@ class ApplicationServiceTest {
             this.executor = this@FakeOllama.executor
             createContext("/api/tags") { exchange ->
                 waitForGate(tagsGate)
-                val names = listOf("embeddinggemma:300m")
+                val names = listOf("embeddinggemma:300m", "qwen2.5:3b", "qwen2.5:7b")
                 respond(exchange, buildJsonObject {
                     put("models", JsonArray(names.map { name -> buildJsonObject { put("name", JsonPrimitive(name)) } }))
                 }.toString())
@@ -1139,7 +1294,9 @@ class ApplicationServiceTest {
             server.start()
         }
 
-        fun client() = OllamaApi(URI("http://127.0.0.1:${server.address.port}"))
+        val uri: URI get() = URI("http://127.0.0.1:${server.address.port}")
+
+        fun client() = OllamaApi(uri)
 
         fun holdNextTags() = Gate().also(tagsGate::set)
 

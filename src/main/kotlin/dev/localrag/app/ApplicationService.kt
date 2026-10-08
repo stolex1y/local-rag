@@ -133,10 +133,43 @@ class ApplicationService(
 
     fun sources(): List<SourceRecord> = catalog.sources()
     fun chatSessions(): List<ChatSession> = chatStore.sessions()
-    fun createChatSession(): ChatSessionDetail = chatStore.createSession()
 
-    fun chatSession(sessionId: String): ChatSessionDetail =
-        chatStore.sessionDetail(sessionId) ?: throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
+    fun createChatSession(): ChatSessionDetail {
+        val configuration = modelConfiguration.options()
+        val selectionRequired = configuration.warning != null
+        val selection = if (selectionRequired) null else {
+            ModelSelection(configuration.selectedProviderId, configuration.selectedModelId)
+        }
+        return chatStore.createSession(selection, selectionRequired)
+    }
+
+    fun chatSession(sessionId: String): ChatSessionDetail {
+        val detail = chatStore.sessionDetail(sessionId)
+            ?: throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
+        if (detail.session.modelSelection != null || detail.session.modelSelectionRequired) return detail
+        val configuration = modelConfiguration.options()
+        if (configuration.warning != null) return detail
+        val selection = ModelSelection(configuration.selectedProviderId, configuration.selectedModelId)
+        return try {
+            chatStore.initializeModelSelection(sessionId, selection)
+        } catch (_: ChatStore.ChatSessionNotFoundException) {
+            throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
+        }
+    }
+
+    fun updateChatModelSelection(sessionId: String, selection: ModelSelection): ChatSessionDetail {
+        chatSession(sessionId)
+        try {
+            modelConfiguration.catalog.resolve(selection)
+        } catch (error: IllegalArgumentException) {
+            throw ApiException(400, "invalid_model_selection", error.message ?: "Выберите модель из каталога.")
+        }
+        return try {
+            chatStore.updateModelSelection(sessionId, selection)
+        } catch (_: ChatStore.ChatSessionNotFoundException) {
+            throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
+        }
+    }
 
     fun deleteChatSession(sessionId: String, confirmed: Boolean) {
         if (!confirmed) throw ApiException(400, "confirmation_required", "Удаление сессии требует отдельного подтверждения.")
@@ -150,14 +183,15 @@ class ApplicationService(
         strategy: ChunkStrategy,
         topK: Int?,
     ): ChatTurnResponse {
-        chatSession(sessionId)
-        val configuration = modelConfiguration.options()
+        val session = chatSession(sessionId).session
+        val selection = session.modelSelection
+            ?: throw ApiException(409, "chat_model_selection_required", "Выберите провайдера и модель для этой сессии.")
         return chatService.turn(
             sessionId,
             turnId,
             question,
             strategy,
-            ModelSelection(configuration.selectedProviderId, configuration.selectedModelId),
+            selection,
             topK,
         )
     }

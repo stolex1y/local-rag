@@ -1,14 +1,15 @@
 package dev.localrag.chat
 
+import dev.localrag.domain.ModelSelection
 import dev.localrag.domain.SourceCitation
 import dev.localrag.source.PrivateLocalStorage
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import java.nio.file.Path
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.file.Path
 import java.sql.Connection
 import java.sql.DriverManager
 import java.time.Instant
@@ -21,6 +22,8 @@ data class ChatSession(
     val createdAt: String,
     val updatedAt: String,
     val messageCount: Int,
+    val modelSelection: ModelSelection? = null,
+    val modelSelectionRequired: Boolean = false,
 )
 
 @Serializable
@@ -109,7 +112,7 @@ data class ChatTurnCompletion(
 )
 
 interface ChatTurnGenerator {
-    fun completeTurn(selection: dev.localrag.domain.ModelSelection, request: ChatTurnRequest): ChatTurnCompletion
+    fun completeTurn(selection: ModelSelection, request: ChatTurnRequest): ChatTurnCompletion
 }
 
 @Serializable
@@ -121,6 +124,8 @@ data class ChatMessage(
     val documentCitations: List<SourceCitation> = emptyList(),
     val memoryReferences: List<ChatMemoryReference> = emptyList(),
     val createdAt: String,
+    val modelSelection: ModelSelection? = null,
+    val elapsedMs: Long? = null,
 )
 
 @Serializable
@@ -149,7 +154,10 @@ class ChatStore(databasePath: Path) : AutoCloseable {
                         title TEXT NOT NULL,
                         title_generated INTEGER NOT NULL DEFAULT 1,
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        provider_id TEXT,
+                        model_id TEXT,
+                        selection_required INTEGER NOT NULL DEFAULT 0
                     )""".trimIndent(),
                 )
                 val hasTitleGenerated = statement.executeQuery("PRAGMA table_info(chat_sessions)").use { rows ->
@@ -170,9 +178,18 @@ class ChatStore(databasePath: Path) : AutoCloseable {
                         document_citations_json TEXT NOT NULL DEFAULT '[]',
                         memory_references_json TEXT NOT NULL DEFAULT '[]',
                         created_at TEXT NOT NULL,
+                        provider_id TEXT,
+                        model_id TEXT,
+                        elapsed_ms INTEGER,
                         UNIQUE(session_id,turn_id,role)
                     )""".trimIndent(),
                 )
+                ensureColumn("chat_sessions", "provider_id", "TEXT")
+                ensureColumn("chat_sessions", "model_id", "TEXT")
+                ensureColumn("chat_sessions", "selection_required", "INTEGER NOT NULL DEFAULT 0")
+                ensureColumn("chat_messages", "provider_id", "TEXT")
+                ensureColumn("chat_messages", "model_id", "TEXT")
+                ensureColumn("chat_messages", "elapsed_ms", "INTEGER")
                 statement.execute("CREATE INDEX IF NOT EXISTS chat_messages_session_idx ON chat_messages(session_id,created_at,message_id)")
                 statement.execute(
                     """CREATE TABLE IF NOT EXISTS chat_task_states (
@@ -217,16 +234,21 @@ class ChatStore(databasePath: Path) : AutoCloseable {
     }
 
     @Synchronized
-    fun createSession(): ChatSessionDetail = transaction {
+    fun createSession(modelSelection: ModelSelection? = null, modelSelectionRequired: Boolean = false): ChatSessionDetail = transaction {
         val now = Instant.now().toString()
         val sessionId = UUID.randomUUID().toString()
         connection.prepareStatement(
-            "INSERT INTO chat_sessions(session_id,title,title_generated,created_at,updated_at) VALUES (?,?,0,?,?)",
+            """INSERT INTO chat_sessions(
+                session_id,title,title_generated,created_at,updated_at,provider_id,model_id,selection_required
+            ) VALUES (?,?,0,?,?,?,?,?)""".trimIndent(),
         ).use { statement ->
             statement.setString(1, sessionId)
             statement.setString(2, NEW_SESSION_TITLE)
             statement.setString(3, now)
             statement.setString(4, now)
+            statement.setString(5, modelSelection?.providerId)
+            statement.setString(6, modelSelection?.modelId)
+            statement.setInt(7, if (modelSelectionRequired) 1 else 0)
             statement.executeUpdate()
         }
         connection.prepareStatement(
@@ -235,6 +257,35 @@ class ChatStore(databasePath: Path) : AutoCloseable {
             statement.setString(1, sessionId)
             statement.setString(2, now)
             statement.executeUpdate()
+        }
+        requireNotNull(sessionDetail(sessionId))
+    }
+
+    @Synchronized
+    fun initializeModelSelection(sessionId: String, modelSelection: ModelSelection): ChatSessionDetail = transaction {
+        requireUuid(sessionId, "session ID")
+        connection.prepareStatement(
+            "UPDATE chat_sessions SET provider_id=?,model_id=?,selection_required=0 WHERE session_id=? AND provider_id IS NULL AND model_id IS NULL AND selection_required=0",
+        ).use { statement ->
+            statement.setString(1, modelSelection.providerId)
+            statement.setString(2, modelSelection.modelId)
+            statement.setString(3, sessionId)
+            statement.executeUpdate()
+        }
+        if (!sessionExists(sessionId)) throw ChatSessionNotFoundException()
+        requireNotNull(sessionDetail(sessionId))
+    }
+
+    @Synchronized
+    fun updateModelSelection(sessionId: String, modelSelection: ModelSelection): ChatSessionDetail = transaction {
+        requireUuid(sessionId, "session ID")
+        connection.prepareStatement(
+            "UPDATE chat_sessions SET provider_id=?,model_id=?,selection_required=0 WHERE session_id=?",
+        ).use { statement ->
+            statement.setString(1, modelSelection.providerId)
+            statement.setString(2, modelSelection.modelId)
+            statement.setString(3, sessionId)
+            if (statement.executeUpdate() != 1) throw ChatSessionNotFoundException()
         }
         requireNotNull(sessionDetail(sessionId))
     }
@@ -262,7 +313,7 @@ class ChatStore(databasePath: Path) : AutoCloseable {
 
     @Synchronized
     fun sessions(): List<ChatSession> = connection.prepareStatement(
-        """SELECT s.session_id,s.title,s.created_at,s.updated_at,COUNT(m.message_id)
+        """SELECT s.session_id,s.title,s.created_at,s.updated_at,COUNT(m.message_id),s.provider_id,s.model_id,s.selection_required
             FROM chat_sessions s LEFT JOIN chat_messages m ON m.session_id=s.session_id
             GROUP BY s.session_id ORDER BY s.updated_at DESC,s.session_id""".trimIndent(),
     ).use { statement ->
@@ -275,6 +326,8 @@ class ChatStore(databasePath: Path) : AutoCloseable {
                         createdAt = rows.getString(3),
                         updatedAt = rows.getString(4),
                         messageCount = rows.getInt(5),
+                        modelSelection = readModelSelection(rows.getString(6), rows.getString(7)),
+                        modelSelectionRequired = rows.getInt(8) != 0,
                     ),
                 )
             }
@@ -285,7 +338,7 @@ class ChatStore(databasePath: Path) : AutoCloseable {
     fun sessionDetail(sessionId: String): ChatSessionDetail? {
         requireUuid(sessionId, "session ID")
         val session = connection.prepareStatement(
-            """SELECT s.session_id,s.title,s.created_at,s.updated_at,COUNT(m.message_id)
+            """SELECT s.session_id,s.title,s.created_at,s.updated_at,COUNT(m.message_id),s.provider_id,s.model_id,s.selection_required
                 FROM chat_sessions s LEFT JOIN chat_messages m ON m.session_id=s.session_id
                 WHERE s.session_id=? GROUP BY s.session_id""".trimIndent(),
         ).use { statement ->
@@ -297,12 +350,14 @@ class ChatStore(databasePath: Path) : AutoCloseable {
                     createdAt = rows.getString(3),
                     updatedAt = rows.getString(4),
                     messageCount = rows.getInt(5),
+                    modelSelection = readModelSelection(rows.getString(6), rows.getString(7)),
+                    modelSelectionRequired = rows.getInt(8) != 0,
                 )
             }
         } ?: return null
 
         val messages = connection.prepareStatement(
-            """SELECT message_id,turn_id,role,content,document_citations_json,memory_references_json,created_at
+            """SELECT message_id,turn_id,role,content,document_citations_json,memory_references_json,created_at,provider_id,model_id,elapsed_ms
                 FROM chat_messages WHERE session_id=? ORDER BY created_at,message_id""".trimIndent(),
         ).use { statement ->
             statement.setString(1, sessionId)
@@ -317,6 +372,8 @@ class ChatStore(databasePath: Path) : AutoCloseable {
                             documentCitations = json.decodeFromString(rows.getString(5)),
                             memoryReferences = json.decodeFromString(rows.getString(6)),
                             createdAt = rows.getString(7),
+                            modelSelection = readModelSelection(rows.getString(8), rows.getString(9)),
+                            elapsedMs = rows.getLong(10).let { if (rows.wasNull()) null else it },
                         ),
                     )
                 }
@@ -384,7 +441,7 @@ class ChatStore(databasePath: Path) : AutoCloseable {
         requireUuid(sessionId, "session ID")
         requireUuid(turnId, "turn ID")
         return connection.prepareStatement(
-            """SELECT message_id,content,document_citations_json,memory_references_json,created_at
+            """SELECT message_id,content,document_citations_json,memory_references_json,created_at,provider_id,model_id,elapsed_ms
                 FROM chat_messages WHERE session_id=? AND turn_id=? AND role='ASSISTANT'""".trimIndent(),
         ).use { statement ->
             statement.setString(1, sessionId)
@@ -398,6 +455,8 @@ class ChatStore(databasePath: Path) : AutoCloseable {
                     documentCitations = json.decodeFromString(rows.getString(3)),
                     memoryReferences = json.decodeFromString(rows.getString(4)),
                     createdAt = rows.getString(5),
+                    modelSelection = readModelSelection(rows.getString(6), rows.getString(7)),
+                    elapsedMs = rows.getLong(8).let { if (rows.wasNull()) null else it },
                 )
             }
         }
@@ -461,12 +520,17 @@ class ChatStore(databasePath: Path) : AutoCloseable {
         sessionFacts: List<ChatMemoryFactDraft> = emptyList(),
         sharedFacts: List<ChatMemoryFactDraft> = emptyList(),
         sessionTitle: String? = null,
+        modelSelection: ModelSelection? = null,
+        elapsedMs: Long? = null,
     ): ChatMessage = transaction {
         requireUuid(sessionId, "session ID")
         requireUuid(turnId, "turn ID")
         require(answer.isNotBlank() && answer.length <= MAX_MESSAGE_LENGTH)
+        require((modelSelection == null) == (elapsedMs == null) && (elapsedMs == null || elapsedMs >= 0)) {
+            "Для ответа нужны согласованные модель и время обработки."
+        }
         val existing = connection.prepareStatement(
-            """SELECT message_id,content,document_citations_json,memory_references_json,created_at
+            """SELECT message_id,content,document_citations_json,memory_references_json,created_at,provider_id,model_id,elapsed_ms
                 FROM chat_messages WHERE session_id=? AND turn_id=? AND role='ASSISTANT'""".trimIndent(),
         ).use { statement ->
             statement.setString(1, sessionId)
@@ -480,6 +544,8 @@ class ChatStore(databasePath: Path) : AutoCloseable {
                     documentCitations = json.decodeFromString(rows.getString(3)),
                     memoryReferences = json.decodeFromString(rows.getString(4)),
                     createdAt = rows.getString(5),
+                    modelSelection = readModelSelection(rows.getString(6), rows.getString(7)),
+                    elapsedMs = rows.getLong(8).let { if (rows.wasNull()) null else it },
                 )
             }
         }
@@ -497,8 +563,9 @@ class ChatStore(databasePath: Path) : AutoCloseable {
         val messageId = UUID.randomUUID().toString()
         connection.prepareStatement(
             """INSERT INTO chat_messages(
-                message_id,session_id,turn_id,role,content,document_citations_json,memory_references_json,created_at
-            ) VALUES (?,?,?,'ASSISTANT',?,?,?,?)""".trimIndent(),
+                message_id,session_id,turn_id,role,content,document_citations_json,memory_references_json,created_at,
+                provider_id,model_id,elapsed_ms
+            ) VALUES (?,?,?,'ASSISTANT',?,?,?,?,?,?,?)""".trimIndent(),
         ).use { statement ->
             statement.setString(1, messageId)
             statement.setString(2, sessionId)
@@ -507,6 +574,9 @@ class ChatStore(databasePath: Path) : AutoCloseable {
             statement.setString(5, json.encodeToString(citations))
             statement.setString(6, json.encodeToString(memoryReferences))
             statement.setString(7, now)
+            statement.setString(8, modelSelection?.providerId)
+            statement.setString(9, modelSelection?.modelId)
+            if (elapsedMs == null) statement.setNull(10, java.sql.Types.INTEGER) else statement.setLong(10, elapsedMs)
             statement.executeUpdate()
         }
         connection.prepareStatement(
@@ -547,7 +617,17 @@ class ChatStore(databasePath: Path) : AutoCloseable {
             statement.setString(2, sessionId)
             statement.executeUpdate()
         }
-        ChatMessage(messageId, turnId, ChatMessageRole.ASSISTANT, answer, citations, memoryReferences, now)
+        ChatMessage(
+            messageId,
+            turnId,
+            ChatMessageRole.ASSISTANT,
+            answer,
+            citations,
+            memoryReferences,
+            now,
+            modelSelection,
+            elapsedMs,
+        )
     }
 
     @Synchronized
@@ -752,6 +832,27 @@ class ChatStore(databasePath: Path) : AutoCloseable {
             while (buffer.hasRemaining()) add(buffer.float)
         }
     }
+    private fun ensureColumn(table: String, column: String, declaration: String) {
+        val exists = connection.createStatement().use { statement ->
+            statement.executeQuery("PRAGMA table_info($table)").use { rows ->
+                var found = false
+                while (rows.next()) if (rows.getString("name") == column) found = true
+                found
+            }
+        }
+        if (!exists) {
+            connection.createStatement().use { statement ->
+                statement.execute("ALTER TABLE $table ADD COLUMN $column $declaration")
+            }
+        }
+    }
+
+    private fun readModelSelection(providerId: String?, modelId: String?): ModelSelection? = when {
+        providerId == null && modelId == null -> null
+        providerId != null && modelId != null -> ModelSelection(providerId, modelId)
+        else -> error("В хранилище чата сохранена неполная модель.")
+    }
+
 
     override fun close() = connection.close()
 
@@ -780,7 +881,7 @@ class ChatStore(databasePath: Path) : AutoCloseable {
     class ChatSessionNotFoundException : RuntimeException("Сессия чата не найдена.")
 
     companion object {
-        const val CHAT_SCHEMA_VERSION = 14
+        const val CHAT_SCHEMA_VERSION = 16
         const val MAX_MESSAGE_LENGTH = 4_000
         const val MAX_HISTORY_MESSAGES = 8
         const val MAX_MEMORY_FACT_LENGTH = 1_100

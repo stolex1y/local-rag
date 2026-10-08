@@ -27,6 +27,7 @@ class ChatService(
         selection: ModelSelection,
         topK: Int? = null,
     ): ChatTurnResponse {
+        val startedAt = System.nanoTime()
         require(question.isNotBlank() && question.length <= ChatStore.MAX_MESSAGE_LENGTH) {
             "Вопрос должен содержать от 1 до ${ChatStore.MAX_MESSAGE_LENGTH} символов."
         }
@@ -37,7 +38,7 @@ class ChatService(
         store.saveUserMessage(sessionId, turnId, question)
         val completed = store.assistantMessage(sessionId, turnId)
         if (completed != null) return ChatTurnResponse(completed, store.taskState(sessionId))
-        val retrieved = rag.retrieveForChat(question, strategy, topK, selection).enhanced
+        val retrieved = rag.retrieveForChat(question, strategy, topK).enhanced
         val existingFacts = store.memoryFacts(sessionId)
         val queryEmbedding = if (existingFacts.isEmpty()) emptyList() else embedOne(question)
         val selectedSessionFacts = selectFacts(
@@ -133,6 +134,8 @@ class ChatService(
             sessionFacts = sessionDrafts,
             sharedFacts = sharedDrafts,
             sessionTitle = title,
+            modelSelection = selection,
+            elapsedMs = (System.nanoTime() - startedAt) / 1_000_000,
         )
         return ChatTurnResponse(message, store.taskState(sessionId))
     }

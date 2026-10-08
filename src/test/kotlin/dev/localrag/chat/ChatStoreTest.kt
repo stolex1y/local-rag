@@ -52,6 +52,146 @@ class ChatStoreTest {
     }
 
     @Test
+    fun `session choice and answer provenance survive updates and reopening`() {
+        val database = temporaryDirectory.resolve("chat-model-provenance.sqlite")
+        val firstSelection = ModelSelection("ollama", "qwen2.5:3b")
+        val secondSelection = ModelSelection("deepseek", "deepseek-flash")
+        val updatedSelection = ModelSelection("ollama", "qwen2.5:7b")
+        val firstSessionId: String
+        val secondSessionId: String
+        val turnId = UUID.randomUUID().toString()
+
+        ChatStore(database).use { store ->
+            firstSessionId = store.createSession(firstSelection).session.id
+            secondSessionId = store.createSession(secondSelection).session.id
+            store.saveUserMessage(firstSessionId, turnId, "A synthetic question")
+            val assistant = store.completeTurn(
+                sessionId = firstSessionId,
+                turnId = turnId,
+                answer = "A synthetic answer",
+                citations = emptyList(),
+                memoryReferences = emptyList(),
+                taskState = ChatTaskState(),
+                modelSelection = firstSelection,
+                elapsedMs = 321,
+            )
+            assertEquals(firstSelection, assistant.modelSelection)
+            assertEquals(321L, assistant.elapsedMs)
+            store.updateModelSelection(firstSessionId, updatedSelection)
+
+            val detail = requireNotNull(store.sessionDetail(firstSessionId))
+            assertEquals(updatedSelection, detail.session.modelSelection)
+            val user = detail.messages.single { it.role == ChatMessageRole.USER }
+            val savedAnswer = detail.messages.single { it.role == ChatMessageRole.ASSISTANT }
+            assertNull(user.modelSelection)
+            assertNull(user.elapsedMs)
+            assertEquals(firstSelection, savedAnswer.modelSelection)
+            assertEquals(321L, savedAnswer.elapsedMs)
+            assertEquals(secondSelection, store.sessionDetail(secondSessionId)?.session?.modelSelection)
+        }
+
+        ChatStore(database).use { store ->
+            val first = requireNotNull(store.sessionDetail(firstSessionId))
+            assertEquals(updatedSelection, first.session.modelSelection)
+            val answer = first.messages.single { it.role == ChatMessageRole.ASSISTANT }
+            assertEquals(firstSelection, answer.modelSelection)
+            assertEquals(321L, answer.elapsedMs)
+            assertEquals(secondSelection, store.sessionDetail(secondSessionId)?.session?.modelSelection)
+        }
+    }
+
+    @Test
+    fun `explicit model selection requirement persists until a per-session choice`() {
+        val database = temporaryDirectory.resolve("explicit-selection-required.sqlite")
+        val inherited = ModelSelection("fixture", "deepseek-flash")
+        val selected = ModelSelection("ollama", "qwen2.5:7b")
+        val sessionId: String
+
+        ChatStore(database).use { store ->
+            val created = store.createSession(modelSelectionRequired = true)
+            sessionId = created.session.id
+            assertNull(created.session.modelSelection)
+            assertTrue(created.session.modelSelectionRequired)
+
+            val legacyInitialization = store.initializeModelSelection(sessionId, inherited)
+            assertNull(legacyInitialization.session.modelSelection)
+            assertTrue(legacyInitialization.session.modelSelectionRequired)
+        }
+
+        ChatStore(database).use { store ->
+            val persisted = requireNotNull(store.sessionDetail(sessionId)).session
+            assertNull(persisted.modelSelection)
+            assertTrue(persisted.modelSelectionRequired)
+
+            val updated = store.updateModelSelection(sessionId, selected).session
+            assertEquals(selected, updated.modelSelection)
+            assertFalse(updated.modelSelectionRequired)
+        }
+
+        ChatStore(database).use { store ->
+            val restored = requireNotNull(store.sessionDetail(sessionId)).session
+            assertEquals(selected, restored.modelSelection)
+            assertFalse(restored.modelSelectionRequired)
+        }
+    }
+
+    @Test
+    fun `legacy chat rows retain unknown model and elapsed time after schema migration`() {
+        val database = temporaryDirectory.resolve("legacy-chat-metadata.sqlite")
+        val sessionId = UUID.randomUUID().toString()
+        val turnId = UUID.randomUUID().toString()
+        DriverManager.getConnection("jdbc:sqlite:${database.toAbsolutePath()}").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.execute(
+                    """CREATE TABLE chat_sessions(
+                        session_id TEXT PRIMARY KEY,title TEXT NOT NULL,title_generated INTEGER NOT NULL,
+                        created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+                    )""".trimIndent(),
+                )
+                statement.execute(
+                    """CREATE TABLE chat_messages(
+                        message_id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+                        turn_id TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('USER','ASSISTANT')),
+                        content TEXT NOT NULL,document_citations_json TEXT NOT NULL DEFAULT '[]',
+                        memory_references_json TEXT NOT NULL DEFAULT '[]',created_at TEXT NOT NULL,
+                        UNIQUE(session_id,turn_id,role)
+                    )""".trimIndent(),
+                )
+                statement.execute("PRAGMA user_version=14")
+            }
+            connection.prepareStatement(
+                "INSERT INTO chat_sessions(session_id,title,title_generated,created_at,updated_at) VALUES (?,?,1,?,?)",
+            ).use { statement ->
+                statement.setString(1, sessionId)
+                statement.setString(2, "Legacy session")
+                statement.setString(3, "2026-10-01T00:00:00Z")
+                statement.setString(4, "2026-10-01T00:00:00Z")
+                statement.executeUpdate()
+            }
+            connection.prepareStatement(
+                "INSERT INTO chat_messages(message_id,session_id,turn_id,role,content,created_at) VALUES (?,?,?,'ASSISTANT',?,?)",
+            ).use { statement ->
+                statement.setString(1, UUID.randomUUID().toString())
+                statement.setString(2, sessionId)
+                statement.setString(3, turnId)
+                statement.setString(4, "Legacy answer")
+                statement.setString(5, "2026-10-01T00:00:00Z")
+                statement.executeUpdate()
+            }
+        }
+
+        ChatStore(database).use { store ->
+            val detail = requireNotNull(store.sessionDetail(sessionId))
+            assertFalse(detail.session.modelSelectionRequired)
+            assertNull(detail.session.modelSelection)
+            assertNull(detail.messages.single().modelSelection)
+            assertNull(detail.messages.single().elapsedMs)
+            assertEquals(ChatStore.CHAT_SCHEMA_VERSION, userVersion(database))
+        }
+    }
+
+    @Test
     fun `chat schema migration preserves existing source chunks benchmark review and selection`() {
         val database = temporaryDirectory.resolve("existing.sqlite")
         val sourceId = UUID.randomUUID().toString()

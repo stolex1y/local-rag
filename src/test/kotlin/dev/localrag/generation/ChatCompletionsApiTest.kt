@@ -302,6 +302,159 @@ class ChatCompletionsApiTest {
     }
 
     @Test
+    fun `local structured chat requests strict JSON schema without cloud fallback`() {
+        val cloudCalls = AtomicInteger()
+        val requests = CopyOnWriteArrayList<Pair<String?, JsonObject>>()
+        val content = """{"answer":"Проверено","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[],"terms_to_add":[]},"memory_updates":[],"document_citation_refs":["D1"],"memory_reference_refs":[],"session_title":null}"""
+        val fake = FakeProvider { exchange ->
+            cloudCalls.incrementAndGet()
+            respond(exchange, 200, """{"choices":[{"message":{"content":"cloud fallback"}}]}""")
+        }
+        fake.use {
+            it.addContext("/v1/chat/completions") { exchange ->
+                val body = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+                requests += exchange.requestHeaders.getFirst("Authorization") to body
+                val response = kotlinx.serialization.json.buildJsonObject {
+                    put("choices", kotlinx.serialization.json.buildJsonArray {
+                        add(kotlinx.serialization.json.buildJsonObject {
+                            put("message", kotlinx.serialization.json.buildJsonObject { put("content", JsonPrimitive(content)) })
+                        })
+                    })
+                }.toString()
+                respond(exchange, 200, response)
+            }
+            val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
+            val completion = api.completeTurn(
+                ModelSelection("ollama", "qwen2.5:7b"),
+                ChatTurnRequest(
+                    "Question?",
+                    emptyList(),
+                    ChatTaskState(),
+                    listOf(ChatMemoryCandidate("S1", ChatMemoryScope.SESSION, "Synthetic session fact")),
+                    listOf(ChatMemoryCandidate("M1", ChatMemoryScope.SHARED, "Synthetic shared fact")),
+                    listOf(ChatDocumentCandidate("D1", "Synthetic evidence")),
+                    false,
+                ),
+            )
+
+            assertEquals("Проверено", completion.answer)
+            assertEquals(listOf("D1"), completion.documentCitationRefs)
+            assertEquals(0, cloudCalls.get())
+            assertEquals(1, requests.size)
+            assertEquals(null, requests.single().first)
+
+            val body = requests.single().second
+            val format = body.getValue("response_format").jsonObject
+            assertEquals("json_schema", format.getValue("type").jsonPrimitive.content)
+            val jsonSchema = format.getValue("json_schema").jsonObject
+            assertEquals("chat_turn", jsonSchema.getValue("name").jsonPrimitive.content)
+            val schema = jsonSchema.getValue("schema").jsonObject
+            assertEquals(
+                listOf("answer", "task_state_delta", "memory_updates", "document_citation_refs", "memory_reference_refs", "session_title"),
+                schema.getValue("required").jsonArray.map { it.jsonPrimitive.content },
+            )
+            val taskDelta = schema.getValue("properties").jsonObject.getValue("task_state_delta").jsonObject
+            assertEquals(
+                listOf("goal", "clarifications_to_add", "constraints_to_add", "terms_to_add"),
+                taskDelta.getValue("required").jsonArray.map { it.jsonPrimitive.content },
+            )
+
+            val properties = schema.getValue("properties").jsonObject
+            assertEquals("4000", properties.getValue("answer").jsonObject.getValue("maxLength").jsonPrimitive.content)
+
+            val deltaProperties = taskDelta.getValue("properties").jsonObject
+            assertEquals(
+                "500",
+                deltaProperties.getValue("goal").jsonObject.getValue("anyOf").jsonArray.first().jsonObject
+                    .getValue("maxLength").jsonPrimitive.content,
+            )
+            listOf("clarifications_to_add", "constraints_to_add").forEach { key ->
+                val field = deltaProperties.getValue(key).jsonObject
+                assertEquals("20", field.getValue("maxItems").jsonPrimitive.content)
+                assertEquals("500", field.getValue("items").jsonObject.getValue("maxLength").jsonPrimitive.content)
+            }
+            val terms = deltaProperties.getValue("terms_to_add").jsonObject
+            assertEquals("20", terms.getValue("maxItems").jsonPrimitive.content)
+            val termProperties = terms.getValue("items").jsonObject.getValue("properties").jsonObject
+            listOf("term", "definition").forEach { key ->
+                assertEquals("500", termProperties.getValue(key).jsonObject.getValue("maxLength").jsonPrimitive.content)
+            }
+
+            val memories = properties.getValue("memory_updates").jsonObject
+            assertEquals("20", memories.getValue("maxItems").jsonPrimitive.content)
+            assertEquals(
+                "1100",
+                memories.getValue("items").jsonObject.getValue("properties").jsonObject
+                    .getValue("content").jsonObject.getValue("maxLength").jsonPrimitive.content,
+            )
+            listOf("document_citation_refs" to "1", "memory_reference_refs" to "2").forEach { (key, maxItems) ->
+                val field = properties.getValue(key).jsonObject
+                assertEquals(maxItems, field.getValue("maxItems").jsonPrimitive.content)
+                assertEquals("500", field.getValue("items").jsonObject.getValue("maxLength").jsonPrimitive.content)
+            }
+            assertEquals(
+                "60",
+                properties.getValue("session_title").jsonObject.getValue("anyOf").jsonArray.first().jsonObject
+                    .getValue("maxLength").jsonPrimitive.content,
+            )
+
+            val documentRefSchema = properties.getValue("document_citation_refs").jsonObject
+            assertEquals(
+                listOf("D1"),
+                documentRefSchema.getValue("items").jsonObject.getValue("enum").jsonArray.map { it.jsonPrimitive.content },
+            )
+            assertEquals("1", documentRefSchema.getValue("maxItems").jsonPrimitive.content)
+            val memoryRefSchema = properties.getValue("memory_reference_refs").jsonObject
+            assertEquals(
+                listOf("S1", "M1"),
+                memoryRefSchema.getValue("items").jsonObject.getValue("enum").jsonArray.map { it.jsonPrimitive.content },
+            )
+            assertEquals("2", memoryRefSchema.getValue("maxItems").jsonPrimitive.content)
+        }
+    }
+
+    @Test
+    fun `local structured chat forbids references when there are no candidates`() {
+        val cloudCalls = AtomicInteger()
+        val requests = CopyOnWriteArrayList<JsonObject>()
+        val fake = FakeProvider { exchange ->
+            cloudCalls.incrementAndGet()
+            respond(exchange, 200, """{"choices":[{"message":{"content":"cloud fallback"}}]}""")
+        }
+        fake.use {
+            it.addContext("/v1/chat/completions") { exchange ->
+                requests += Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+                val content = """{"answer":"Нет подтверждённых сведений","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[],"terms_to_add":[]},"memory_updates":[],"document_citation_refs":[],"memory_reference_refs":[],"session_title":null}"""
+                val response = kotlinx.serialization.json.buildJsonObject {
+                    put("choices", kotlinx.serialization.json.buildJsonArray {
+                        add(kotlinx.serialization.json.buildJsonObject {
+                            put("message", kotlinx.serialization.json.buildJsonObject { put("content", JsonPrimitive(content)) })
+                        })
+                    })
+                }.toString()
+                respond(exchange, 200, response)
+            }
+            val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
+            val completion = api.completeTurn(
+                ModelSelection("ollama", "qwen2.5:7b"),
+                ChatTurnRequest("Question?", emptyList(), ChatTaskState(), emptyList(), emptyList(), emptyList(), false),
+            )
+
+            assertEquals("Нет подтверждённых сведений", completion.answer)
+            assertEquals(emptyList(), completion.documentCitationRefs)
+            assertEquals(0, cloudCalls.get())
+            val properties = requests.single().getValue("response_format").jsonObject
+                .getValue("json_schema").jsonObject.getValue("schema").jsonObject
+                .getValue("properties").jsonObject
+            listOf("document_citation_refs", "memory_reference_refs").forEach { key ->
+                val field = properties.getValue(key).jsonObject
+                assertEquals("0", field.getValue("maxItems").jsonPrimitive.content)
+                assertFalse(field.getValue("items").jsonObject.containsKey("enum"))
+            }
+        }
+    }
+
+    @Test
     fun `local provider failure is reported without cloud retry`() {
         val cloudCalls = AtomicInteger()
         val fake = FakeProvider { exchange ->

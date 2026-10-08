@@ -156,6 +156,11 @@ class LocalHttpServer(
             }
             parts.size == 4 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && method == "GET" ->
                 sendJson(exchange, 200, application.chatSession(parts[3]))
+            parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "model-selection" && method == "PUT" -> {
+                requireJsonContentType(exchange)
+                val request = readJson<ModelSelectionRequest>(exchange)
+                sendJson(exchange, 200, application.updateChatModelSelection(parts[3], ModelSelection(request.providerId, request.modelId)))
+            }
             parts.size == 4 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && method == "DELETE" -> {
                 requireJsonContentType(exchange)
                 val request = readJson<DeleteRequest>(exchange)
