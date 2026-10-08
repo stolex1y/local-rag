@@ -120,7 +120,7 @@ interface ChatPort {
 }
 
 interface RerankPort {
-    fun rerank(selection: ModelSelection, question: String, candidateTexts: List<String>): List<Int>
+    fun rerank(question: String, candidateTexts: List<String>): List<Int>
 }
 
 data class StoredSource(

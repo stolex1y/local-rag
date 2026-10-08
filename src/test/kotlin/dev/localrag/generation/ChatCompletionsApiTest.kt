@@ -278,71 +278,79 @@ class ChatCompletionsApiTest {
 
 
     @Test
-    fun `reranker receives only query and candidate text and returns a validated order`() {
+    fun `selected local model uses loopback without credential or cloud fallback`() {
+        val cloudCalls = AtomicInteger()
         val requests = CopyOnWriteArrayList<JsonObject>()
         val fake = FakeProvider { exchange ->
-            requests += Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
-            respond(exchange, 200, """{"choices":[{"message":{"content":"{\"ranked_indices\":[1,0]}"}}]}""")
+            cloudCalls.incrementAndGet()
+            respond(exchange, 200, """{"choices":[{"message":{"content":"cloud"}}]}""")
         }
         fake.use {
-            val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-api-key" }))
-            val question = "What is the calibration limit?"
-            val candidateTexts = listOf("LIMIT = 19", "Unrelated synthetic note")
+            it.addContext("/v1/chat/completions") { exchange ->
+                requests += Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+                respond(exchange, 200, """{"choices":[{"message":{"content":"local answer"}}]}""")
+            }
+            val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
+            val localSelection = ModelSelection("ollama", "qwen2.5:7b")
 
-            assertEquals(listOf(1, 0), api.rerank(selection, question, candidateTexts))
+            assertEquals("local answer", api.answer(localSelection, "Question?"))
 
-            val messages = requests.single().getValue("messages").jsonArray.map { it.jsonObject }
-            assertEquals(listOf("system", "user"), messages.map { it.getValue("role").jsonPrimitive.content })
-            val payloadText = messages.last().getValue("content").jsonPrimitive.content
-            val payload = Json.parseToJsonElement(payloadText).jsonObject
-            assertEquals(question, payload.getValue("question").jsonPrimitive.content)
-            assertEquals(
-                candidateTexts,
-                payload.getValue("candidates").jsonArray.map {
-                    it.jsonObject.getValue("text").jsonPrimitive.content
-                },
-            )
-            listOf("sourceId", "sourceName", "chunkId", "location", "section", "embedding")
-                .forEach { field -> assertFalse(field in payloadText, "Reranker payload contained $field") }
+            assertEquals(0, cloudCalls.get())
+            assertEquals("qwen2.5:7b", requests.single().getValue("model").jsonPrimitive.content)
+            assertFalse(requests.single().containsKey("Authorization"))
         }
     }
 
     @Test
-    fun `reranker rejects malformed incomplete duplicate and out of range orders safely`() {
-        val responses = listOf(
-            200 to "not JSON",
-            200 to """{"ranked_indices":[0]}""",
-            200 to """{"ranked_indices":[0,0]}""",
-            200 to """{"ranked_indices":[0,2]}""",
-            503 to """{"error":"SYNTHETIC_PRIVATE_FULL_PROMPT"}""",
-        )
-        val requests = AtomicInteger()
+    fun `local provider failure is reported without cloud retry`() {
+        val cloudCalls = AtomicInteger()
         val fake = FakeProvider { exchange ->
-            val (status, content) = responses[requests.getAndIncrement()]
-            val body = if (status == 200) {
-                """{"choices":[{"message":{"content":${JsonPrimitive(content)}}}]}"""
-            } else {
-                content
-            }
-            respond(exchange, status, body)
+            cloudCalls.incrementAndGet()
+            respond(exchange, 200, """{"choices":[{"message":{"content":"cloud fallback"}}]}""")
         }
         fake.use {
-            val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-api-key" }))
-            assertEquals(emptyList(), api.rerank(selection, "Question?", emptyList()))
-            assertEquals(0, requests.get())
-
-            val sensitiveQuestion = "SENSITIVE_SYNTHETIC_QUERY"
-            repeat(responses.size) {
-                val error = assertFailsWith<CloudModelException> {
-                    api.rerank(selection, sensitiveQuestion, listOf("synthetic candidate one", "synthetic candidate two"))
-                }
-                assertFalse("SYNTHETIC_PRIVATE_FULL_PROMPT" in error.message.orEmpty())
-                assertFalse(sensitiveQuestion in error.message.orEmpty())
-                assertFalse("synthetic-api-key" in error.message.orEmpty())
+            it.addContext("/v1/chat/completions") { exchange ->
+                respond(exchange, 503, """{"error":"SYNTHETIC_LOCAL_FAILURE"}""")
             }
-            assertEquals(responses.size, requests.get())
+            val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
+
+            val failure = assertFailsWith<dev.localrag.ollama.LocalModelException> {
+                api.answer(ModelSelection("ollama", "qwen2.5:3b"), "Question?")
+            }
+
+            assertContains(failure.message.orEmpty(), "Ollama")
+            assertFalse("SYNTHETIC_LOCAL_FAILURE" in failure.message.orEmpty())
+            assertEquals(0, cloudCalls.get())
         }
     }
+
+    private fun localProviderConfiguration(fake: FakeProvider, credentials: ProviderCredentialSource): ModelConfiguration {
+        val catalog = ProviderCatalog.create(
+            listOf(
+                ProviderDefinition(
+                    id = "deepseek",
+                    displayName = "DeepSeek",
+                    baseUrl = "http://127.0.0.1:${fake.port}",
+                    chatCompletionsPath = "/chat/completions",
+                    credentialEnv = "DEEPSEEK_API_KEY",
+                    models = listOf(ProviderModelDefinition("deepseek-flash", "DeepSeek Flash")),
+                ),
+                ProviderDefinition(
+                    id = "ollama",
+                    displayName = "Local / Ollama",
+                    baseUrl = "http://127.0.0.1:${fake.port}",
+                    chatCompletionsPath = "/v1/chat/completions",
+                    credentialEnv = null,
+                    models = listOf(ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"), ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B")),
+                    kind = ProviderKind.OLLAMA,
+                ),
+            ),
+            ModelSelection("ollama", "qwen2.5:7b"),
+            allowLoopbackHttpForTests = true,
+        )
+        return ModelConfiguration(catalog, ModelSelectionStore(temporaryDirectory.resolve("local-selection.json"), catalog), credentials)
+    }
+
 
     private fun configuration(fake: FakeProvider, credentials: ProviderCredentialSource): ModelConfiguration {
         val catalog = ProviderCatalog.create(

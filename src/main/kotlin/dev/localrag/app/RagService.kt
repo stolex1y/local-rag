@@ -53,7 +53,7 @@ class RagService(
         requireReadySources()
         val count = validateTopK(topK)
         val baseline = baseline(question, selection)
-        val comparison = retrieveComparison(question, strategy, count, selection)
+        val comparison = retrieveComparison(question, strategy, count)
         val ragAnswer = ragAnswer(question, comparison.enhanced, selection)
         return QueryResponse(
             baseline = AnswerEnvelope(baseline),
@@ -67,12 +67,11 @@ class RagService(
         question: String,
         strategy: ChunkStrategy,
         topK: Int?,
-        selection: ModelSelection,
     ): RetrievalComparison {
         validateQuestion(question)
         val count = validateTopK(topK)
         if (index.sources(SourceStatus.READY).isEmpty()) return RetrievalComparison(emptyList(), emptyList())
-        return retrieveComparison(question, strategy, count, selection)
+        return retrieveComparison(question, strategy, count)
     }
 
     fun baseline(question: String, selection: ModelSelection): String {
@@ -82,7 +81,6 @@ class RagService(
 
     internal fun retrieveForStrategies(
         question: String,
-        selection: ModelSelection,
         topK: Int = defaultTopK,
     ): Map<ChunkStrategy, RetrievalComparison> {
         validateQuestion(question)
@@ -92,7 +90,7 @@ class RagService(
         val normalized = QueryNormalizer.normalize(question)
         val enhancedEmbedding = if (normalized == question) rawEmbedding else embedQuery(normalized)
         return ChunkStrategy.entries.associateWith { strategy ->
-            compare(strategy, question, count, selection, rawEmbedding, enhancedEmbedding)
+            compare(strategy, question, count, rawEmbedding, enhancedEmbedding)
         }
     }
 
@@ -100,19 +98,17 @@ class RagService(
         question: String,
         strategy: ChunkStrategy,
         topK: Int,
-        selection: ModelSelection,
     ): RetrievalComparison {
         val rawEmbedding = embedQuery(question)
         val normalized = QueryNormalizer.normalize(question)
         val enhancedEmbedding = if (normalized == question) rawEmbedding else embedQuery(normalized)
-        return compare(strategy, question, topK, selection, rawEmbedding, enhancedEmbedding)
+        return compare(strategy, question, topK, rawEmbedding, enhancedEmbedding)
     }
 
     private fun compare(
         strategy: ChunkStrategy,
         question: String,
         topK: Int,
-        selection: ModelSelection,
         rawEmbedding: List<Float>,
         enhancedEmbedding: List<Float>,
     ): RetrievalComparison {
@@ -120,7 +116,7 @@ class RagService(
         val candidates = filterRelevant(index.search(strategy, enhancedEmbedding, embeddings.modelName, topK))
         if (candidates.isEmpty()) return RetrievalComparison(raw, emptyList())
 
-        val order = reranker.rerank(selection, question, candidates.map { it.chunk.draft.text })
+        val order = reranker.rerank(question, candidates.map { it.chunk.draft.text })
         if (order.size != candidates.size) throw IllegalStateException("Reranker вернул некорректный порядок фрагментов.")
         val seen = BooleanArray(candidates.size)
         val enhanced = ArrayList<ScoredChunk>(candidates.size)

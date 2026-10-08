@@ -310,7 +310,7 @@ class ChatServiceTest {
         ): String = ""
     }
     private object EmptyReranker : RerankPort {
-        override fun rerank(selection: ModelSelection, question: String, candidateTexts: List<String>): List<Int> = emptyList()
+        override fun rerank(question: String, candidateTexts: List<String>): List<Int> = emptyList()
     }
 
     companion object {

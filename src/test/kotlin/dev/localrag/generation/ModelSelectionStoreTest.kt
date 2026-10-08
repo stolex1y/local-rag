@@ -47,16 +47,40 @@ class ModelSelectionStoreTest {
     }
 
     @Test
-    fun `production catalog contains only approved DeepSeek models`() {
+    fun `production catalog includes cloud and local generation models`() {
         val catalog = ProviderCatalog.load(Path.of("config/providers.json"), Path.of("config/agent.json"))
-        val provider = catalog.providers.single()
+        val cloud = catalog.providers.single { it.id == "deepseek" }
+        val ollama = catalog.providers.single { it.id == "ollama" }
 
-        assertEquals("deepseek", provider.id)
-        assertEquals("https://api.deepseek.com", provider.baseUrl)
-        assertEquals("/chat/completions", provider.chatCompletionsPath)
-        assertEquals("DEEPSEEK_API_KEY", provider.credentialEnv)
-        assertEquals(listOf("deepseek-flash", "deepseek-v4-pro"), provider.models.map { it.id })
+        assertEquals("https://api.deepseek.com", cloud.baseUrl)
+        assertEquals("/chat/completions", cloud.chatCompletionsPath)
+        assertEquals("DEEPSEEK_API_KEY", cloud.credentialEnv)
+        assertEquals(listOf("deepseek-flash", "deepseek-v4-pro"), cloud.models.map { it.id })
+        assertEquals("http://127.0.0.1:11434", ollama.baseUrl)
+        assertEquals(ProviderKind.OLLAMA, ollama.kind)
+        assertNull(ollama.credentialEnv)
+        assertEquals(listOf("qwen2.5:3b", "qwen2.5:7b"), ollama.models.map { it.id })
         assertEquals(ModelSelection("deepseek", "deepseek-flash"), catalog.defaultSelection)
+    }
+
+    @Test
+    fun `provider model options reflect Ollama tags and cloud credentials`() {
+        val catalog = catalog()
+        val configuration = ModelConfiguration(
+            catalog,
+            ModelSelectionStore(temporaryDirectory.resolve("options.json"), catalog),
+            ProviderCredentialSource { "synthetic-cloud-key" },
+        )
+        configuration.select(ModelSelection("ollama", "qwen2.5:7b"))
+
+        val response = configuration.options(setOf("qwen2.5:7b"))
+
+        assertTrue(response.selectedModelAvailable)
+        assertEquals(
+            listOf(false, true),
+            response.providers.single { it.id == "ollama" }.models.map { it.available },
+        )
+        assertTrue(response.providers.single { it.id == "deepseek" }.models.all { it.available })
     }
 
     @Test
@@ -134,6 +158,18 @@ class ModelSelectionStoreTest {
                     ProviderModelDefinition("deepseek-flash", "DeepSeek Flash"),
                     ProviderModelDefinition("deepseek-v4-pro", "DeepSeek V4 Pro"),
                 ),
+            ),
+            ProviderDefinition(
+                id = "ollama",
+                displayName = "Local / Ollama",
+                baseUrl = "http://127.0.0.1:11434",
+                chatCompletionsPath = "/v1/chat/completions",
+                credentialEnv = null,
+                models = listOf(
+                    ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
+                    ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
+                ),
+                kind = ProviderKind.OLLAMA,
             ),
         ),
         ModelSelection("deepseek", "deepseek-flash"),

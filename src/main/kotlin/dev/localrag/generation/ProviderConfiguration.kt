@@ -10,6 +10,12 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 @Serializable
+enum class ProviderKind {
+    CLOUD,
+    OLLAMA,
+}
+
+@Serializable
 data class ProviderCatalogDocument(val providers: List<ProviderDefinition>)
 
 @Serializable
@@ -18,8 +24,9 @@ data class ProviderDefinition(
     @SerialName("display_name") val displayName: String,
     @SerialName("base_url") val baseUrl: String,
     @SerialName("chat_completions_path") val chatCompletionsPath: String,
-    @SerialName("credential_env") val credentialEnv: String,
+    @SerialName("credential_env") val credentialEnv: String?,
     val models: List<ProviderModelDefinition>,
+    val kind: ProviderKind = ProviderKind.CLOUD,
 )
 
 @Serializable
@@ -35,12 +42,13 @@ data class AgentDefaults(
 )
 
 @Serializable
-data class ModelOption(val id: String, val displayName: String)
+data class ModelOption(val id: String, val displayName: String, val available: Boolean = true)
 
 @Serializable
 data class ProviderOption(
     val id: String,
     val displayName: String,
+    val kind: ProviderKind,
     val models: List<ModelOption>,
 )
 
@@ -51,6 +59,7 @@ data class ModelConfigurationResponse(
     val defaultModelId: String,
     val selectedProviderId: String,
     val selectedModelId: String,
+    val selectedModelAvailable: Boolean,
     val credentialEnv: String,
     val credentialConfigured: Boolean,
     val warning: String? = null,
@@ -90,6 +99,7 @@ class ProviderCatalog private constructor(
         ProviderOption(
             id = provider.id,
             displayName = provider.displayName,
+            kind = provider.kind,
             models = provider.models.map { ModelOption(it.id, it.displayName) },
         )
     }
@@ -97,8 +107,12 @@ class ProviderCatalog private constructor(
     companion object {
         private val json = Json
 
-        fun load(providersPath: Path, agentPath: Path): ProviderCatalog {
-            val providers = try {
+        fun load(
+            providersPath: Path,
+            agentPath: Path,
+            ollamaBaseUrl: URI = URI("http://127.0.0.1:11434"),
+        ): ProviderCatalog {
+            val cloudProviders = try {
                 json.decodeFromString<ProviderCatalogDocument>(Files.readString(providersPath)).providers
             } catch (_: Exception) {
                 throw ModelConfigurationException("Не удалось прочитать config/providers.json.")
@@ -108,8 +122,20 @@ class ProviderCatalog private constructor(
             } catch (_: Exception) {
                 throw ModelConfigurationException("Не удалось прочитать config/agent.json.")
             }
+            val ollama = ProviderDefinition(
+                id = "ollama",
+                displayName = "Local / Ollama",
+                baseUrl = ollamaBaseUrl.toString(),
+                chatCompletionsPath = "/v1/chat/completions",
+                credentialEnv = null,
+                models = listOf(
+                    ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
+                    ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
+                ),
+                kind = ProviderKind.OLLAMA,
+            )
             return create(
-                providers,
+                cloudProviders + ollama,
                 ModelSelection(defaults.defaultProviderId, defaults.defaultModelId),
             )
         }
@@ -141,10 +167,11 @@ class ProviderCatalog private constructor(
             } catch (_: Exception) {
                 throw IllegalArgumentException("Некорректный base_url провайдера.")
             }
-            val loopbackHttp = allowLoopbackHttpForTests && base.scheme == "http" &&
-                base.host in setOf("127.0.0.1", "localhost", "::1")
+            val isOllama = provider.kind == ProviderKind.OLLAMA
+            val loopbackHttp = base.scheme == "http" && base.host == "127.0.0.1" &&
+                (isOllama || allowLoopbackHttpForTests)
             require(base.isAbsolute && (base.scheme == "https" || loopbackHttp) && base.host != null) {
-                "Provider base_url должен использовать HTTPS; HTTP допустим только для loopback fake-сервиса."
+                "Provider base_url должен использовать HTTPS; HTTP разрешён только для Ollama loopback и loopback fake-сервиса."
             }
             require(base.userInfo == null && base.query == null && base.fragment == null &&
                 (base.path.isNullOrEmpty() || base.path == "/") && base.port in -1..65535 && base.port != 0) {
@@ -159,15 +186,22 @@ class ProviderCatalog private constructor(
                 endpoint.query == null && endpoint.fragment == null && !endpoint.path.split('/').contains("..")) {
                 "chat_completions_path должен быть абсолютным путём без host, query и traversal."
             }
-            require(provider.credentialEnv.matches(Regex("[A-Z][A-Z0-9_]{0,127}"))) {
-                "Некорректное имя credential environment variable."
+            if (isOllama) {
+                require(provider.id == "ollama" && provider.chatCompletionsPath == "/v1/chat/completions" &&
+                    provider.credentialEnv == null) {
+                    "Ollama provider должен использовать loopback OpenAI-compatible endpoint без credential."
+                }
+            } else {
+                require(provider.credentialEnv?.matches(Regex("[A-Z][A-Z0-9_]{0,127}")) == true) {
+                    "Некорректное имя credential environment variable."
+                }
             }
             require(provider.models.isNotEmpty()) { "Провайдер должен содержать хотя бы одну модель." }
             require(provider.models.map(ProviderModelDefinition::id).toSet().size == provider.models.size) {
                 "Идентификаторы моделей должны быть уникальными у провайдера."
             }
             provider.models.forEach { model ->
-                require(model.id.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,127}"))) { "Некорректный model id." }
+                require(model.id.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"))) { "Некорректный model id." }
                 require(model.displayName.isNotBlank() && model.displayName.length <= 120) { "Некорректное display name модели." }
             }
         }
@@ -191,33 +225,63 @@ class ModelConfiguration(
         selections.select(selection)
     }
 
-    fun options(): ModelConfigurationResponse {
+    fun options(availableLocalModels: Set<String> = emptySet()): ModelConfigurationResponse {
         val selection = currentSelection()
         val provider = catalog.resolve(selection).provider
+        val credentialConfigured = hasCredential(selection)
+        val availableFor = { candidate: ProviderDefinition ->
+            when (candidate.kind) {
+                ProviderKind.CLOUD -> candidate.credentialEnv?.let { !credentials.read(it).isNullOrBlank() } == true
+                ProviderKind.OLLAMA -> candidate.models.any { it.id in availableLocalModels }
+            }
+        }
+        val providerOptions = catalog.providers.map { candidate ->
+            ProviderOption(
+                id = candidate.id,
+                displayName = candidate.displayName,
+                kind = candidate.kind,
+                models = candidate.models.map { model ->
+                    val available = when (candidate.kind) {
+                        ProviderKind.CLOUD -> availableFor(candidate)
+                        ProviderKind.OLLAMA -> model.id in availableLocalModels
+                    }
+                    ModelOption(model.id, model.displayName, available)
+                },
+            )
+        }
+        val selectedModelAvailable = when (provider.kind) {
+            ProviderKind.CLOUD -> credentialConfigured
+            ProviderKind.OLLAMA -> selection.modelId in availableLocalModels
+        }
         return ModelConfigurationResponse(
-            providers = catalog.options(),
+            providers = providerOptions,
             defaultProviderId = catalog.defaultSelection.providerId,
             defaultModelId = catalog.defaultSelection.modelId,
             selectedProviderId = selection.providerId,
             selectedModelId = selection.modelId,
-            credentialEnv = provider.credentialEnv,
-            credentialConfigured = hasCredential(selection),
+            selectedModelAvailable = selectedModelAvailable,
+            credentialEnv = provider.credentialEnv.orEmpty(),
+            credentialConfigured = credentialConfigured,
             warning = selections.warning(),
         )
     }
 
     fun hasCredential(selection: ModelSelection = currentSelection()): Boolean {
-        val envName = catalog.resolve(selection).provider.credentialEnv
+        val provider = catalog.resolve(selection).provider
+        val envName = provider.credentialEnv ?: return false
         return !credentials.read(envName).isNullOrBlank()
     }
 
     fun requireCredential(selection: ModelSelection) {
-        val envName = catalog.resolve(selection).provider.credentialEnv
+        val provider = catalog.resolve(selection).provider
+        val envName = provider.credentialEnv ?: return
         if (credentials.read(envName).isNullOrBlank()) {
             throw CloudModelException("Для генерации задайте переменную окружения $envName и перезапустите приложение.")
         }
     }
 
-    fun credential(selection: ModelSelection): String? =
-        credentials.read(catalog.resolve(selection).provider.credentialEnv)?.takeIf(String::isNotBlank)
+    fun credential(selection: ModelSelection): String? {
+        val provider = catalog.resolve(selection).provider
+        return provider.credentialEnv?.let(credentials::read)?.takeIf(String::isNotBlank)
+    }
 }

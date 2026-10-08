@@ -19,6 +19,7 @@ import dev.localrag.index.SqliteIndexRepository
 import dev.localrag.index.StructuralChunker
 import dev.localrag.ollama.OllamaApi
 import dev.localrag.ollama.OllamaEmbeddingPort
+import dev.localrag.ollama.OllamaReranker
 import dev.localrag.source.LocalRagPaths
 import dev.localrag.source.SourceCatalog
 import dev.localrag.generation.ChatCompletionsApi
@@ -28,9 +29,11 @@ import dev.localrag.generation.ProviderCatalog
 import dev.localrag.generation.ProviderCredentialSource
 import dev.localrag.generation.ProviderDefinition
 import dev.localrag.generation.ProviderModelDefinition
+import dev.localrag.generation.ProviderKind
 import dev.localrag.domain.ModelSelection
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -397,7 +400,7 @@ class BrowserAcceptanceTest {
 
     @Test
     fun chatLeavesCollectionAndBenchmarkFlowsUsable() {
-        withChatBrowser { page, app, _ ->
+        withChatBrowser { page, app, fake ->
             page.onDialog { it.accept() }
             indexSyntheticGreenhouseSource(page)
             page.locator("#chat-tab").click()
@@ -416,6 +419,14 @@ class BrowserAcceptanceTest {
             assertThat(page.locator("#query-results")).containsText("строки 1–2")
             assertThat(page.locator("#query-results")).containsText("2026-03-15")
 
+            val localProviderResponse = page.waitForResponse("**/api/models/selection") {
+                page.locator("#provider-select").selectOption("ollama")
+            }
+            assertEquals(200, localProviderResponse.status())
+            assertThat(page.locator("#model-select")).hasValue("qwen2.5:3b")
+            val benchmarkCloudStart = fake.cloud.chatModels.size
+            val benchmarkGenerationStart = fake.localGenerationCalls.get()
+            val benchmarkRerankStart = fake.rerankRequests.size
             val source = Json.parseToJsonElement(
                 page.request().get("http://127.0.0.1:${app.server.port}/api/sources").text(),
             ).jsonArray.single { it.jsonObject.getValue("name").jsonPrimitive.content == "greenhouse-chat.md" }
@@ -440,6 +451,28 @@ class BrowserAcceptanceTest {
             assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
             assertThat(page.locator("#benchmark-results")).containsText("Baseline")
             assertThat(page.locator("#benchmark-results")).containsText("RAG")
+            assertEquals(benchmarkCloudStart, fake.cloud.chatModels.size)
+            assertEquals(30, fake.localGenerationCalls.get() - benchmarkGenerationStart)
+            assertEquals(20, fake.rerankRequests.size - benchmarkRerankStart)
+            val review = page.locator("#benchmark-results .rating-form").first()
+            review.locator("select[name=\"baselineRating\"]").selectOption("PASS")
+            review.locator("select[name=\"ragRating\"]").selectOption("PARTIAL")
+            review.locator("input[name=\"note\"]").fill("Local benchmark review.")
+            page.waitForResponse("**/api/benchmark/review") {
+                review.locator("button[type=\"submit\"]").click()
+            }
+            val origin = "http://127.0.0.1:${app.server.port}"
+            val resultsBeforeModelChange = Json.parseToJsonElement(get("$origin/api/benchmark/results")).jsonObject
+            assertTrue(resultsBeforeModelChange.getValue("results").jsonArray.all { result ->
+                result.jsonObject.getValue("providerId").jsonPrimitive.content == "ollama" &&
+                    result.jsonObject.getValue("modelId").jsonPrimitive.content == "qwen2.5:3b"
+            })
+            val modelResponse = page.waitForResponse("**/api/models/selection") {
+                page.locator("#model-select").selectOption("qwen2.5:7b")
+            }
+            assertEquals(200, modelResponse.status())
+            val resultsAfterModelChange = Json.parseToJsonElement(get("$origin/api/benchmark/results")).jsonObject
+            assertEquals(resultsBeforeModelChange, resultsAfterModelChange)
         }
     }
     private fun withChatBrowser(block: (Page, BrowserAppFixture, FakeOllama) -> Unit) {
@@ -453,7 +486,7 @@ class BrowserAcceptanceTest {
                 try {
                     val page = browser.newPage()
                     page.setDefaultTimeout(30_000.0)
-                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { app ->
                         page.navigate("http://127.0.0.1:${app.server.port}/")
                         block(page, app, fake)
                     }
@@ -528,9 +561,9 @@ class BrowserAcceptanceTest {
                         val catalog = SourceCatalog(paths.sources, index, benchmarkStore::deleteSourceReferences)
                         val ollama = OllamaApi(fake.uri)
                         val embeddings = OllamaEmbeddingPort(ollama)
-                        val modelConfiguration = modelConfiguration(paths, fake.cloud)
+                        val modelConfiguration = modelConfiguration(paths, fake)
                         val chat = ChatCompletionsApi(modelConfiguration)
-                        val rag = RagService(index, embeddings, chat, chat)
+                        val rag = RagService(index, embeddings, chat, OllamaReranker(ollama))
                         val chatService = ChatService(chatStore, rag, chat, embeddings)
                         val indexing = IndexWorkflow(
                             extractor = SourceExtractorRegistry(),
@@ -617,7 +650,7 @@ class BrowserAcceptanceTest {
                 )
                 try {
                     val page = browser.newPage()
-                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { app ->
                         page.navigate("http://127.0.0.1:${app.server.port}/")
                         assertThat(page.locator("#benchmark-results")).containsText("Legacy RAG")
                         assertThat(page.locator("#benchmark-results")).containsText("Прежний retrieval · до D23")
@@ -632,6 +665,87 @@ class BrowserAcceptanceTest {
         }
     }
 
+
+    @Test
+    fun collectionUsesSelectedLocalGenerationModelWithoutCloudFallback() {
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("local-provider-app-data"))
+            val source = temporaryDirectory.resolve("local-provider-greenhouse.txt")
+            Files.writeString(source, "Greenhouse payment date is 17 June.\n", UTF_8)
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                try {
+                    val page = browser.newPage()
+                    page.setDefaultTimeout(30_000.0)
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { app ->
+                        page.navigate("http://127.0.0.1:${app.server.port}/")
+                        page.onDialog { it.accept() }
+                        page.locator("#source-files").setInputFiles(source)
+                        page.locator("#upload-button").click()
+                        assertThat(page.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+                        page.locator("#index-button").click()
+                        assertThat(page.locator("#index-success")).containsText("Индексация завершена")
+
+                        val origin = "http://127.0.0.1:${app.server.port}"
+                        val sourceRecordsBefore = Json.parseToJsonElement(get("$origin/api/sources")).jsonArray
+                        val indexRowsBefore = indexSnapshot(paths.database)
+                        val sourceFilesBefore = sourceFilesSnapshot(paths.sources)
+                        assertEquals(1, sourceRecordsBefore.size)
+                        assertTrue(indexRowsBefore.second.isNotEmpty())
+                        assertEquals(1, sourceFilesBefore.size)
+                        val providerResponse = page.waitForResponse("**/api/models/selection") {
+                            page.locator("#provider-select").selectOption("ollama")
+                        }
+                        assertEquals(200, providerResponse.status())
+                        assertThat(page.locator("#model-select")).hasValue("qwen2.5:3b")
+                        val modelResponse = page.waitForResponse("**/api/models/selection") {
+                            page.locator("#model-select").selectOption("qwen2.5:7b")
+                        }
+                        assertEquals(200, modelResponse.status())
+
+                        assertEquals(
+                            sourceRecordsBefore,
+                            Json.parseToJsonElement(get("$origin/api/sources")).jsonArray,
+                        )
+                        assertEquals(indexRowsBefore, indexSnapshot(paths.database))
+                        assertEquals(sourceFilesBefore, sourceFilesSnapshot(paths.sources))
+                        val activeJob = Json.parseToJsonElement(get("$origin/api/status")).jsonObject
+                            .getValue("activeJob")
+                        assertEquals(JsonNull, activeJob)
+                        val cloudStart = fake.cloud.chatMessages.size
+                        val localGenerationStart = fake.localGenerationCalls.get()
+                        val localModelStart = fake.localModels.size
+                        val localRerankStart = fake.rerankRequests.size
+                        page.locator("#question").fill("What is the greenhouse payment date?")
+                        val queryResponse = page.waitForResponse("**/api/query") {
+                            page.locator("#query-button").click()
+                        }
+                        assertEquals(200, queryResponse.status())
+                        val result = Json.parseToJsonElement(queryResponse.text()).jsonObject
+                        val selection = result.getValue("modelSelection").jsonObject
+                        assertEquals("ollama", selection.getValue("providerId").jsonPrimitive.content)
+                        assertEquals("qwen2.5:7b", selection.getValue("modelId").jsonPrimitive.content)
+                        val rag = result.getValue("rag").jsonObject
+                        assertEquals("Synthetic local answer.", rag.getValue("answer").jsonPrimitive.content)
+                        assertTrue(rag.getValue("sources").jsonArray.isNotEmpty())
+                        assertEquals(cloudStart, fake.cloud.chatMessages.size)
+                        assertEquals(2, fake.localGenerationCalls.get() - localGenerationStart)
+                        val localModels = fake.localModels.drop(localModelStart)
+                        assertTrue(localModels.contains("qwen2.5:7b"))
+                        assertTrue(localModels.contains("qwen2.5:3b"))
+                        assertEquals(1, fake.rerankRequests.size - localRerankStart)
+                    }
+                } finally {
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
 
     @Test
     fun queryShowsRawAndEnhancedRetrievalWithValidatedCitations() {
@@ -650,7 +764,7 @@ class BrowserAcceptanceTest {
                 try {
                     val page = browser.newPage()
                     page.setDefaultTimeout(30_000.0)
-                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { app ->
                         page.navigate("http://127.0.0.1:${app.server.port}/")
                         page.onDialog { it.accept() }
                         page.locator("#source-files").setInputFiles(source)
@@ -697,7 +811,7 @@ class BrowserAcceptanceTest {
                         assertTrue(rawCard.contains("greenhouse-comparison.md") && rawCard.contains("фрагмент"))
                         assertTrue(listOf("ALPHA", "BETA", "GAMMA", "DELTA").all(enhancedCard::contains))
 
-                        val rerankPayload = Json.parseToJsonElement(fake.cloud.rerankMessages.last().last()).jsonObject
+                        val rerankPayload = fake.rerankRequests.last()
                         assertEquals(setOf("question", "candidates"), rerankPayload.keys)
                         assertEquals(4, rerankPayload.getValue("candidates").jsonArray.size)
                         assertTrue(rerankPayload.getValue("candidates").jsonArray.all {
@@ -745,7 +859,7 @@ class BrowserAcceptanceTest {
                 try {
                     val page = browser.newPage()
                     page.setDefaultTimeout(30_000.0)
-                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { app ->
                         page.navigate("http://127.0.0.1:${app.server.port}/")
                         page.onDialog { it.accept() }
                         page.locator("#source-files").setInputFiles(source)
@@ -756,7 +870,7 @@ class BrowserAcceptanceTest {
 
                         val question = "What are penguin breeding habits?"
                         val chatStart = fake.cloud.chatMessages.size
-                        val rerankStart = fake.cloud.rerankMessages.size
+                        val rerankStart = fake.rerankRequests.size
                         page.locator("#question").fill(question)
                         val response = page.waitForResponse("**/api/query") {
                             page.locator("#query-button").click()
@@ -778,7 +892,7 @@ class BrowserAcceptanceTest {
                         assertEquals(2, cloudCalls.single().size)
                         assertEquals(question, cloudCalls.single().last())
                         assertTrue(cloudCalls.single().none { "Observatory temperature" in it || "synthetic-observatory.txt" in it })
-                        assertEquals(rerankStart, fake.cloud.rerankMessages.size)
+                        assertEquals(rerankStart, fake.rerankRequests.size)
                         assertEquals(
                             0,
                             page.locator("#query-results .answer-card").nth(2)
@@ -808,7 +922,7 @@ class BrowserAcceptanceTest {
                 try {
                     val page = browser.newPage()
                     page.setDefaultTimeout(30_000.0)
-                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud)).use { app ->
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { app ->
                         page.navigate("http://127.0.0.1:${app.server.port}/")
                         page.onDialog { it.accept() }
                         page.locator("#source-files").setInputFiles(source)
@@ -822,22 +936,19 @@ class BrowserAcceptanceTest {
                         )
                         assertThat(page.locator("#index-success")).containsText("Индексация завершена")
 
-                        fake.cloud.failReranker.set(true)
+                        fake.failReranker.set(true)
                         val chatStart = fake.cloud.chatMessages.size
-                        val rerankStart = fake.cloud.rerankMessages.size
+                        val rerankStart = fake.rerankRequests.size
                         page.locator("#question").fill("What is the greenhouse humidity target?")
                         val response = page.waitForResponse("**/api/query") {
                             page.locator("#query-button").click()
                         }
-                        assertEquals(502, response.status())
-                        assertFalse("Synthetic cloud failure" in response.text())
+                        assertEquals(503, response.status())
+                        assertFalse("SYNTHETIC_LOCAL_RERANK_FAILURE" in response.text())
                         assertFalse("fixture-secret" in response.text())
-                        assertEquals(2, fake.cloud.chatMessages.size - chatStart)
-                        assertEquals(1, fake.cloud.rerankMessages.size - rerankStart)
-                        assertTrue(
-                            Json.parseToJsonElement(fake.cloud.rerankMessages.last().last()).jsonObject
-                                .getValue("candidates").jsonArray.isNotEmpty(),
-                        )
+                        assertEquals(1, fake.cloud.chatMessages.size - chatStart)
+                        assertEquals(1, fake.rerankRequests.size - rerankStart)
+                        assertTrue(fake.rerankRequests.last().getValue("candidates").jsonArray.isNotEmpty())
                         assertThat(page.locator("#query-error")).containsText("HTTP 503")
                         assertThat(page.locator("#query-results")).containsText("нового ответа нет")
                         assertFalse(page.locator("#query-results").innerText().contains("Greenhouse humidity target"))
@@ -869,14 +980,14 @@ class BrowserAcceptanceTest {
                     val page = browser.newPage()
                     page.setDefaultTimeout(30_000.0)
                     var fixture: BrowserAppFixture? =
-                        BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
+                        BrowserAppFixture(paths, fake, modelConfiguration(paths, fake))
                     try {
                         val app = fixture!!
                         page.navigate("http://127.0.0.1:${app.server.port}/")
-                        val benchmarkDisclosure = page.getByText("Один запуск отправляет провайдеру")
-                        assertThat(benchmarkDisclosure).containsText("до 20 пар reranker/RAG-запросов")
-                        assertThat(benchmarkDisclosure).containsText("максимум 50 запросов")
-                        assertThat(benchmarkDisclosure).containsText("запросы пропускаются")
+                        val benchmarkDisclosure = page.getByText("С выбранной моделью выполняются")
+                        assertThat(benchmarkDisclosure).containsText("10 baseline-вопросов и до 20 RAG-запросов")
+                        assertThat(benchmarkDisclosure).containsText("максимум 30 вызовов")
+                        assertThat(benchmarkDisclosure).containsText("Локальный reranker")
                         page.onDialog { it.accept() }
                         page.locator("#source-files").setInputFiles(sourceFiles.toTypedArray())
                         page.locator("#upload-button").click()
@@ -943,12 +1054,12 @@ class BrowserAcceptanceTest {
                         assertThat(page.locator("#benchmark-error")).containsText("Набор сохранён")
 
                         val benchmarkCallStart = fake.cloud.chatMessages.size
-                        val benchmarkRerankStart = fake.cloud.rerankMessages.size
+                        val benchmarkRerankStart = fake.rerankRequests.size
                         page.locator("#benchmark-run").click()
                         assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
                         val benchmarkCalls = fake.cloud.chatMessages.drop(benchmarkCallStart)
-                        assertEquals(46, benchmarkCalls.size)
-                        assertEquals(18, fake.cloud.rerankMessages.size - benchmarkRerankStart)
+                        assertEquals(28, benchmarkCalls.size)
+                        assertEquals(18, fake.rerankRequests.size - benchmarkRerankStart)
                         assertEquals(
                             listOf(emptyQuestion),
                             benchmarkCalls.filter { it.last().contains(emptyQuestion) }.map { it.last() },
@@ -1039,7 +1150,7 @@ class BrowserAcceptanceTest {
                         val beforeRestart = Json.parseToJsonElement(get("http://127.0.0.1:${app.server.port}/api/benchmark/results"))
                             .jsonObject
                         fixture?.close()
-                        fixture = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
+                        fixture = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake))
                         val reopened = fixture!!
                         page.navigate("http://127.0.0.1:${reopened.server.port}/")
                         val afterRestart = Json.parseToJsonElement(get("http://127.0.0.1:${reopened.server.port}/api/benchmark/results"))
@@ -1077,7 +1188,7 @@ class BrowserAcceptanceTest {
                 try {
                     val page = browser.newPage()
                     page.setDefaultTimeout(30_000.0)
-                    var fixture: BrowserAppFixture? = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
+                    var fixture: BrowserAppFixture? = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake))
                     try {
                         val app = fixture!!
                         page.navigate("http://127.0.0.1:${app.server.port}/")
@@ -1154,7 +1265,7 @@ class BrowserAcceptanceTest {
                     page.setDefaultTimeout(30_000.0)
                     Files.createDirectories(paths.modelSelection.parent)
                     Files.writeString(paths.modelSelection, """{"providerId":"fixture","modelId":"removed-model"}""")
-                    var fixture: BrowserAppFixture? = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
+                    var fixture: BrowserAppFixture? = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake))
                     try {
                         val first = fixture!!
                         page.navigate("http://127.0.0.1:${first.server.port}/")
@@ -1197,6 +1308,7 @@ class BrowserAcceptanceTest {
                         assertThat(page.locator("#benchmark-run")).isEnabled()
                         assertThat(page.locator("#query-button")).isEnabled()
                         val benchmarkModelCallStart = fake.cloud.chatModels.size
+                        val benchmarkRerankStart = fake.rerankRequests.size
                         fake.cloud.holdNextChat.set(true)
                         page.locator("#benchmark-run").click()
                         assertTrue(fake.cloud.firstChatStarted.await(10, TimeUnit.SECONDS))
@@ -1212,7 +1324,8 @@ class BrowserAcceptanceTest {
                         fake.cloud.releaseFirstChat.countDown()
                         assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
                         val benchmarkModels = fake.cloud.chatModels.drop(benchmarkModelCallStart)
-                        assertEquals(50, benchmarkModels.size)
+                        assertEquals(30, benchmarkModels.size)
+                        assertEquals(20, fake.rerankRequests.size - benchmarkRerankStart)
                         assertTrue(benchmarkModels.all { it == "deepseek-v4-pro" })
                         page.waitForResponse("**/api/models/selection") {
                             page.locator("#model-select").selectOption("deepseek-v4-pro")
@@ -1250,7 +1363,7 @@ class BrowserAcceptanceTest {
 
                         first.close()
                         fixture = null
-                        fixture = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake.cloud))
+                        fixture = BrowserAppFixture(paths, fake, modelConfiguration(paths, fake))
                         val reopened = fixture!!
                         page.navigate("http://127.0.0.1:${reopened.server.port}/")
                         assertThat(page.locator("#model-select")).hasValue("deepseek-v4-pro")
@@ -1311,6 +1424,37 @@ class BrowserAcceptanceTest {
         }
     }
 
+    private fun indexSnapshot(database: Path): Pair<List<List<String>>, List<List<String>>> =
+        DriverManager.getConnection("jdbc:sqlite:${database.toAbsolutePath()}").use { connection ->
+            val sources = connection.createStatement().use { statement ->
+                statement.executeQuery(
+                    "SELECT source_id,name,type,size_bytes,status,content_sha256 FROM sources ORDER BY source_id",
+                ).use { rows ->
+                    buildList {
+                        while (rows.next()) add((1..6).map { rows.getString(it) ?: "<NULL>" })
+                    }
+                }
+            }
+            val chunks = connection.createStatement().use { statement ->
+                statement.executeQuery(
+                    """SELECT chunk_id,source_id,strategy,section,page_start,page_end,line_start,line_end,
+                        token_units,text,hex(embedding),embedding_model,embedding_dimension
+                        FROM chunks ORDER BY source_id,chunk_id""".trimIndent(),
+                ).use { rows ->
+                    buildList {
+                        while (rows.next()) add((1..13).map { rows.getString(it) ?: "<NULL>" })
+                    }
+                }
+            }
+            sources to chunks
+        }
+
+    private fun sourceFilesSnapshot(directory: Path): Map<String, List<Byte>> =
+        Files.list(directory).use { files ->
+            files.sorted().map { path ->
+                path.fileName.toString() to Files.readAllBytes(path).toList()
+            }.toList().toMap()
+        }
     private fun formatUiBytes(bytes: Long): String {
         if (bytes < 1024) {
             return java.text.NumberFormat.getIntegerInstance(Locale.forLanguageTag("ru-RU")).format(bytes) + " Б"
@@ -1443,7 +1587,7 @@ class BrowserAcceptanceTest {
                 assertThat(queryResults).containsText("greenhouse.html")
                 assertThat(queryResults).containsText("Greenhouse telemetry")
                 val queryMessages = fake.cloud.chatMessages.drop(chatStart)
-                assertEquals(3, queryMessages.size)
+                assertEquals(2, queryMessages.size)
                 assertTrue(queryMessages.first().none { "Humidity target is 64 percent" in it })
                 assertTrue(queryMessages[1].last().contains("Humidity target is 64 percent"))
                 assertTrue(listOf("sourceId", "sourceName", "chunkId", "location").none { it in queryMessages[1].last() })
@@ -1457,7 +1601,7 @@ class BrowserAcceptanceTest {
                 assertThat(queryResults).containsText("synthetic-field-guide.pdf")
                 assertThat(queryResults).containsText("стр. 1")
                 val pdfMessages = fake.cloud.chatMessages.drop(pdfChatStart)
-                assertEquals(3, pdfMessages.size)
+                assertEquals(2, pdfMessages.size)
                 assertTrue(pdfMessages.first().none { "conductivity is 21 units" in it })
                 assertTrue(pdfMessages.last().any { "conductivity is 21 units" in it })
                 assertEquals(0, probe.requests.get())
@@ -1471,7 +1615,7 @@ class BrowserAcceptanceTest {
                     assertThat(queryResults).containsText("copper-calibration.kt")
                     assertThat(queryResults).containsText("строки 1")
                     val codeMessages = fake.cloud.chatMessages.drop(codeChatStart)
-                    assertEquals(3, codeMessages.size)
+                    assertEquals(2, codeMessages.size)
                     assertTrue(codeMessages.last().any { "LIMIT = 19" in it })
 
                     val textChatStart = fake.cloud.chatMessages.size
@@ -1480,7 +1624,7 @@ class BrowserAcceptanceTest {
                     assertThat(queryResults).containsText("version-note.txt")
                     assertThat(queryResults).containsText("строки 1")
                     val textMessages = fake.cloud.chatMessages.drop(textChatStart)
-                    assertEquals(3, textMessages.size)
+                    assertEquals(2, textMessages.size)
                     assertTrue(textMessages.last().any { "beacon threshold" in it })
                 }
                 assertEquals(0, probe.requests.get())
@@ -1775,20 +1919,32 @@ class BrowserAcceptanceTest {
         return response.body()
     }
 
-    private fun modelConfiguration(paths: LocalRagPaths, fake: FakeDeepSeek): ModelConfiguration {
+    private fun modelConfiguration(paths: LocalRagPaths, fake: FakeOllama): ModelConfiguration {
         val selection = ModelSelection("fixture", "deepseek-flash")
         val catalog = ProviderCatalog.create(
             listOf(
                 ProviderDefinition(
                     "fixture",
                     "Fixture provider",
-                    fake.uri.toString(),
+                    fake.cloud.uri.toString(),
                     "/chat/completions",
                     "FIXTURE_API_KEY",
                     listOf(
                         ProviderModelDefinition(selection.modelId, "Fixture Flash"),
                         ProviderModelDefinition("deepseek-v4-pro", "Fixture V4 Pro"),
                     ),
+                ),
+                ProviderDefinition(
+                    "ollama",
+                    "Local / Ollama",
+                    fake.uri.toString(),
+                    "/v1/chat/completions",
+                    null,
+                    listOf(
+                        ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
+                        ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
+                    ),
+                    ProviderKind.OLLAMA,
                 ),
             ),
             selection,
@@ -1797,7 +1953,7 @@ class BrowserAcceptanceTest {
         return ModelConfiguration(
             catalog,
             ModelSelectionStore(paths.modelSelection, catalog),
-            ProviderCredentialSource { if (fake.credentialConfigured.get()) "fixture-secret" else null },
+            ProviderCredentialSource { if (fake.cloud.credentialConfigured.get()) "fixture-secret" else null },
         )
     }
 
@@ -1823,7 +1979,7 @@ class BrowserAcceptanceTest {
         private val ollama = OllamaApi(fake.uri)
         private val embeddings = OllamaEmbeddingPort(ollama)
         private val chat = ChatCompletionsApi(modelConfiguration)
-        private val rag = RagService(index, embeddings, chat, chat)
+        private val rag = RagService(index, embeddings, chat, OllamaReranker(ollama))
         private val chatService = ChatService(chatStore, rag, chat, embeddings)
         private val catalog = SourceCatalog(paths.sources, index, benchmarkStore::deleteSourceReferences)
         private val indexing = IndexWorkflow(
@@ -1851,6 +2007,10 @@ class BrowserAcceptanceTest {
 
     private class FakeOllama : AutoCloseable {
         val cloud = FakeDeepSeek()
+        val failReranker = AtomicBoolean(false)
+        val rerankRequests = CopyOnWriteArrayList<JsonObject>()
+        val localGenerationCalls = AtomicInteger()
+        val localModels = CopyOnWriteArrayList<String>()
         val embeddingInputs = CopyOnWriteArrayList<String>()
         val embeddingCalls = AtomicInteger()
         val holdPdfEmbedding = AtomicBoolean(false)
@@ -1860,7 +2020,7 @@ class BrowserAcceptanceTest {
         private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             this.executor = this@FakeOllama.executor
             createContext("/api/tags") { exchange ->
-                val models = """{"models":[{"name":"embeddinggemma:300m"}]}"""
+                val models = """{"models":[{"name":"embeddinggemma:300m"},{"name":"qwen2.5:3b"},{"name":"qwen2.5:7b"}]}"""
                 respond(exchange, 200, models)
             }
             createContext("/api/embed") { exchange ->
@@ -1885,6 +2045,64 @@ class BrowserAcceptanceTest {
                     }
                 }
                 respond(exchange, 200, buildJsonObject { put("embeddings", embeddings) }.toString())
+            }
+            createContext("/v1/chat/completions") { exchange ->
+                val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+                localModels += request.getValue("model").jsonPrimitive.content
+                val messages = request.getValue("messages").jsonArray.map {
+                    it.jsonObject.getValue("content").jsonPrimitive.content
+                }
+                val isReranker = messages.firstOrNull()?.contains("локальный reranker") == true
+                val content = if (isReranker) {
+                    val payload = Json.parseToJsonElement(messages.last()).jsonObject
+                    rerankRequests += payload
+                    if (failReranker.compareAndSet(true, false)) {
+                        respond(exchange, 503, """{"error":"SYNTHETIC_LOCAL_RERANK_FAILURE"}""")
+                        return@createContext
+                    }
+                    val count = payload.getValue("candidates").jsonArray.size
+                    buildJsonObject {
+                        put("ranked_indices", JsonArray((count - 1 downTo 0).map { JsonPrimitive(it) }))
+                    }.toString()
+                } else {
+                    localGenerationCalls.incrementAndGet()
+                    if (request.containsKey("response_format")) {
+                        val payload = Json.parseToJsonElement(messages.last()).jsonObject
+                        val documentCandidates = payload.getValue("document_candidates").jsonArray
+                        buildJsonObject {
+                            put("answer", if (documentCandidates.isEmpty()) ChatService.ABSTENTION else "Synthetic local chat answer.")
+                            put("task_state_delta", buildJsonObject {
+                                put("goal", kotlinx.serialization.json.JsonNull)
+                                put("clarifications_to_add", buildJsonArray { })
+                                put("constraints_to_add", buildJsonArray { })
+                                put("terms_to_add", buildJsonArray { })
+                            })
+                            put("memory_updates", buildJsonArray { })
+                            put("document_citation_refs", buildJsonArray {
+                                documentCandidates.firstOrNull()?.jsonObject?.get("ref_id")?.let { add(it) }
+                            })
+                            put("memory_reference_refs", buildJsonArray { })
+                            put(
+                                "session_title",
+                                if (payload.getValue("generate_title").jsonPrimitive.content.toBoolean()) {
+                                    JsonPrimitive("Local synthetic session")
+                                } else {
+                                    kotlinx.serialization.json.JsonNull
+                                },
+                            )
+                        }.toString()
+                    } else {
+                        "Synthetic local answer."
+                    }
+                }
+                val response = buildJsonObject {
+                    put("choices", buildJsonArray {
+                        add(buildJsonObject {
+                            put("message", buildJsonObject { put("content", JsonPrimitive(content)) })
+                        })
+                    })
+                }.toString()
+                respond(exchange, 200, response)
             }
         }
 
@@ -1912,12 +2130,10 @@ class BrowserAcceptanceTest {
     private class FakeDeepSeek : AutoCloseable {
         val failChat = AtomicBoolean(false)
         val malformedStructuredResponse = AtomicBoolean(false)
-        val failReranker = AtomicBoolean(false)
         val credentialConfigured = AtomicBoolean(true)
         val chatMessages = CopyOnWriteArrayList<List<String>>()
         val titleGenerationRequests = AtomicInteger(0)
         val chatModels = CopyOnWriteArrayList<String>()
-        val rerankMessages = CopyOnWriteArrayList<List<String>>()
         val holdNextChat = AtomicBoolean(false)
         val firstChatStarted = CountDownLatch(1)
         val releaseFirstChat = CountDownLatch(1)
@@ -1931,19 +2147,12 @@ class BrowserAcceptanceTest {
                 }
                 chatMessages.add(messages)
                 chatModels.add(request.getValue("model").jsonPrimitive.content)
-                val isReranker = messages.firstOrNull()?.contains("Ты reranker") == true
-                if (isReranker) rerankMessages.add(messages)
                 if (holdNextChat.compareAndSet(true, false)) {
                     firstChatStarted.countDown()
                     check(releaseFirstChat.await(20, TimeUnit.SECONDS))
                 }
-                if (failChat.get() || (isReranker && failReranker.get())) {
+                if (failChat.get()) {
                     respond(exchange, 503, """{"error":"Synthetic cloud failure"}""")
-                } else if (isReranker) {
-                    val candidateCount = Json.parseToJsonElement(messages.last()).jsonObject
-                        .getValue("candidates").jsonArray.size
-                    val reversed = (candidateCount - 1 downTo 0).joinToString(",")
-                    respond(exchange, 200, """{"choices":[{"message":{"content":"{\"ranked_indices\":[$reversed]}"}}]}""")
                 } else if (request.containsKey("response_format")) {
                     val payload = Json.parseToJsonElement(messages.last()).jsonObject
                     val question = payload.getValue("question").jsonPrimitive.content

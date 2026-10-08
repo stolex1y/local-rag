@@ -24,7 +24,7 @@ class BenchmarkRunner(
             val validExpectedSources = question.expectedSources.filter { expected ->
                 index.hasSourceLocation(expected.sourceId, expected.location, expected.section)
             }
-            val comparisonsByStrategy = rag.retrieveForStrategies(question.question, selection)
+            val comparisonsByStrategy = rag.retrieveForStrategies(question.question)
             ChunkStrategy.entries.forEach { strategy ->
                 progress(IndexProgressUpdate("rag", completed, totalCases, 0, 0, question.question, 0, 0))
                 val comparison = comparisonsByStrategy.getValue(strategy)

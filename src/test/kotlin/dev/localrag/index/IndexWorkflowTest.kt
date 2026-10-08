@@ -81,11 +81,8 @@ class IndexWorkflowTest {
                 FixtureEmbeddings(),
                 EvidenceChat(),
                 object : RerankPort {
-                    override fun rerank(
-                        selection: ModelSelection,
-                        question: String,
-                        candidateTexts: List<String>,
-                    ): List<Int> = candidateTexts.indices.toList()
+                    override fun rerank(question: String, candidateTexts: List<String>): List<Int> =
+                        candidateTexts.indices.toList()
                 },
             )
             val response = rag.answer(

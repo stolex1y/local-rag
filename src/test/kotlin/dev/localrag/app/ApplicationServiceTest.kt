@@ -1094,7 +1094,7 @@ class ApplicationServiceTest {
     }
 
     private class FixtureReranker(private val calls: AtomicInteger) : RerankPort {
-        override fun rerank(selection: ModelSelection, question: String, candidateTexts: List<String>): List<Int> {
+        override fun rerank(question: String, candidateTexts: List<String>): List<Int> {
             calls.incrementAndGet()
             return candidateTexts.indices.toList()
         }

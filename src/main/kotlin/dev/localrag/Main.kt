@@ -19,6 +19,7 @@ import dev.localrag.index.SqliteIndexRepository
 import dev.localrag.index.StructuralChunker
 import dev.localrag.ollama.OllamaApi
 import dev.localrag.ollama.OllamaEmbeddingPort
+import dev.localrag.ollama.OllamaReranker
 import dev.localrag.source.LocalRagPaths
 import dev.localrag.source.SourceCatalog
 import dev.localrag.web.LocalHttpServer
@@ -35,12 +36,17 @@ fun main() {
                 val jobs = JobManager()
                 try {
                     val ollamaAddress = System.getenv("LOCAL_RAG_OLLAMA_URL")
-                    val ollama = if (ollamaAddress.isNullOrBlank()) OllamaApi() else OllamaApi(URI.create(ollamaAddress))
-                    val modelCatalog = ProviderCatalog.load(Path.of("config/providers.json"), Path.of("config/agent.json"))
+                    val ollamaBaseUrl = if (ollamaAddress.isNullOrBlank()) URI("http://127.0.0.1:11434") else URI.create(ollamaAddress)
+                    val ollama = OllamaApi(ollamaBaseUrl)
+                    val modelCatalog = ProviderCatalog.load(
+                        Path.of("config/providers.json"),
+                        Path.of("config/agent.json"),
+                        ollamaBaseUrl,
+                    )
                     val modelConfiguration = ModelConfiguration(modelCatalog, ModelSelectionStore(paths.modelSelection, modelCatalog), EnvironmentProviderCredentials)
                     val embeddings = OllamaEmbeddingPort(ollama)
                     val chat = ChatCompletionsApi(modelConfiguration)
-                    val rag = RagService(index, embeddings, chat, chat)
+                    val rag = RagService(index, embeddings, chat, OllamaReranker(ollama))
                     val chatService = ChatService(chatStore, rag, chat, embeddings)
                     val indexing = IndexWorkflow(
                         extractor = SourceExtractorRegistry(),

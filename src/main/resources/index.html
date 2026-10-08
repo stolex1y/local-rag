@@ -180,7 +180,7 @@
           <select id="model-select"></select>
         </div>
       </div>
-      <p class="notice" id="model-note" role="status">Проверяем локальную embedding-модель и облачные настройки…</p>
+      <p class="notice" id="model-note" role="status">Проверяем локальные модели и настройки генерации…</p>
       <p class="muted" id="model-selection-note" role="status"></p>
       <p class="error" id="status-error" role="alert" hidden></p>
       <p class="job" id="job-progress" role="status" aria-live="polite" hidden></p>
@@ -252,7 +252,7 @@
         <div><h2 id="benchmark-heading">Benchmark на своих вопросах</h2><p class="muted">Загрузите JSON ровно с 10 вопросами, ожидаемыми фактами и ссылками на готовые источники.</p></div>
         <button class="secondary" id="benchmark-refresh" type="button">Обновить вопросы и результаты</button>
       </div>
-      <div class="callout">Один запуск отправляет провайдеру 10 baseline-вопросов и до 20 пар reranker/RAG-запросов — максимум 50 запросов. Если enhanced retrieval не нашёл кандидатов, соответствующие reranker и RAG-запросы пропускаются. Фактические расходы зависят от тарифа провайдера; запускайте benchmark только если принимаете эти запросы и возможные расходы. Выбранная пара фиксируется на весь запуск; изменение выбора повлияет на следующий.</div>
+      <div class="callout">С выбранной моделью выполняются 10 baseline-вопросов и до 20 RAG-запросов (максимум 30 вызовов). Локальный reranker обрабатывает до 20 наборов кандидатов на этом компьютере. Если enhanced retrieval не нашёл кандидатов, соответствующие RAG-запросы пропускаются. Вызовы выбранной облачной модели могут тарифицироваться провайдером. Выбранная пара фиксируется на весь запуск; изменение выбора повлияет на следующий.</div>
       <div class="upload-grid">
         <div class="field">
           <label for="benchmark-file">JSON-файл benchmark</label>
@@ -319,8 +319,8 @@
       "use strict";
 
       const $ = (selector, root = document) => root.querySelector(selector);
-      const state = { modelsAvailable: false, embeddingAvailable: false, modelConfiguration: null, modelSelectionPending: false, activeJob: null, sources: [], benchmark: null, results: [] };
-      const chatState = { sessionId: null, detail: null, sessions: [], sharedFacts: [], pendingTurn: null, busy: false, loadingSession: false, sessionLoadGeneration: 0, refreshGeneration: 0, activeTab: "collection" };
+      const state = { modelsAvailable: false, embeddingAvailable: false, rerankerAvailable: false, modelConfiguration: null, modelSelectionPending: false, activeJob: null, sources: [], benchmark: null, results: [] };
+      const chatState = { sessionId: null, detail: null, sessions: [], sharedFacts: [], pendingTurn: null, busy: false, loadingSession: false, modelSelectionPending: false, sessionLoadGeneration: 0, refreshGeneration: 0, activeTab: "collection" };
       const MAX_FILE_BYTES = 256 * 1024 * 1024;
       const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
       const MAX_BENCHMARK_FILE_BYTES = 1024 * 1024;
@@ -469,9 +469,12 @@
         const modelSelect = $("#model-select");
         modelSelect.replaceChildren();
         const provider = configuration.providers.find(item => item.id === configuration.selectedProviderId);
-        (provider?.models || []).forEach(model => modelSelect.append(
-          Object.assign(node("option", model.displayName), { value: model.id }),
-        ));
+        (provider?.models || []).forEach(model => {
+          const label = provider.kind === "OLLAMA" && !model.available ? `${model.displayName} · не загружена` : model.displayName;
+          const option = Object.assign(node("option", label), { value: model.id });
+          option.disabled = provider.kind === "OLLAMA" && !model.available;
+          modelSelect.append(option);
+        });
         modelSelect.value = configuration.selectedModelId;
         const selectionNote = $("#model-selection-note");
         selectionNote.textContent = configuration.warning || "";
@@ -499,7 +502,8 @@
       async function chooseProvider() {
         const provider = state.modelConfiguration?.providers.find(item => item.id === $("#provider-select").value);
         if (!provider?.models.length) return;
-        await saveModelSelection(provider.id, provider.models[0].id);
+        const model = provider.models.find(item => item.available) || provider.models[0];
+        await saveModelSelection(provider.id, model.id);
       }
 
       async function chooseModel() {
@@ -524,14 +528,22 @@
         const models = status.models;
         const configuration = state.modelConfiguration;
         state.embeddingAvailable = Boolean(models.available);
-        state.modelsAvailable = state.embeddingAvailable && Boolean(configuration?.credentialConfigured);
+        state.rerankerAvailable = Boolean(models.localRerankerAvailable);
+        state.modelsAvailable = state.embeddingAvailable && state.rerankerAvailable && Boolean(configuration?.selectedModelAvailable);
         const note = $("#model-note");
+        const selectedProvider = configuration?.providers.find(item => item.id === configuration.selectedProviderId);
         if (!state.embeddingAvailable) {
           note.hidden = false;
           note.textContent = `Локальная embedding-модель недоступна. Запустите Ollama и загрузите ${models.embedding}.`;
-        } else if (!configuration?.credentialConfigured) {
+        } else if (!state.rerankerAvailable) {
           note.hidden = false;
-          note.textContent = `Ollama embedding ${models.embedding} доступен. Для облачной генерации задайте ${configuration?.credentialEnv || "DEEPSEEK_API_KEY"} и перезапустите приложение. Ключ хранится только в окружении.`;
+          note.textContent = `Локальный reranker недоступен. Запустите Ollama и загрузите ${models.localReranker}.`;
+        } else if (selectedProvider?.kind === "OLLAMA" && !configuration?.selectedModelAvailable) {
+          note.hidden = false;
+          note.textContent = `Выбранная локальная модель ${configuration?.selectedModelId} не загружена в Ollama. Другой provider автоматически не включается.`;
+        } else if (selectedProvider?.kind === "CLOUD" && !configuration?.credentialConfigured) {
+          note.hidden = false;
+          note.textContent = `Для облачной генерации задайте ${configuration?.credentialEnv || "DEEPSEEK_API_KEY"} и перезапустите приложение. Ключ хранится только в окружении. Retrieval и reranking остаются локальными.`;
         } else {
           note.textContent = "";
           note.hidden = true;

@@ -23,6 +23,7 @@ import dev.localrag.index.IndexWorkflow
 import dev.localrag.domain.ModelSelection
 import dev.localrag.generation.ModelConfiguration
 import dev.localrag.generation.ModelConfigurationResponse
+import dev.localrag.ollama.LOCAL_RERANK_MODEL
 import dev.localrag.ollama.EMBEDDING_MODEL
 import dev.localrag.ollama.OllamaApi
 import dev.localrag.source.ImportBatch
@@ -38,6 +39,8 @@ import java.io.InputStream
 data class ModelStatus(
     val embedding: String,
     val available: Boolean,
+    val localReranker: String,
+    val localRerankerAvailable: Boolean,
 )
 
 @Serializable
@@ -110,7 +113,12 @@ class ApplicationService(
         val sources = catalog.sources()
         val availableModels = availableModels()
         return StatusResponse(
-            models = ModelStatus(EMBEDDING_MODEL, EMBEDDING_MODEL in availableModels),
+            models = ModelStatus(
+                EMBEDDING_MODEL,
+                EMBEDDING_MODEL in availableModels,
+                LOCAL_RERANK_MODEL,
+                LOCAL_RERANK_MODEL in availableModels,
+            ),
             sources = SourceSummary(
                 total = sources.size,
                 pending = sources.count { it.status == SourceStatus.PENDING },
@@ -166,7 +174,7 @@ class ApplicationService(
         chatSession(sessionId)
         return chatService.updateTaskState(sessionId, taskState)
     }
-    fun models(): ModelConfigurationResponse = modelConfiguration.options()
+    fun models(): ModelConfigurationResponse = modelConfiguration.options(availableModels())
 
     fun selectModel(selection: ModelSelection): ModelConfigurationResponse {
         try {
@@ -174,7 +182,7 @@ class ApplicationService(
         } catch (error: IllegalArgumentException) {
             throw ApiException(400, "invalid_model_selection", error.message ?: "Выберите модель из каталога.")
         }
-        return modelConfiguration.options()
+        return modelConfiguration.options(availableModels())
     }
 
     fun beginImport(files: List<ImportFileMetadata>): ImportBatch = catalog.beginImport(files)
