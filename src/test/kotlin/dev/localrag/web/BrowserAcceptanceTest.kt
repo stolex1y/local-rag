@@ -99,11 +99,27 @@ class BrowserAcceptanceTest {
             val quote = citationData.getValue("quote").jsonPrimitive.content
             assertTrue("2026-03-15" in quote)
             val providerPayload = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
+            assertEquals(
+                setOf(
+                    "question",
+                    "previous_messages",
+                    "task_state",
+                    "session_memory",
+                    "shared_memory",
+                    "document_candidates",
+                    "generate_title",
+                ),
+                providerPayload.keys,
+            )
+            assertEquals("greenhouse payment date?", providerPayload.getValue("question").jsonPrimitive.content)
+            assertTrue(providerPayload.getValue("previous_messages").jsonArray.isEmpty())
             val candidates = providerPayload.getValue("document_candidates").jsonArray
             assertTrue(candidates.size >= 2)
+            assertTrue(candidates.all { it.jsonObject.keys == setOf("ref_id", "text") })
             assertTrue(candidates.any { quote in it.jsonObject.getValue("text").jsonPrimitive.content })
             assertTrue(candidates.all { it.jsonObject.getValue("ref_id").jsonPrimitive.content.matches(Regex("D\\d+")) })
             assertFalse(providerPayload.toString().contains("greenhouse-chat.md"))
+            assertFalse(providerPayload.toString().contains(expectedSourceId))
             val citation = page.locator(".chat-bubble.assistant .chat-evidence .citations")
                 .first().locator("li").first()
             assertThat(citation).containsText("greenhouse-chat.md · Greenhouse · строки 1–2")
@@ -161,22 +177,34 @@ class BrowserAcceptanceTest {
             page.onDialog { it.accept() }
             indexSyntheticGreenhouseSource(page)
             page.locator("#chat-tab").click()
+            val sectionTabs = page.locator("nav[aria-label='Разделы приложения'] button").allTextContents()
+                .map { it.trim() }
+            assertEquals(listOf("Источники и поиск", "Чат"), sectionTabs)
+            val comparisonQuestion = "What is the greenhouse payment date?"
             val cloudSession = createChatSession(page)
             assertThat(page.locator("#chat-provider-select")).hasValue("fixture")
             assertThat(page.locator("#chat-model-select")).hasValue("deepseek-flash")
             val cloudStart = fake.cloud.chatModels.size
             val cloudResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill("session-A compare model")
+                page.locator("#chat-question").fill(comparisonQuestion)
                 page.locator("#chat-send").click()
             }
             assertEquals(200, cloudResponse.status())
             val cloudMessage = Json.parseToJsonElement(cloudResponse.text()).jsonObject
                 .getValue("message").jsonObject
+            val cloudElapsedMs = cloudMessage.getValue("elapsedMs").jsonPrimitive.content.toLong()
+            assertTrue(cloudElapsedMs >= 0)
             assertEquals("fixture", cloudMessage.getValue("modelSelection").jsonObject
                 .getValue("providerId").jsonPrimitive.content)
             assertEquals("deepseek-flash", cloudMessage.getValue("modelSelection").jsonObject
                 .getValue("modelId").jsonPrimitive.content)
             assertEquals(listOf("deepseek-flash"), fake.cloud.chatModels.drop(cloudStart))
+            val cloudPayload = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
+            assertEquals(comparisonQuestion, cloudPayload.getValue("question").jsonPrimitive.content)
+            val cloudAssistant = page.locator(".chat-bubble.assistant").last()
+            assertThat(cloudAssistant).containsText("fixture/deepseek-flash")
+            assertThat(cloudAssistant)
+                .containsText("Время обработки хода: $cloudElapsedMs мс (retrieval + генерация).")
 
             val localSession = createChatSession(page)
             val providerResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
@@ -191,20 +219,23 @@ class BrowserAcceptanceTest {
             val localGenerationStart = fake.localGenerationCalls.get()
             val localModelsStart = fake.localModels.size
             val localResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill("What is the greenhouse payment date?")
+                page.locator("#chat-question").fill(comparisonQuestion)
                 page.locator("#chat-send").click()
             }
             assertEquals(200, localResponse.status())
+            assertEquals(comparisonQuestion, fake.localChatPayloads.last().getValue("question").jsonPrimitive.content)
             val localMessage = Json.parseToJsonElement(localResponse.text()).jsonObject
                 .getValue("message").jsonObject
+            val localElapsedMs = localMessage.getValue("elapsedMs").jsonPrimitive.content.toLong()
             val localSelection = localMessage.getValue("modelSelection").jsonObject
             assertEquals("ollama", localSelection.getValue("providerId").jsonPrimitive.content)
             assertEquals("qwen2.5:7b", localSelection.getValue("modelId").jsonPrimitive.content)
-            assertTrue(localMessage.getValue("elapsedMs").jsonPrimitive.content.toLong() >= 0)
+            assertTrue(localElapsedMs >= 0)
             assertEquals(1, fake.localGenerationCalls.get() - localGenerationStart)
             assertTrue(fake.localModels.drop(localModelsStart).contains("qwen2.5:7b"))
             assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:7b")
-            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Время обработки хода:")
+            assertThat(page.locator(".chat-bubble.assistant").last())
+                .containsText("Время обработки хода: $localElapsedMs мс (retrieval + генерация).")
             val changedModelResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
                 page.locator("#chat-model-select").selectOption("qwen2.5:3b")
             }
@@ -222,9 +253,13 @@ class BrowserAcceptanceTest {
                 "qwen2.5:3b",
                 changedMessage.getValue("modelSelection").jsonObject.getValue("modelId").jsonPrimitive.content,
             )
+            val changedElapsedMs = changedMessage.getValue("elapsedMs").jsonPrimitive.content.toLong()
+            assertTrue(changedElapsedMs >= 0)
             assertEquals(1, fake.localGenerationCalls.get() - changedGenerationStart)
             assertTrue(fake.localModels.drop(changedModelsStart).contains("qwen2.5:3b"))
             assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
+            assertThat(page.locator(".chat-bubble.assistant").last())
+                .containsText("Время обработки хода: $changedElapsedMs мс (retrieval + генерация).")
 
             page.locator("#collection-tab").click()
             assertThat(page.locator("#provider-select")).hasValue("fixture")
@@ -342,6 +377,9 @@ class BrowserAcceptanceTest {
                 page.locator("#chat-send").click()
             }
             assertTrue(localFailure.status() >= 400)
+            page.locator("#chat-error").waitFor()
+            assertTrue(page.locator("#chat-error").isVisible)
+            assertThat(page.locator("#chat-error")).containsText("Ollama вернул HTTP 503")
             assertEquals(cloudCallsBeforeLocalFailure, fake.cloud.chatModels.size)
         }
     }
@@ -478,6 +516,27 @@ class BrowserAcceptanceTest {
             assertThat(page.locator(".chat-bubble.user").last().locator("button")).isEnabled()
             assertThat(page.locator("#chat-send")).isDisabled()
             assertThat(page.locator("#chat-question")).isDisabled()
+            val cloudCallsBeforeNavigatedRetry = fake.cloud.chatModels.size
+            val localCallsBeforeNavigatedRetry = fake.localGenerationCalls.get()
+            val navigatedRetryResponse = page.waitForResponse("**/api/chat/sessions/$secondSession/turns") {
+                page.locator(".chat-bubble.user").last().locator("button").click()
+            }
+            assertEquals(200, navigatedRetryResponse.status())
+            assertEquals(cloudCallsBeforeNavigatedRetry, fake.cloud.chatModels.size)
+            assertEquals(localCallsBeforeNavigatedRetry + 1, fake.localGenerationCalls.get())
+            val navigatedRetryMessage = Json.parseToJsonElement(navigatedRetryResponse.text()).jsonObject
+                .getValue("message").jsonObject
+            assertEquals(
+                "ollama",
+                navigatedRetryMessage.getValue("modelSelection").jsonObject.getValue("providerId").jsonPrimitive.content,
+            )
+            assertEquals(
+                "qwen2.5:3b",
+                navigatedRetryMessage.getValue("modelSelection").jsonObject.getValue("modelId").jsonPrimitive.content,
+            )
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
+            assertThat(page.locator(".chat-bubble.user")).hasCount(1)
+            assertThat(page.locator(".chat-bubble.assistant")).hasCount(1)
             assertNotEquals(firstSession, secondSession)
         }
     }
@@ -1342,6 +1401,27 @@ class BrowserAcceptanceTest {
                         assertTrue(localModels.contains("qwen2.5:7b"))
                         assertTrue(localModels.contains("qwen2.5:3b"))
                         assertEquals(1, fake.rerankRequests.size - localRerankStart)
+                        val cloudCallsBeforeGenerationFailure = fake.cloud.chatMessages.size
+                        fake.failLocalGeneration.set(true)
+                        val generationFailure = page.waitForResponse("**/api/query") {
+                            page.locator("#query-button").click()
+                        }
+                        assertEquals(503, generationFailure.status())
+                        page.locator("#query-error").waitFor()
+                        assertTrue(page.locator("#query-error").isVisible)
+                        assertThat(page.locator("#query-error")).containsText("Ollama вернул HTTP 503")
+                        assertEquals(cloudCallsBeforeGenerationFailure, fake.cloud.chatMessages.size)
+
+                        val cloudCallsBeforeRerankerFailure = fake.cloud.chatMessages.size
+                        fake.failReranker.set(true)
+                        val rerankerFailure = page.waitForResponse("**/api/query") {
+                            page.locator("#query-button").click()
+                        }
+                        assertEquals(503, rerankerFailure.status())
+                        page.locator("#query-error").waitFor()
+                        assertTrue(page.locator("#query-error").isVisible)
+                        assertThat(page.locator("#query-error")).containsText("Ollama вернул HTTP 503")
+                        assertEquals(cloudCallsBeforeRerankerFailure, fake.cloud.chatMessages.size)
                     }
                 } finally {
                     browser.close()
@@ -2617,6 +2697,7 @@ class BrowserAcceptanceTest {
         val rerankRequests = CopyOnWriteArrayList<JsonObject>()
         val localGenerationCalls = AtomicInteger()
         val localModels = CopyOnWriteArrayList<String>()
+        val localChatPayloads = CopyOnWriteArrayList<JsonObject>()
         val embeddingInputs = CopyOnWriteArrayList<String>()
         val embeddingCalls = AtomicInteger()
         val holdPdfEmbedding = AtomicBoolean(false)
@@ -2678,6 +2759,7 @@ class BrowserAcceptanceTest {
                     }
                     if (request.containsKey("response_format")) {
                         val payload = Json.parseToJsonElement(messages.last()).jsonObject
+                        localChatPayloads += payload
                         val documentCandidates = payload.getValue("document_candidates").jsonArray
                         buildJsonObject {
                             put("answer", if (documentCandidates.isEmpty()) ChatService.ABSTENTION else "Synthetic local chat answer.")
