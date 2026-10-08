@@ -232,15 +232,69 @@ class BrowserAcceptanceTest {
         withChatBrowser { page, app, fake ->
             page.onDialog { it.accept() }
             indexSyntheticGreenhouseSource(page)
+            val origin = "http://127.0.0.1:${app.server.port}"
+            val comparisonQuestion = "What is the greenhouse payment date?"
+            val source = Json.parseToJsonElement(get("$origin/api/sources")).jsonArray
+                .map { it.jsonObject }
+                .single { it.getValue("name").jsonPrimitive.content == "greenhouse-chat.md" }
+            val sourceId = source.getValue("sourceId").jsonPrimitive.content
+            val questionsFile = temporaryDirectory.resolve("chat-manual-comparison-benchmark.json")
+            Files.writeString(
+                questionsFile,
+                benchmarkQuestions(
+                    sourceId,
+                    2,
+                    "The greenhouse payment date is 2026-03-15.",
+                    questionText = comparisonQuestion,
+                    questionCount = 10,
+                ),
+                UTF_8,
+            )
+            page.locator("#benchmark-file").setInputFiles(questionsFile)
+            page.locator("#benchmark-upload").click()
+            assertThat(page.locator("#benchmark-error")).containsText("Набор сохранён")
+            page.locator("#benchmark-run").click()
+            assertThat(page.locator("#benchmark-error")).containsText("Benchmark завершён")
+            val review = page.locator("#benchmark-results .rating-form").first()
+            review.locator("select[name=\"baselineRating\"]").selectOption("PASS")
+            review.locator("select[name=\"ragRating\"]").selectOption("PARTIAL")
+            review.locator("input[name=\"note\"]").fill("D25 review must survive Chat model choices.")
+            val reviewResponse = page.waitForResponse("**/api/benchmark/review") {
+                review.locator("button[type=\"submit\"]").click()
+            }
+            assertEquals(200, reviewResponse.status())
+            val benchmarkResultsBefore = Json.parseToJsonElement(
+                get("$origin/api/benchmark/results"),
+            ).jsonObject.getValue("results").jsonArray
+            assertEquals(20, benchmarkResultsBefore.size)
+            assertTrue(benchmarkResultsBefore.any { result ->
+                val fields = result.jsonObject
+                fields.getValue("baselineRating").jsonPrimitive.content == "PASS" &&
+                    fields.getValue("ragRating").jsonPrimitive.content == "PARTIAL" &&
+                    fields.getValue("note").jsonPrimitive.content == "D25 review must survive Chat model choices."
+            })
             page.locator("#chat-tab").click()
             val sectionTabs = page.locator("nav[aria-label='Разделы приложения'] button").allTextContents()
                 .map { it.trim() }
             assertEquals(listOf("Источники и поиск", "Чат"), sectionTabs)
-            val comparisonQuestion = "What is the greenhouse payment date?"
+            val expectedTables = setOf(
+                "benchmark_questions",
+                "benchmark_result_sources",
+                "benchmark_results",
+                "chat_messages",
+                "chat_sessions",
+                "chat_session_facts",
+                "chat_shared_facts",
+                "chat_task_states",
+                "chunks",
+                "sources",
+            )
+            assertEquals(expectedTables, app.databaseTableNames())
             val cloudSession = createChatSession(page)
             assertThat(page.locator("#chat-provider-select")).hasValue("fixture")
             assertThat(page.locator("#chat-model-select")).hasValue("deepseek-flash")
             val cloudStart = fake.cloud.chatModels.size
+            val localGenerationBeforeCloudSend = fake.localGenerationCalls.get()
             val cloudResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
                 page.locator("#chat-question").fill(comparisonQuestion)
                 page.locator("#chat-send").click()
@@ -255,6 +309,7 @@ class BrowserAcceptanceTest {
             assertEquals("deepseek-flash", cloudMessage.getValue("modelSelection").jsonObject
                 .getValue("modelId").jsonPrimitive.content)
             assertEquals(listOf("deepseek-flash"), fake.cloud.chatModels.drop(cloudStart))
+            assertEquals(localGenerationBeforeCloudSend, fake.localGenerationCalls.get())
             val cloudPayload = Json.parseToJsonElement(fake.cloud.chatMessages.last().last()).jsonObject
             assertEquals(comparisonQuestion, cloudPayload.getValue("question").jsonPrimitive.content)
             val cloudAssistant = page.locator(".chat-bubble.assistant").last()
@@ -263,6 +318,10 @@ class BrowserAcceptanceTest {
                 .containsText("Время обработки хода: $cloudElapsedMs мс (retrieval + генерация).")
 
             val localSession = createChatSession(page)
+            val cloudCallsBeforeLocalSelection = fake.cloud.chatModels.size
+            val localCallsBeforeSelection = fake.localGenerationCalls.get()
+            val embeddingsBeforeSelection = fake.embeddingCalls.get()
+            val reranksBeforeSelection = fake.rerankRequests.size
             val providerResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
                 page.locator("#chat-provider-select").selectOption("ollama")
             }
@@ -272,6 +331,11 @@ class BrowserAcceptanceTest {
                 page.locator("#chat-model-select").selectOption("qwen2.5:7b")
             }
             assertEquals(200, modelResponse.status())
+            assertEquals(cloudCallsBeforeLocalSelection, fake.cloud.chatModels.size)
+            assertEquals(localCallsBeforeSelection, fake.localGenerationCalls.get())
+            assertEquals(embeddingsBeforeSelection, fake.embeddingCalls.get())
+            assertEquals(reranksBeforeSelection, fake.rerankRequests.size)
+            val cloudCallsBeforeLocalSend = fake.cloud.chatModels.size
             val localGenerationStart = fake.localGenerationCalls.get()
             val localModelsStart = fake.localModels.size
             val localResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
@@ -288,14 +352,24 @@ class BrowserAcceptanceTest {
             assertEquals("qwen2.5:7b", localSelection.getValue("modelId").jsonPrimitive.content)
             assertTrue(localElapsedMs >= 0)
             assertEquals(1, fake.localGenerationCalls.get() - localGenerationStart)
+            assertEquals(cloudCallsBeforeLocalSend, fake.cloud.chatModels.size)
             assertTrue(fake.localModels.drop(localModelsStart).contains("qwen2.5:7b"))
             assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:7b")
             assertThat(page.locator(".chat-bubble.assistant").last())
                 .containsText("Время обработки хода: $localElapsedMs мс (retrieval + генерация).")
+            val cloudCallsBeforeModelChange = fake.cloud.chatModels.size
+            val localCallsBeforeModelChange = fake.localGenerationCalls.get()
+            val embeddingsBeforeModelChange = fake.embeddingCalls.get()
+            val reranksBeforeModelChange = fake.rerankRequests.size
             val changedModelResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
                 page.locator("#chat-model-select").selectOption("qwen2.5:3b")
             }
             assertEquals(200, changedModelResponse.status())
+            assertEquals(cloudCallsBeforeModelChange, fake.cloud.chatModels.size)
+            assertEquals(localCallsBeforeModelChange, fake.localGenerationCalls.get())
+            assertEquals(embeddingsBeforeModelChange, fake.embeddingCalls.get())
+            assertEquals(reranksBeforeModelChange, fake.rerankRequests.size)
+            val cloudCallsBeforeChangedTurn = fake.cloud.chatModels.size
             val changedGenerationStart = fake.localGenerationCalls.get()
             val changedModelsStart = fake.localModels.size
             val changedTurnResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
@@ -312,6 +386,7 @@ class BrowserAcceptanceTest {
             val changedElapsedMs = changedMessage.getValue("elapsedMs").jsonPrimitive.content.toLong()
             assertTrue(changedElapsedMs >= 0)
             assertEquals(1, fake.localGenerationCalls.get() - changedGenerationStart)
+            assertEquals(cloudCallsBeforeChangedTurn, fake.cloud.chatModels.size)
             assertTrue(fake.localModels.drop(changedModelsStart).contains("qwen2.5:3b"))
             assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
             assertThat(page.locator(".chat-bubble.assistant").last())
@@ -335,7 +410,6 @@ class BrowserAcceptanceTest {
             assertThat(page.locator(".chat-bubble.assistant").first()).containsText("ollama/qwen2.5:7b")
             assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
 
-            val origin = "http://127.0.0.1:${app.server.port}"
             val firstChoice = Json.parseToJsonElement(
                 page.request().get("$origin/api/chat/sessions/$cloudSession").text(),
             ).jsonObject.getValue("session").jsonObject.getValue("modelSelection").jsonObject
@@ -344,6 +418,12 @@ class BrowserAcceptanceTest {
             ).jsonObject.getValue("session").jsonObject.getValue("modelSelection").jsonObject
             assertEquals("fixture", firstChoice.getValue("providerId").jsonPrimitive.content)
             assertEquals("ollama", secondChoice.getValue("providerId").jsonPrimitive.content)
+            assertEquals(
+                benchmarkResultsBefore,
+                Json.parseToJsonElement(get("$origin/api/benchmark/results"))
+                    .jsonObject.getValue("results").jsonArray,
+            )
+            assertEquals(expectedTables, app.databaseTableNames())
         }
     }
 
@@ -1504,11 +1584,14 @@ class BrowserAcceptanceTest {
                         val localGenerationStart = fake.localGenerationCalls.get()
                         val localModelStart = fake.localModels.size
                         val localRerankStart = fake.rerankRequests.size
-                        page.locator("#question").fill("What is the greenhouse payment date?")
+                        val query = "What is the greenhouse payment date?"
+                        val queryEmbeddingStart = fake.embeddingInputs.size
+                        page.locator("#question").fill(query)
                         val queryResponse = page.waitForResponse("**/api/query") {
                             page.locator("#query-button").click()
                         }
                         assertEquals(200, queryResponse.status())
+                        assertTrue(fake.embeddingInputs.drop(queryEmbeddingStart).contains(query))
                         val result = Json.parseToJsonElement(queryResponse.text()).jsonObject
                         val selection = result.getValue("modelSelection").jsonObject
                         assertEquals("ollama", selection.getValue("providerId").jsonPrimitive.content)
@@ -2792,6 +2875,7 @@ class BrowserAcceptanceTest {
         fake: FakeOllama,
         private val modelConfiguration: ModelConfiguration,
     ) : AutoCloseable {
+        private val databasePath = paths.database
         private val index = SqliteIndexRepository(paths.database)
         private val benchmarkStore = BenchmarkStore(paths.database)
         private val chatStore = ChatStore(paths.database)
@@ -2816,6 +2900,19 @@ class BrowserAcceptanceTest {
         init {
             server.start()
         }
+
+        fun databaseTableNames(): Set<String> =
+            DriverManager.getConnection("jdbc:sqlite:${databasePath.toAbsolutePath()}").use { connection ->
+                connection.createStatement().use { statement ->
+                    statement.executeQuery(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                    ).use { rows ->
+                        buildSet {
+                            while (rows.next()) add(rows.getString("name"))
+                        }
+                    }
+                }
+            }
 
         override fun close() {
             server.close()
