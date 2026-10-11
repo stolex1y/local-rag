@@ -2,8 +2,6 @@ package dev.localrag.web
 
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
-import com.sun.net.httpserver.HttpsConfigurator
-import com.sun.net.httpserver.HttpsServer
 import dev.localrag.chat.WorkspaceStore
 import dev.localrag.chat.ChatActiveTurnException
 import dev.localrag.app.ApiException
@@ -25,16 +23,10 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import java.io.FileInputStream
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
-import java.security.KeyStore
-import java.security.MessageDigest
 import java.util.concurrent.Executors
-import javax.net.ssl.KeyManagerFactory
-import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLParameters
 
 @Serializable
 private data class ErrorPayload(val error: ErrorDetail)
@@ -89,11 +81,6 @@ private data class ModelSelectionRequest(val providerId: String, val modelId: St
 
 @Serializable
 private data class SavedResponse(val saved: Boolean)
-@Serializable
-data class AuthStatusResponse(val authenticated: Boolean, val requiresLogin: Boolean)
-
-@Serializable
-private data class LoginRequest(val secret: String)
 
 class LocalHttpServer(
     private val application: ApplicationService,
@@ -112,7 +99,7 @@ class LocalHttpServer(
     }
 
     val port: Int get() = server.address.port
-    val origin: String? get() = config.originFor(port)
+    val origin: String get() = config.originFor(port)
 
     fun start() = server.start()
     private fun handle(exchange: HttpExchange) {
@@ -123,10 +110,8 @@ class LocalHttpServer(
             }
             val path = exchange.requestURI.path
             when {
-                path == "/api/auth/status" && exchange.requestMethod.equals("GET", true) -> handleAuthStatus(exchange)
-                path == "/api/auth/login" && exchange.requestMethod.equals("POST", true) -> handleLogin(exchange)
                 path.startsWith("/api/") -> {
-                    val workspaceId = authenticatedWorkspace(exchange) ?: return
+                    val workspaceId = resolveWorkspace(exchange)
                     handleApi(exchange, path, workspaceId)
                 }
                 else -> handleStatic(exchange, path)
@@ -162,72 +147,27 @@ class LocalHttpServer(
         }
     }
 
-    private fun handleAuthStatus(exchange: HttpExchange) {
-        val token = sessionToken(exchange)
-        if (config.requiresSharedSecret) {
-            val workspaceId = workspaceStore.findWorkspace(token)
-            val authenticated = workspaceId != null && workspaceStore.isAuthenticated(token)
-            if (authenticated && token != null) setWorkspaceCookie(exchange, token)
-            sendJson(exchange, 200, AuthStatusResponse(authenticated, true))
-            return
-        }
-        val session = workspaceStore.resolveOrCreate(token, exchange.remoteAddress.address.isLoopbackAddress)
-        setWorkspaceCookie(exchange, session.token)
-        sendJson(exchange, 200, AuthStatusResponse(true, false))
-    }
 
-    private fun handleLogin(exchange: HttpExchange) {
-        if (!config.requiresSharedSecret) {
-            sendError(exchange, 404, "not_found", "Вход по общему секрету не включён.")
-            return
-        }
-        requireJsonContentType(exchange)
-        val request = readJson<LoginRequest>(exchange)
-        val expected = requireNotNull(config.sharedSecret)
-        if (!MessageDigest.isEqual(expected, request.secret.toByteArray(StandardCharsets.UTF_8))) {
-            sendError(exchange, 401, "authentication_failed", "Общий секрет не принят.")
-            return
-        }
-        val loopbackPeer = exchange.remoteAddress.address.isLoopbackAddress
-        val token = sessionToken(exchange)
-        val existing = workspaceStore.findWorkspace(token)
-        val session = if (existing != null && token != null &&
-            (workspaceStore.isAuthenticated(token) || loopbackPeer)
-        ) {
-            WorkspaceStore.WorkspaceSession(existing, token)
-        } else if (loopbackPeer) {
-            workspaceStore.resolveOrCreate(null, mayClaimLegacyWorkspace = true)
-        } else {
-            workspaceStore.createRemoteWorkspace()
-        }
-        check(workspaceStore.markAuthenticated(session.token)) { "New workspace session could not be authenticated." }
-        setWorkspaceCookie(exchange, session.token)
-        sendJson(exchange, 200, AuthStatusResponse(true, true))
-    }
-
-    private fun authenticatedWorkspace(exchange: HttpExchange): String? {
-        val token = sessionToken(exchange)
-        if (config.requiresSharedSecret) {
-            val workspaceId = workspaceStore.findWorkspace(token)
-            if (workspaceId == null || token == null || !workspaceStore.isAuthenticated(token)) {
-                sendError(exchange, 401, "authentication_required", "Введите общий секрет, чтобы открыть приложение.")
-                return null
-            }
-            setWorkspaceCookie(exchange, token)
-            return workspaceId
-        }
-        val session = workspaceStore.resolveOrCreate(token, exchange.remoteAddress.address.isLoopbackAddress)
+    private fun resolveWorkspace(exchange: HttpExchange): String {
+        val session = workspaceStore.resolveOrCreate(
+            sessionToken(exchange),
+            exchange.remoteAddress.address.isLoopbackAddress,
+        )
         setWorkspaceCookie(exchange, session.token)
         return session.workspaceId
     }
 
-    private fun sessionToken(exchange: HttpExchange): String? =
-        exchange.requestHeaders.getFirst("Cookie")
-            ?.split(';')
-            ?.asSequence()
-            ?.map(String::trim)
-            ?.firstNotNullOfOrNull { part ->
-                part.takeIf { it.startsWith("${WorkspaceStore.SESSION_COOKIE}=") }
+    private fun sessionToken(exchange: HttpExchange): String? {
+        val cookies = exchange.requestHeaders.getFirst("Cookie")?.split(';') ?: return null
+        return cookieValue(cookies, WorkspaceStore.SESSION_COOKIE)
+            ?: cookieValue(cookies, WorkspaceStore.LEGACY_SESSION_COOKIE)
+    }
+
+    private fun cookieValue(cookies: List<String>, name: String): String? =
+        cookies.asSequence()
+            .map(String::trim)
+            .firstNotNullOfOrNull { part ->
+                part.takeIf { it.startsWith("$name=") }
                     ?.substringAfter('=')
                     ?.removeSurrounding("\"")
                     ?.takeIf { token ->
@@ -238,22 +178,17 @@ class LocalHttpServer(
             }
 
     private fun setWorkspaceCookie(exchange: HttpExchange, token: String) {
-        val secure = if (config.usesHttps) "; Secure" else ""
         exchange.responseHeaders.add(
             "Set-Cookie",
-            "${WorkspaceStore.SESSION_COOKIE}=$token; Path=/; HttpOnly; SameSite=Strict; Max-Age=${WorkspaceStore.SESSION_LIFETIME_DAYS * 24 * 60 * 60}$secure",
+            "${WorkspaceStore.SESSION_COOKIE}=$token; Path=/; HttpOnly; SameSite=Strict; Max-Age=${WorkspaceStore.SESSION_LIFETIME_DAYS * 24 * 60 * 60}",
         )
     }
 
     private fun isSafeRequest(exchange: HttpExchange): Boolean {
-        val remoteAddress = exchange.remoteAddress.address
-        if (!config.acceptsHost(exchange.requestHeaders.getFirst("Host"), port, remoteAddress)) return false
+        if (!config.acceptsHost(exchange.requestHeaders.getFirst("Host"), port)) return false
         if (exchange.requestMethod.uppercase() !in MUTATING_METHODS) return true
-        val origin = exchange.requestHeaders.getFirst("Origin")
-        if (config.requiresSharedSecret || config.usesHttps || origin != null) {
-            return config.acceptsOrigin(origin, port, remoteAddress)
-        }
-        return true
+        val origin = exchange.requestHeaders.getFirst("Origin") ?: return true
+        return config.acceptsOrigin(origin, port)
     }
 
     private fun handleApi(exchange: HttpExchange, path: String, workspaceId: String) {
@@ -396,7 +331,6 @@ class LocalHttpServer(
             ?: throw ApiException(500, "ui_missing", "Файл локального интерфейса не найден.")
         exchange.responseHeaders.set("Content-Type", "text/html; charset=utf-8")
         exchange.responseHeaders.set("Cache-Control", "no-store")
-        if (config.usesHttps) exchange.responseHeaders.set("Strict-Transport-Security", "max-age=31536000")
         exchange.responseHeaders.set("X-Content-Type-Options", "nosniff")
         exchange.responseHeaders.set("X-Frame-Options", "DENY")
         exchange.responseHeaders.set("Referrer-Policy", "no-referrer")
@@ -408,34 +342,8 @@ class LocalHttpServer(
         exchange.responseBody.use { it.write(page) }
     }
 
-    private fun createServer(): HttpServer {
-        val address = InetSocketAddress(config.bindAddress, config.port)
-        if (!config.usesHttps) return HttpServer.create(address, 0)
-        val context = createSslContext()
-        return HttpsServer.create(address, 0).apply {
-            httpsConfigurator = object : HttpsConfigurator(context) {
-                override fun configure(parameters: com.sun.net.httpserver.HttpsParameters) {
-                    parameters.setSSLParameters(context.defaultSSLParameters.apply {
-                        protocols = arrayOf("TLSv1.3", "TLSv1.2")
-                    })
-                }
-            }
-        }
-    }
-
-    private fun createSslContext(): SSLContext {
-        val password = requireNotNull(config.keyStorePassword)
-        try {
-            val keyStore = KeyStore.getInstance("PKCS12")
-            FileInputStream(requireNotNull(config.keyStorePath).toFile()).use { keyStore.load(it, password) }
-            val keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply {
-                init(keyStore, password)
-            }
-            return SSLContext.getInstance("TLS").apply { init(keyManagers.keyManagers, null, null) }
-        } finally {
-            password.fill('\u0000')
-        }
-    }
+    private fun createServer(): HttpServer =
+        HttpServer.create(InetSocketAddress(config.bindAddress, config.port), 0)
 
     private fun requireJsonContentType(exchange: HttpExchange) {
         val value = exchange.requestHeaders.getFirst("Content-Type")?.substringBefore(';')?.trim()
@@ -487,7 +395,6 @@ class LocalHttpServer(
         val bytes = json.encodeToString(value).toByteArray(StandardCharsets.UTF_8)
         exchange.responseHeaders.set("Content-Type", "application/json; charset=utf-8")
         exchange.responseHeaders.set("Cache-Control", "no-store")
-        if (config.usesHttps) exchange.responseHeaders.set("Strict-Transport-Security", "max-age=31536000")
         exchange.responseHeaders.set("X-Content-Type-Options", "nosniff")
         exchange.sendResponseHeaders(status, bytes.size.toLong())
         exchange.responseBody.use { it.write(bytes) }

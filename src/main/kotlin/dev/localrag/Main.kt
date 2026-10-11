@@ -30,6 +30,7 @@ import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 
 fun main() {
+    val serverConfig = LocalHttpServerConfig.fromEnvironment()
     val paths = LocalRagPaths.current()
     SqliteIndexRepository(paths.database).use { index ->
         BenchmarkStore(paths.database).use { benchmarkStore ->
@@ -45,6 +46,7 @@ fun main() {
                             Path.of("config/providers.json"),
                             Path.of("config/agent.json"),
                             ollamaBaseUrl,
+                            includeCloud = serverConfig.bindAddress.isLoopbackAddress,
                         )
                         val modelConfiguration = ModelConfiguration(modelCatalog, ModelSelectionStore(paths.modelSelection, modelCatalog), EnvironmentProviderCredentials)
                         val embeddings = OllamaEmbeddingPort(ollama)
@@ -72,13 +74,13 @@ fun main() {
                             chatStore,
                             chatService,
                         )
-                        val serverConfig = LocalHttpServerConfig.fromEnvironment()
                         try {
                             LocalHttpServer(application, workspaceStore, serverConfig).use { server ->
                                 server.start()
-                                val localOrigin = server.origin
-                                    ?: "${if (serverConfig.usesHttps) "https" else "http"}://127.0.0.1:${server.port}"
-                                println("Local RAG доступен: $localOrigin/")
+                                if (!serverConfig.bindAddress.isLoopbackAddress) {
+                                    System.err.println("ПРЕДУПРЕЖДЕНИЕ: LAN HTTP без TLS и входа; любой доступный клиент может использовать общую коллекцию.")
+                                }
+                                println("Local RAG доступен: ${server.origin}/")
                                 CountDownLatch(1).await()
                             }
                         } finally {

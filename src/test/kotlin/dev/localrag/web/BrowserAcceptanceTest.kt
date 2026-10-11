@@ -359,7 +359,7 @@ class BrowserAcceptanceTest {
     }
 
     @Test
-    fun existingLoopbackSessionsMigrateAsUnauthenticated() {
+    fun existingBrowserWorkspaceSessionSurvivesAuthRemoval() {
         val database = temporaryDirectory.resolve("legacy-browser-workspaces.sqlite")
         val token = "synthetic-browser-token-for-migration-0123456789"
         val tokenHash = Base64.getEncoder().encodeToString(
@@ -398,50 +398,15 @@ class BrowserAcceptanceTest {
         }
         WorkspaceStore(database).use { store ->
             assertEquals(ChatStore.LEGACY_OWNER_WORKSPACE_ID, store.findWorkspace(token))
-            assertFalse(store.isAuthenticated(token))
         }
     }
 
     @Test
-    fun sharedSecretHTTPSLoginIsRequiredForSeparateBrowserProfiles() {
-        val keyStore = temporaryDirectory.resolve("secure-browser-test.p12")
-        val keyStorePassword = "synthetic-keystore-password"
-        val keytool = Path.of(System.getProperty("java.home"), "bin", "keytool")
-        val keytoolProcess = ProcessBuilder(
-            keytool.toString(),
-            "-genkeypair",
-            "-alias", "local-rag-test",
-            "-keyalg", "RSA",
-            "-keysize", "2048",
-            "-validity", "1",
-            "-storetype", "PKCS12",
-            "-keystore", keyStore.toString(),
-            "-storepass", keyStorePassword,
-            "-keypass", keyStorePassword,
-            "-dname", "CN=localhost",
-            "-ext", "SAN=dns:localhost,ip:127.0.0.1",
-            "-noprompt",
-        ).redirectOutput(ProcessBuilder.Redirect.DISCARD)
-            .redirectError(ProcessBuilder.Redirect.DISCARD)
-            .start()
-        assertTrue(keytoolProcess.waitFor(30, TimeUnit.SECONDS))
-        assertEquals(0, keytoolProcess.exitValue())
-
-        val sharedSecret = "synthetic-shared-secret-with-at-least-32-bytes"
-        val serverConfig = LocalHttpServerConfig(
-            java.net.InetAddress.getByName("127.0.0.1"),
-            0,
-            URI("https://localhost"),
-            keyStore,
-            keyStorePassword.toCharArray(),
-            sharedSecret,
-        )
+    fun unauthenticatedHttpSharesSourcesAndIsolatesBrowserWorkspaces() {
+        val serverConfig = LocalHttpServerConfig(java.net.InetAddress.getByName("127.0.0.1"), 0)
         FakeOllama().use { fake ->
-            val paths = LocalRagPaths(temporaryDirectory.resolve("secure-browser-app-data"))
+            val paths = LocalRagPaths(temporaryDirectory.resolve("open-http-browser-app-data"))
             Files.createDirectories(paths.dataDirectory)
-            val legacyToken = WorkspaceStore(paths.database).use {
-                it.resolveOrCreate(null, mayClaimLegacyWorkspace = true).token
-            }
             val legacySession = ChatStore(paths.database).use { store ->
                 val session = store.createSession(workspaceId = ChatStore.LEGACY_OWNER_WORKSPACE_ID)
                 store.saveSessionFact(
@@ -458,67 +423,58 @@ class BrowserAcceptanceTest {
                 val browser = playwright.chromium().launch(
                     BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
                 )
-                val ownerContext = browser.newContext(Browser.NewContextOptions().setIgnoreHTTPSErrors(true))
-                val participantContext = browser.newContext(Browser.NewContextOptions().setIgnoreHTTPSErrors(true))
+                val ownerContext = browser.newContext()
+                val participantContext = browser.newContext()
                 try {
-                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake), serverConfig).use { app ->
-                        assertTrue(
-                            serverConfig.acceptsHost(
-                                "127.0.0.1:${app.server.port}",
-                                app.server.port,
-                                java.net.InetAddress.getByName("127.0.0.1"),
-                            ),
-                        )
-                        assertFalse(
-                            serverConfig.acceptsHost(
-                                "127.0.0.1:${app.server.port}",
-                                app.server.port,
-                                java.net.InetAddress.getByName("192.0.2.10"),
-                            ),
-                        )
-                        assertTrue(
-                            serverConfig.acceptsHost(
-                                "localhost:${app.server.port}",
-                                app.server.port,
-                                java.net.InetAddress.getByName("192.0.2.10"),
-                            ),
-                        )
-                        val origin = "https://localhost:${app.server.port}"
-                        val ownerOrigin = "https://127.0.0.1:${app.server.port}"
-                        ownerContext.addCookies(
-                            listOf(
-                                Cookie(WorkspaceStore.SESSION_COOKIE, legacyToken)
-                                    .setUrl("$ownerOrigin/")
-                                    .setSecure(false)
-                                    .setHttpOnly(true),
-                            ),
-                        )
+                    BrowserAppFixture(
+                        paths,
+                        fake,
+                        modelConfiguration(paths, fake, includeCloud = false),
+                        serverConfig,
+                    ).use { app ->
+                        val origin = serverConfig.originFor(app.server.port)
+                        assertTrue(serverConfig.acceptsHost("127.0.0.1:${app.server.port}", app.server.port))
+                        assertFalse(serverConfig.acceptsHost("other-host:${app.server.port}", app.server.port))
+                        assertTrue(serverConfig.acceptsOrigin(origin, app.server.port))
+                        assertFalse(serverConfig.acceptsOrigin("http://attacker.test", app.server.port))
+
                         val owner = ownerContext.newPage()
                         val participant = participantContext.newPage()
                         owner.setDefaultTimeout(30_000.0)
                         participant.setDefaultTimeout(30_000.0)
-
                         owner.onDialog { it.accept() }
                         participant.onDialog { it.accept() }
-                        owner.navigate("$ownerOrigin/")
-                        assertThat(owner.locator("#login-view")).isVisible()
-                        assertEquals(401, owner.request().get("$ownerOrigin/api/chat/sessions").status())
-                        owner.locator("#auth-secret").fill("wrong synthetic secret")
-                        owner.locator("#login-form button[type=submit]").click()
-                        assertThat(owner.locator("#login-error")).containsText("Общий секрет не принят")
-                        assertEquals(401, owner.request().get("$ownerOrigin/api/chat/sessions").status())
-                        assertEquals(
-                            legacyToken,
-                            ownerContext.cookies(ownerOrigin).single { it.name == WorkspaceStore.SESSION_COOKIE }.value,
+                        participant.addInitScript(
+                            """Object.defineProperty(Crypto.prototype, "randomUUID", { configurable: true, value: undefined });""",
                         )
-                        owner.locator("#auth-secret").fill(sharedSecret)
-                        owner.locator("#login-form button[type=submit]").click()
+                        val initialApiEvents = CopyOnWriteArrayList<String>()
+                        owner.onRequest { request ->
+                            URI(request.url()).path.takeIf { it.startsWith("/api/") }
+                                ?.let { initialApiEvents.add("request:$it") }
+                        }
+                        owner.onResponse { response ->
+                            URI(response.url()).path.takeIf { it.startsWith("/api/") }
+                                ?.let { initialApiEvents.add("response:$it") }
+                        }
+
+                        val initialStatus = owner.waitForResponse("**/api/status") {
+                            owner.navigate("$origin/")
+                        }
+                        assertEquals(200, initialStatus.status())
                         assertThat(owner.locator("#app-view")).isVisible()
-                        assertEquals(
-                            legacyToken,
-                            ownerContext.cookies(ownerOrigin).single { it.name == WorkspaceStore.SESSION_COOKIE }.value,
+                        owner.waitForFunction("() => document.querySelectorAll('#provider-select option').length === 1")
+                        assertEquals("ollama", owner.locator("#provider-select").inputValue())
+                        assertEquals(1, owner.locator("#chat-provider-select option").count().toInt())
+                        val firstSessionsResponse = initialApiEvents.indexOf("response:/api/chat/sessions")
+                        val firstOtherRequest = initialApiEvents.indexOfFirst {
+                            it.startsWith("request:") && it != "request:/api/chat/sessions"
+                        }
+                        assertTrue(
+                            firstSessionsResponse >= 0 && firstOtherRequest > firstSessionsResponse,
+                            "The initial workspace cookie must be set before parallel API requests: $initialApiEvents",
                         )
-                        assertTrue(owner.request().get("$ownerOrigin/api/chat/sessions").text().contains(legacySession.id))
+                        assertEquals(200, owner.request().get("$origin/api/chat/sessions").status())
+                        assertTrue(owner.request().get("$origin/api/chat/sessions").text().contains(legacySession.id))
                         assertTrue(
                             ChatStore(paths.database).use {
                                 it.memoryFacts(legacySession.id, ChatStore.LEGACY_OWNER_WORKSPACE_ID)
@@ -542,18 +498,16 @@ class BrowserAcceptanceTest {
                         assertEquals(
                             "running",
                             Json.parseToJsonElement(
-                                owner.request().get("$ownerOrigin/api/chat/sessions/$ownerSession/turns/$ownerTurnId").text(),
+                                owner.request().get("$origin/api/chat/sessions/$ownerSession/turns/$ownerTurnId").text(),
                             ).jsonObject.getValue("state").jsonPrimitive.content,
                         )
 
                         participant.navigate("$origin/")
-                        assertThat(participant.locator("#login-view")).isVisible()
-                        participant.locator("#auth-secret").fill(sharedSecret)
-                        participant.locator("#login-form button[type=submit]").click()
                         assertThat(participant.locator("#app-view")).isVisible()
                         participant.locator("#chat-tab").click()
                         assertThat(participant.locator("#chat-sessions")).containsText("Сессий пока нет.")
                         assertThat(participant.locator("#task-goal")).hasValue("")
+                        assertThat(participant.locator("#source-list")).containsText("greenhouse-chat.md")
 
                         val participantSession = createChatSession(participant)
                         selectLocalChatModel(participant)
@@ -566,6 +520,10 @@ class BrowserAcceptanceTest {
                         assertEquals(202, participantTurnResponse.status())
                         val participantTurnId = Json.parseToJsonElement(participantTurnResponse.text()).jsonObject
                             .getValue("turnId").jsonPrimitive.content
+                        assertTrue(
+                            participantTurnId.matches(Regex("[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")),
+                            "Chat must generate a UUID turn ID without crypto.randomUUID in an insecure HTTP context.",
+                        )
                         assertEquals(
                             "queued",
                             Json.parseToJsonElement(participantTurnResponse.text()).jsonObject
@@ -574,8 +532,9 @@ class BrowserAcceptanceTest {
                         assertEquals(1, fake.localGenerationCalls.get())
                         assertEquals(
                             404,
-                            owner.request().get("$ownerOrigin/api/chat/sessions/$participantSession").status(),
+                            owner.request().get("$origin/api/chat/sessions/$participantSession").status(),
                         )
+
                         val cloudCallsBeforeCompletion = fake.cloud.chatModels.size
                         fake.releaseLocalGeneration.countDown()
                         assertEquals("completed", waitForChatTurn(owner, ownerSession, ownerTurnId)
@@ -583,7 +542,7 @@ class BrowserAcceptanceTest {
                         assertEquals("completed", waitForChatTurn(participant, participantSession, participantTurnId)
                             .getValue("state").jsonPrimitive.content)
                         val ownerDetail = Json.parseToJsonElement(
-                            owner.request().get("$ownerOrigin/api/chat/sessions/$ownerSession").text(),
+                            owner.request().get("$origin/api/chat/sessions/$ownerSession").text(),
                         ).jsonObject
                         val participantDetail = Json.parseToJsonElement(
                             participant.request().get("$origin/api/chat/sessions/$participantSession").text(),
@@ -609,28 +568,11 @@ class BrowserAcceptanceTest {
                         assertEquals(cloudCallsBeforeCompletion, fake.cloud.chatModels.size)
 
                         participant.locator("#collection-tab").click()
-                        assertThat(participant.locator("#source-list")).containsText("greenhouse-chat.md")
                         participant.locator("#source-list button[aria-label^='Удалить источник greenhouse-chat.md']").click()
                         assertThat(participant.locator("#source-list")).not().containsText("greenhouse-chat.md")
                         owner.locator("#collection-tab").click()
                         owner.locator("#refresh-sources").click()
                         assertThat(owner.locator("#source-list")).not().containsText("greenhouse-chat.md")
-                        val sharedSource = temporaryDirectory.resolve("secure-shared-source.md")
-                        Files.writeString(sharedSource, "# Shared HTTPS source\nSynthetic shared content.\n")
-                        participant.locator("#source-files").setInputFiles(sharedSource)
-                        participant.locator("#upload-button").click()
-                        assertThat(participant.locator("#upload-success")).containsText("1 файл(ов) добавлено")
-                        participant.locator("#index-button").click()
-                        assertThat(participant.locator("#index-success")).containsText("Индексация завершена")
-                        owner.locator("#collection-tab").click()
-                        owner.locator("#refresh-sources").click()
-                        assertThat(owner.locator("#source-list")).containsText("secure-shared-source.md")
-
-                        participant.locator("#refresh-sources").click()
-                        participant.locator("#source-list button[aria-label^='Удалить источник secure-shared-source.md']").click()
-                        assertThat(participant.locator("#source-list")).not().containsText("secure-shared-source.md")
-                        owner.locator("#refresh-sources").click()
-                        assertThat(owner.locator("#source-list")).not().containsText("secure-shared-source.md")
                     }
                 } finally {
                     participantContext.close()
@@ -1810,29 +1752,25 @@ class BrowserAcceptanceTest {
                     val page = browser.newPage()
                     page.setDefaultTimeout(30_000.0)
                     val browserErrors = CopyOnWriteArrayList<String>()
-                    val authResponses = CopyOnWriteArrayList<Int>()
                     page.onPageError { browserErrors.add(it) }
                     page.onConsoleMessage { message ->
                         if (message.type() == "error") browserErrors.add(message.text())
-                    }
-                    page.onResponse { response ->
-                        if (response.url().endsWith("/api/auth/status")) authResponses.add(response.status())
                     }
                     BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { app ->
                         val navigation = page.navigate("http://127.0.0.1:${app.server.port}/")
                         assertEquals(200, navigation?.status())
                         page.setDefaultTimeout(5_000.0)
                         try {
-                            page.waitForFunction("() => !document.querySelector('#app-view').hidden || !document.querySelector('#login-view').hidden")
+                            page.waitForFunction("() => !document.querySelector('#app-view').hidden")
                         } catch (error: RuntimeException) {
                             throw AssertionError(
-                                "Local RAG bootstrap did not finish; auth responses=$authResponses, browser errors=$browserErrors.",
+                                "Local RAG bootstrap did not finish; browser errors=$browserErrors.",
                                 error,
                             )
                         }
                         assertTrue(
                             page.locator("#app-view").isVisible(),
-                            "The test browser must authenticate automatically in loopback mode; auth responses=$authResponses, browser errors=$browserErrors.",
+                            "The test browser should open Local RAG without an authentication flow; browser errors=$browserErrors.",
                         )
                         page.setDefaultTimeout(30_000.0)
                         block(page, app, fake)
@@ -2024,7 +1962,7 @@ class BrowserAcceptanceTest {
                         )
                         val benchmark = BenchmarkRunner(rag, benchmarkStore, index)
                         val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration, chatStore, chatService)
-                        val serverConfig = LocalHttpServerConfig(java.net.InetAddress.getByName("127.0.0.1"), 0, null, null, null, null)
+                        val serverConfig = LocalHttpServerConfig(java.net.InetAddress.getByName("127.0.0.1"), 0)
                         try {
                             LocalHttpServer(application, workspaceStore, serverConfig).use { server ->
                                 server.start()
@@ -3413,21 +3351,29 @@ class BrowserAcceptanceTest {
         return response.body()
     }
 
-    private fun modelConfiguration(paths: LocalRagPaths, fake: FakeOllama): ModelConfiguration {
-        val selection = ModelSelection("fixture", "deepseek-flash")
-        val catalog = ProviderCatalog.create(
-            listOf(
-                ProviderDefinition(
-                    "fixture",
-                    "Fixture provider",
-                    fake.cloud.uri.toString(),
-                    "/chat/completions",
-                    "FIXTURE_API_KEY",
-                    listOf(
-                        ProviderModelDefinition(selection.modelId, "Fixture Flash"),
-                        ProviderModelDefinition("deepseek-v4-pro", "Fixture V4 Pro"),
+    private fun modelConfiguration(
+        paths: LocalRagPaths,
+        fake: FakeOllama,
+        includeCloud: Boolean = true,
+    ): ModelConfiguration {
+        val cloudSelection = ModelSelection("fixture", "deepseek-flash")
+        val providers = buildList {
+            if (includeCloud) {
+                add(
+                    ProviderDefinition(
+                        "fixture",
+                        "Fixture provider",
+                        fake.cloud.uri.toString(),
+                        "/chat/completions",
+                        "FIXTURE_API_KEY",
+                        listOf(
+                            ProviderModelDefinition(cloudSelection.modelId, "Fixture Flash"),
+                            ProviderModelDefinition("deepseek-v4-pro", "Fixture V4 Pro"),
+                        ),
                     ),
-                ),
+                )
+            }
+            add(
                 ProviderDefinition(
                     "ollama",
                     "Local / Ollama",
@@ -3441,8 +3387,12 @@ class BrowserAcceptanceTest {
                     ),
                     kind = ProviderKind.OLLAMA,
                 ),
-            ),
-            selection,
+            )
+        }
+        val defaultSelection = if (includeCloud) cloudSelection else ModelSelection("ollama", "qwen2.5:3b")
+        val catalog = ProviderCatalog.create(
+            providers,
+            defaultSelection,
             allowLoopbackHttpForTests = true,
         )
         return ModelConfiguration(
@@ -3467,7 +3417,7 @@ class BrowserAcceptanceTest {
         fake: FakeOllama,
         private val modelConfiguration: ModelConfiguration,
         private val serverConfig: LocalHttpServerConfig = LocalHttpServerConfig(
-            java.net.InetAddress.getByName("127.0.0.1"), 0, null, null, null, null,
+            java.net.InetAddress.getByName("127.0.0.1"), 0,
         ),
     ) : AutoCloseable {
         private val databasePath = paths.database

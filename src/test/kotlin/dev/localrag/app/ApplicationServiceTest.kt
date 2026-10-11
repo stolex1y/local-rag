@@ -80,73 +80,39 @@ class ApplicationServiceTest {
 
 
     @Test
-    fun `LAN bind rejects cleartext and missing shared secret`() {
-        val externalAddress = java.net.InetAddress.getByName("0.0.0.0")
+    fun `LAN bind is restricted to approved Wi-Fi address and port`() {
         assertFailsWith<IllegalArgumentException> {
-            LocalHttpServerConfig(externalAddress, 8765, null, null, null, null)
+            LocalHttpServerConfig(java.net.InetAddress.getByName("0.0.0.0"), 8767)
         }
         assertFailsWith<IllegalArgumentException> {
-            LocalHttpServerConfig(
-                externalAddress,
-                8765,
-                URI("https://localhost:8765"),
-                Path.of("not-read-by-config.p12"),
-                "synthetic-password".toCharArray(),
-                null,
-            )
+            LocalHttpServerConfig(java.net.InetAddress.getByName("203.0.113.10"), 8767)
         }
+        assertFailsWith<IllegalArgumentException> {
+            LocalHttpServerConfig(java.net.InetAddress.getByName("192.168.2.161"), 8767)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LocalHttpServerConfig(java.net.InetAddress.getByName("192.168.2.160"), 8766)
+        }
+
+        val config = LocalHttpServerConfig(java.net.InetAddress.getByName("192.168.2.160"), 8767)
+        assertEquals("http://192.168.2.160:8767", config.originFor(8767))
+        assertTrue(config.acceptsHost("192.168.2.160:8767", 8767))
+        assertFalse(config.acceptsHost("another-host:8767", 8767))
+        assertTrue(config.acceptsOrigin("http://192.168.2.160:8767", 8767))
+        assertFalse(config.acceptsOrigin("http://attacker.test", 8767))
     }
 
     @Test
-    fun `LAN server requires HTTPS secret and gives browsers isolated workspaces`() {
-        val password = "synthetic-test-password"
-        val keyStore = temporaryDirectory.resolve("local-rag-test.p12")
-        val keyTool = Path.of(System.getProperty("java.home"), "bin", "keytool").toString()
-        val process = ProcessBuilder(
-            keyTool,
-            "-genkeypair",
-            "-alias", "local-rag-test",
-            "-keyalg", "RSA",
-            "-keysize", "2048",
-            "-validity", "2",
-            "-storetype", "PKCS12",
-            "-keystore", keyStore.toString(),
-            "-storepass", password,
-            "-keypass", password,
-            "-dname", "CN=localhost",
-            "-ext", "SAN=dns:localhost",
-            "-noprompt",
-        ).redirectOutput(ProcessBuilder.Redirect.DISCARD)
-            .redirectError(ProcessBuilder.Redirect.DISCARD)
-            .start()
-        assertTrue(process.waitFor(30, TimeUnit.SECONDS))
-        assertEquals(0, process.exitValue())
-
-        val secret = "synthetic-shared-secret-with-at-least-32-bytes"
-        val serverConfig = LocalHttpServerConfig(
-            java.net.InetAddress.getByName("127.0.0.1"),
-            0,
-            URI("https://localhost"),
-            keyStore,
-            password.toCharArray(),
-            secret,
-        )
+    fun `HTTP API works without login and keeps browser workspaces isolated`() {
+        val serverConfig = LocalHttpServerConfig(java.net.InetAddress.getByName("127.0.0.1"), 0)
         FakeOllama().use { ollama ->
             val fixture = LocalRagFixture(temporaryDirectory, ollama, serverConfig)
             try {
                 fixture.server.start()
-                val origin = "https://localhost:${fixture.server.port}"
-                val trustManager = object : javax.net.ssl.X509TrustManager {
-                    override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) = Unit
-                    override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) = Unit
-                    override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
-                }
-                val sslContext = javax.net.ssl.SSLContext.getInstance("TLS").apply {
-                    init(null, arrayOf(trustManager), java.security.SecureRandom())
-                }
+                val origin = serverConfig.originFor(fixture.server.port)
                 fun client(): HttpClient {
                     val cookies = java.net.CookieManager(null, java.net.CookiePolicy.ACCEPT_ALL)
-                    return HttpClient.newBuilder().sslContext(sslContext).cookieHandler(cookies).build()
+                    return HttpClient.newBuilder().cookieHandler(cookies).build()
                 }
                 fun request(
                     client: HttpClient,
@@ -165,23 +131,14 @@ class ApplicationServiceTest {
                     )
                 }
 
-                val unauthenticated = client()
-                val status = request(unauthenticated, "GET", "/api/auth/status")
-                assertEquals(200, status.statusCode())
-                assertFalse(json(status.body()).jsonObject.getValue("authenticated").jsonPrimitive.content.toBoolean())
-                assertEquals(401, request(unauthenticated, "GET", "/api/chat/sessions").statusCode())
-                val wrongLogin = request(unauthenticated, "POST", "/api/auth/login", """{"secret":"wrong"}""")
-                assertEquals(401, wrongLogin.statusCode())
-
                 val owner = client()
-                val loginBody = Json.encodeToString(buildJsonObject { put("secret", secret) })
-                assertEquals(200, request(owner, "POST", "/api/auth/login", loginBody).statusCode())
+                val participant = client()
+                assertEquals(200, request(owner, "GET", "/api/chat/sessions").statusCode())
                 val created = request(owner, "POST", "/api/chat/sessions", "{}")
                 assertEquals(201, created.statusCode(), created.body())
-                val sessionId = json(created.body()).jsonObject.getValue("session").jsonObject.getValue("id").jsonPrimitive.content
+                val sessionId = json(created.body()).jsonObject
+                    .getValue("session").jsonObject.getValue("id").jsonPrimitive.content
 
-                val participant = client()
-                assertEquals(200, request(participant, "POST", "/api/auth/login", loginBody).statusCode())
                 assertTrue(json(request(participant, "GET", "/api/chat/sessions").body()).jsonArray.isEmpty())
                 assertEquals(404, request(participant, "GET", "/api/chat/sessions/$sessionId").statusCode())
                 assertEquals(1, json(request(owner, "GET", "/api/chat/sessions").body()).jsonArray.size)
@@ -196,27 +153,102 @@ class ApplicationServiceTest {
     }
 
     @Test
-    fun `loopback workspace cookie is renewed on active status and API responses`() {
+    fun `local-only model catalog rejects Cloud selection over HTTP API`() {
+        val serverConfig = LocalHttpServerConfig(java.net.InetAddress.getByName("127.0.0.1"), 0)
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama, serverConfig, includeCloud = false)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                val options = json(api.get("/api/models").body()).jsonObject
+                assertEquals(
+                    listOf("ollama"),
+                    options.getValue("providers").jsonArray.map {
+                        it.jsonObject.getValue("id").jsonPrimitive.content
+                    },
+                )
+
+                val cloudSelection = api.putJson(
+                    "/api/models/selection",
+                    """{"providerId":"fixture","modelId":"fixture-chat"}""",
+                )
+                assertEquals(400, cloudSelection.statusCode())
+                assertTrue(cloudSelection.body().contains("invalid_model_selection"))
+                assertEquals(0, fixture.generationCalls.get())
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `workspace cookie is renewed on workspace API responses`() {
         FakeOllama().use { ollama ->
             val fixture = LocalRagFixture(temporaryDirectory, ollama)
             try {
                 fixture.server.start()
                 val api = ApiClient(fixture.server.port)
-                val initial = api.get("/api/auth/status")
+                val initial = api.get("/api/chat/sessions")
                 assertEquals(200, initial.statusCode())
                 val firstCookie = initial.headers().allValues("Set-Cookie").single()
+                assertTrue(firstCookie.startsWith("local_rag_workspace_http="))
                 val token = firstCookie.substringBefore(';')
+                assertFalse(firstCookie.contains("; Secure"))
                 assertTrue(firstCookie.contains("Max-Age=2592000"))
 
-                val refreshed = api.get("/api/auth/status")
+                val refreshed = api.get("/api/chat/sessions")
                 assertEquals(200, refreshed.statusCode())
                 val refreshedCookie = refreshed.headers().allValues("Set-Cookie").single()
                 assertEquals(token, refreshedCookie.substringBefore(';'))
                 assertTrue(refreshedCookie.contains("Max-Age=2592000"))
+            } finally {
+                fixture.close()
+            }
+        }
+    }
 
-                val sessions = api.get("/api/chat/sessions")
-                assertEquals(200, sessions.statusCode())
-                assertEquals(token, sessions.headers().allValues("Set-Cookie").single().substringBefore(';'))
+    @Test
+    fun `legacy browser cookie upgrades without losing its workspace`() {
+        val directory = temporaryDirectory.resolve("legacy-cookie-upgrade")
+        java.nio.file.Files.createDirectories(directory)
+        val database = directory.resolve("v11.sqlite")
+        val legacySession = dev.localrag.chat.WorkspaceStore(database).use { workspaces ->
+            workspaces.resolveOrCreate(null, mayClaimLegacyWorkspace = false)
+        }
+        val legacySessionId = ChatStore(database).use { it.createSession(workspaceId = legacySession.workspaceId).session.id }
+
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(directory, ollama)
+            try {
+                fixture.server.start()
+                val origin = "http://127.0.0.1:${fixture.server.port}"
+                val cookies = java.net.CookieManager(null, java.net.CookiePolicy.ACCEPT_ALL)
+                cookies.cookieStore.add(
+                    URI(origin),
+                    java.net.HttpCookie(dev.localrag.chat.WorkspaceStore.LEGACY_SESSION_COOKIE, legacySession.token)
+                        .apply { path = "/" },
+                )
+                val client = HttpClient.newBuilder().cookieHandler(cookies).build()
+                fun listSessions(): HttpResponse<String> = client.send(
+                    HttpRequest.newBuilder(URI("$origin/api/chat/sessions")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString(),
+                )
+
+                val first = listSessions()
+                assertEquals(200, first.statusCode())
+                val firstSessionIds = json(first.body()).jsonArray.map {
+                    it.jsonObject.getValue("id").jsonPrimitive.content
+                }
+                assertTrue(legacySessionId in firstSessionIds)
+                val upgradedCookie = first.headers().allValues("Set-Cookie").single()
+                assertTrue(upgradedCookie.startsWith("local_rag_workspace_http=${legacySession.token}"))
+
+                val second = listSessions()
+                assertEquals(200, second.statusCode())
+                val secondSessionIds = json(second.body()).jsonArray.map {
+                    it.jsonObject.getValue("id").jsonPrimitive.content
+                }
+                assertTrue(legacySessionId in secondSessionIds)
             } finally {
                 fixture.close()
             }
@@ -1197,8 +1229,9 @@ class ApplicationServiceTest {
         directory: Path,
         ollama: FakeOllama,
         serverConfig: LocalHttpServerConfig = LocalHttpServerConfig(
-            java.net.InetAddress.getByName("127.0.0.1"), 0, null, null, null, null,
+            java.net.InetAddress.getByName("127.0.0.1"), 0,
         ),
+        includeCloud: Boolean = true,
     ) : AutoCloseable {
         val database = directory.resolve("v11.sqlite")
         val sourcesDirectory = directory.resolve("sources")
@@ -1214,33 +1247,39 @@ class ApplicationServiceTest {
         private val embeddings = OllamaEmbeddingPort(api)
         private val selection = ModelSelection("fixture", "fixture-chat")
         private val providers = ProviderCatalog.create(
-            listOf(
-                ProviderDefinition(
-                    "fixture",
-                    "Fixture provider",
-                    "https://api.deepseek.com",
-                    "/chat/completions",
-                    "FIXTURE_API_KEY",
-                    listOf(
-                        ProviderModelDefinition("fixture-chat", "Fixture chat"),
-                        ProviderModelDefinition("fixture-chat-alt", "Fixture chat alternate"),
+            buildList {
+                if (includeCloud) {
+                    add(
+                        ProviderDefinition(
+                            "fixture",
+                            "Fixture provider",
+                            "https://api.deepseek.com",
+                            "/chat/completions",
+                            "FIXTURE_API_KEY",
+                            listOf(
+                                ProviderModelDefinition("fixture-chat", "Fixture chat"),
+                                ProviderModelDefinition("fixture-chat-alt", "Fixture chat alternate"),
+                            ),
+                        ),
+                    )
+                }
+                add(
+                    ProviderDefinition(
+                        "ollama",
+                        "Local / Ollama",
+                        ollama.uri.toString(),
+                        "/v1/chat/completions",
+                        null,
+                        listOf(
+                            ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
+                            ProviderModelDefinition("qwen2.5:3b-instruct-q5_K_M", "Qwen 2.5 3B Q5_K_M"),
+                            ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
+                        ),
+                        ProviderKind.OLLAMA,
                     ),
-                ),
-                ProviderDefinition(
-                    "ollama",
-                    "Local / Ollama",
-                    ollama.uri.toString(),
-                    "/v1/chat/completions",
-                    null,
-                    listOf(
-                        ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
-                        ProviderModelDefinition("qwen2.5:3b-instruct-q5_K_M", "Qwen 2.5 3B Q5_K_M"),
-                        ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
-                    ),
-                    ProviderKind.OLLAMA,
-                ),
-            ),
-            selection,
+                )
+            },
+            if (includeCloud) selection else ModelSelection("ollama", "qwen2.5:3b"),
         )
         private val modelConfiguration = ModelConfiguration(
             providers,

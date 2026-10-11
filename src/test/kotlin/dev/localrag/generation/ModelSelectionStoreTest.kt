@@ -64,6 +64,28 @@ class ModelSelectionStoreTest {
     }
 
     @Test
+    fun `LAN runtime catalog is local only and rejects a saved cloud selection`() {
+        val catalog = ProviderCatalog.load(
+            Path.of("config/providers.json"),
+            Path.of("config/agent.json"),
+            includeCloud = false,
+        )
+        val settingsPath = temporaryDirectory.resolve("lan/model-selection.json")
+        Files.createDirectories(settingsPath.parent)
+        Files.writeString(settingsPath, """{"providerId":"deepseek","modelId":"deepseek-flash"}""")
+
+        val store = ModelSelectionStore(settingsPath, catalog)
+
+        assertEquals(listOf("ollama"), catalog.providers.map { it.id })
+        assertEquals(ModelSelection("ollama", "qwen2.5:3b"), catalog.defaultSelection)
+        assertEquals(catalog.defaultSelection, store.currentSelection())
+        assertNotNull(store.warning())
+        assertFailsWith<IllegalArgumentException> {
+            catalog.requireSelection(ModelSelection("deepseek", "deepseek-flash"))
+        }
+    }
+
+    @Test
     fun `provider model options reflect Ollama tags and cloud credentials`() {
         val catalog = catalog()
         val configuration = ModelConfiguration(

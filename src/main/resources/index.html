@@ -153,8 +153,6 @@
       .rating-form { grid-template-columns: 1fr; }
       .rating-note { grid-column: auto; }
     }
-    .login-panel { max-width: 34rem; margin: 2rem auto; }
-    .login-form { display: grid; gap: .75rem; }
     .chat-progress { display: flex; align-items: center; gap: .65rem; margin: .75rem 0; color: var(--accent-dark); font-weight: 600; }
     #chat-progress[hidden] { display: none; }
     .chat-spinner { width: 1.1rem; height: 1.1rem; flex: 0 0 auto; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: chat-spin .8s linear infinite; }
@@ -169,19 +167,8 @@
       <h1>Соберите коллекцию и задавайте вопросы по источникам</h1>
     </div>
   </header>
-  <section id="login-view" class="wrap" hidden>
-    <div class="panel login-panel">
-      <h2>Доступ к Local RAG</h2>
-      <p class="muted">Введите общий секрет владельца приложения. Работает только через доверенный HTTPS-адрес.</p>
-      <form id="login-form" class="login-form">
-        <label for="auth-secret">Общий секрет</label>
-        <input id="auth-secret" type="password" autocomplete="current-password" required>
-        <button type="submit">Войти</button>
-      </form>
-      <p id="login-error" class="error" role="alert" hidden></p>
-    </div>
-  </section>
   <main id="app-view" class="wrap" hidden>
+    <p class="notice" role="note">При привязке к сетевому IP приложение работает без TLS и входа: любой доступный клиент может просматривать и менять общую коллекцию. По HTTP cookie сессии передаётся открыто; используйте режим только в доверенной сети.</p>
     <section class="panel" aria-labelledby="status-heading">
       <div class="panel-head">
         <div><h2 id="status-heading">Состояние коллекции и модели</h2></div>
@@ -1600,6 +1587,14 @@
         }
       }
 
+      function createTurnId() {
+        if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+        return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, character => {
+          const random = Math.floor(Math.random() * 16);
+          return (character === "x" ? random : (random & 0x3) | 0x8).toString(16);
+        });
+      }
+
       async function sendChatTurn(retryTurnId = null, retryQuestion = null) {
         if (chatState.busy || chatState.loadingSession || chatState.modelSelectionPending || chatState.modelSelectionUncertain) return;
         if (!chatState.sessionId) {
@@ -1611,7 +1606,7 @@
         const question = pending?.question || $("#chat-question").value.trim();
         if (!question) return;
         const sessionId = chatState.sessionId;
-        const turnId = pending?.turnId || crypto.randomUUID();
+        const turnId = pending?.turnId || createTurnId();
         chatState.pendingTurn = { turnId, question, state: "queued", error: null, accepted: false };
         updateChatControls();
         updateChatProgress();
@@ -1738,28 +1733,13 @@
         await loadChatFromUrl();
       }
 
-      async function showAuthenticatedApp() {
-        $("#login-view").hidden = true;
+      async function showApp() {
         $("#app-view").hidden = false;
+        await request("/api/chat/sessions");
         await initializeTabs();
         await refresh();
       }
 
-      $("#login-form").addEventListener("submit", async event => {
-        event.preventDefault();
-        const button = event.currentTarget.querySelector("button[type=submit]");
-        button.disabled = true;
-        message("login-error", "");
-        try {
-          await request("/api/auth/login", jsonOptions("POST", { secret: $("#auth-secret").value }));
-          $("#auth-secret").value = "";
-          await showAuthenticatedApp();
-        } catch (error) {
-          message("login-error", error.message);
-        } finally {
-          button.disabled = false;
-        }
-      });
 
       $("#refresh-button").addEventListener("click", refresh);
       $("#refresh-sources").addEventListener("click", refreshSources);
@@ -1772,19 +1752,7 @@
       $("#benchmark-upload").addEventListener("click", uploadBenchmark);
       $("#benchmark-run").addEventListener("click", runBenchmark);
       $("#benchmark-refresh").addEventListener("click", refresh);
-      (async () => {
-        try {
-          const auth = await request("/api/auth/status");
-          if (auth.authenticated) await showAuthenticatedApp();
-          else {
-            $("#login-view").hidden = false;
-            $("#auth-secret").focus();
-          }
-        } catch (error) {
-          $("#login-view").hidden = false;
-          message("login-error", error.message);
-        }
-      })();
+      showApp().catch(error => message("status-error", error.message));
     })();
   </script>
 </body>

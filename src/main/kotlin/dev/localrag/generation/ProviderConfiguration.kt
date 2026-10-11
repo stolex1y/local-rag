@@ -111,11 +111,16 @@ class ProviderCatalog private constructor(
             providersPath: Path,
             agentPath: Path,
             ollamaBaseUrl: URI = URI("http://127.0.0.1:11434"),
+            includeCloud: Boolean = true,
         ): ProviderCatalog {
-            val cloudProviders = try {
-                json.decodeFromString<ProviderCatalogDocument>(Files.readString(providersPath)).providers
-            } catch (_: Exception) {
-                throw ModelConfigurationException("Не удалось прочитать config/providers.json.")
+            val cloudProviders = if (includeCloud) {
+                try {
+                    json.decodeFromString<ProviderCatalogDocument>(Files.readString(providersPath)).providers
+                } catch (_: Exception) {
+                    throw ModelConfigurationException("Не удалось прочитать config/providers.json.")
+                }
+            } else {
+                emptyList()
             }
             val defaults = try {
                 json.decodeFromString<AgentDefaults>(Files.readString(agentPath))
@@ -135,10 +140,12 @@ class ProviderCatalog private constructor(
                 ),
                 kind = ProviderKind.OLLAMA,
             )
-            return create(
-                cloudProviders + ollama,
-                ModelSelection(defaults.defaultProviderId, defaults.defaultModelId),
-            )
+            val defaultSelection = if (includeCloud) {
+                ModelSelection(defaults.defaultProviderId, defaults.defaultModelId)
+            } else {
+                ModelSelection(ollama.id, ollama.models.first().id)
+            }
+            return create(cloudProviders + ollama, defaultSelection)
         }
 
         fun create(

@@ -11,7 +11,7 @@ import java.time.temporal.ChronoUnit
 import java.util.Base64
 import java.util.UUID
 
-/** Persistent, opaque browser credentials mapped to isolated chat workspaces. */
+/** Persistent, opaque browser session tokens mapped to isolated chat workspaces. */
 class WorkspaceStore(databasePath: Path) : AutoCloseable {
     private val connection: Connection = DriverManager.getConnection(
         "jdbc:sqlite:${databasePath.toAbsolutePath().normalize()}",
@@ -36,18 +36,9 @@ class WorkspaceStore(databasePath: Path) : AutoCloseable {
                         token_hash TEXT PRIMARY KEY,
                         workspace_id TEXT NOT NULL REFERENCES browser_workspaces(workspace_id) ON DELETE CASCADE,
                         created_at TEXT NOT NULL,
-                        expires_at TEXT NOT NULL,
-                        authenticated INTEGER NOT NULL DEFAULT 0
+                        expires_at TEXT NOT NULL
                     )""".trimIndent(),
                 )
-                val columns = statement.executeQuery("PRAGMA table_info(browser_workspace_sessions)").use { rows ->
-                    buildSet { while (rows.next()) add(rows.getString("name")) }
-                }
-                if ("authenticated" !in columns) {
-                    statement.execute(
-                        "ALTER TABLE browser_workspace_sessions ADD COLUMN authenticated INTEGER NOT NULL DEFAULT 0",
-                    )
-                }
                 statement.execute(
                     """CREATE TABLE IF NOT EXISTS browser_workspace_settings (
                         setting_key TEXT PRIMARY KEY,
@@ -86,29 +77,6 @@ class WorkspaceStore(databasePath: Path) : AutoCloseable {
     @Synchronized
     fun findWorkspace(token: String?): String? = token?.let(::workspaceForToken)
 
-    @Synchronized
-    fun isAuthenticated(token: String?): Boolean = token?.let(::authenticatedForToken) ?: false
-
-    @Synchronized
-    fun markAuthenticated(token: String): Boolean {
-        if (token.length !in 32..128) return false
-        val now = Instant.now().toString()
-        return connection.prepareStatement(
-            "UPDATE browser_workspace_sessions SET authenticated=1,expires_at=? WHERE token_hash=? AND expires_at>?",
-        ).use { statement ->
-            statement.setString(1, Instant.now().plus(SESSION_LIFETIME_DAYS, ChronoUnit.DAYS).toString())
-            statement.setString(2, tokenHash(token))
-            statement.setString(3, now)
-            statement.executeUpdate() == 1
-        }
-    }
-
-    @Synchronized
-    fun createRemoteWorkspace(): WorkspaceSession {
-        val workspaceId = UUID.randomUUID().toString()
-        insertWorkspaceIfMissing(workspaceId)
-        return issueSession(workspaceId)
-    }
 
     private fun workspaceForToken(token: String): String? {
         if (token.length !in 32..128) return null
@@ -137,17 +105,6 @@ class WorkspaceStore(databasePath: Path) : AutoCloseable {
         return workspaceId
     }
 
-    private fun authenticatedForToken(token: String): Boolean {
-        if (token.length !in 32..128) return false
-        val now = Instant.now()
-        return connection.prepareStatement(
-            "SELECT authenticated FROM browser_workspace_sessions WHERE token_hash=? AND expires_at>?",
-        ).use { statement ->
-            statement.setString(1, tokenHash(token))
-            statement.setString(2, now.toString())
-            statement.executeQuery().use { rows -> rows.next() && rows.getInt(1) == 1 }
-        }
-    }
 
     private fun issueSession(workspaceId: String): WorkspaceSession {
         val bytes = ByteArray(TOKEN_BYTES).also(SECURE_RANDOM::nextBytes)
@@ -206,7 +163,8 @@ class WorkspaceStore(databasePath: Path) : AutoCloseable {
     data class WorkspaceSession(val workspaceId: String, val token: String)
 
     companion object {
-        const val SESSION_COOKIE = "local_rag_workspace"
+        const val SESSION_COOKIE = "local_rag_workspace_http"
+        const val LEGACY_SESSION_COOKIE = "local_rag_workspace"
         const val SESSION_LIFETIME_DAYS = 30L
         private const val SESSION_REFRESH_THRESHOLD_DAYS = SESSION_LIFETIME_DAYS - 1
         private const val TOKEN_BYTES = 32
