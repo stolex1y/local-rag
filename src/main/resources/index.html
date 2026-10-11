@@ -1619,7 +1619,7 @@
           }));
           const acceptedTurn = { turnId, question, state: job.state, error: job.error || null, accepted: true };
           if (chatState.sessionId === sessionId) chatState.pendingTurn = acceptedTurn;
-          else ensureTurnPolling(sessionId, acceptedTurn);
+          ensureTurnPolling(sessionId, acceptedTurn);
           if (!retryTurnId) $("#chat-question").value = "";
           if (chatState.sessionId === sessionId) {
             await refreshChat(sessionId);
@@ -1734,11 +1734,18 @@
       }
 
       async function showApp() {
-        $("#app-view").hidden = false;
         await request("/api/chat/sessions");
         await initializeTabs();
         await refresh();
+        $("#app-view").hidden = false;
       }
+
+      async function showAppError(error) {
+        $("#app-view").hidden = false;
+        message("status-error", error.message);
+      }
+
+
 
 
       $("#refresh-button").addEventListener("click", refresh);
@@ -1752,7 +1759,7 @@
       $("#benchmark-upload").addEventListener("click", uploadBenchmark);
       $("#benchmark-run").addEventListener("click", runBenchmark);
       $("#benchmark-refresh").addEventListener("click", refresh);
-      showApp().catch(error => message("status-error", error.message));
+      showApp().catch(showAppError);
     })();
   </script>
 </body>

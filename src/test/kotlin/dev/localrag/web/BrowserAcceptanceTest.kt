@@ -447,6 +447,23 @@ class BrowserAcceptanceTest {
                         participant.addInitScript(
                             """Object.defineProperty(Crypto.prototype, "randomUUID", { configurable: true, value: undefined });""",
                         )
+                        owner.addInitScript(
+                            """
+                            (() => {
+                              const gate = window.__startupGate = { held: false, release: null };
+                              const originalFetch = window.fetch.bind(window);
+                              window.fetch = async (input, init = {}) => {
+                                const url = typeof input === "string" ? input : input.url;
+                                const method = (init.method || (typeof input === "string" ? "GET" : input.method)).toUpperCase();
+                                if (method === "GET" && new URL(url, location.href).pathname === "/api/chat/sessions" && !gate.held) {
+                                  gate.held = true;
+                                  await new Promise(resolve => { gate.release = resolve; });
+                                }
+                                return originalFetch(input, init);
+                              };
+                            })();
+                            """.trimIndent(),
+                        )
                         val initialApiEvents = CopyOnWriteArrayList<String>()
                         owner.onRequest { request ->
                             URI(request.url()).path.takeIf { it.startsWith("/api/") }
@@ -457,10 +474,14 @@ class BrowserAcceptanceTest {
                                 ?.let { initialApiEvents.add("response:$it") }
                         }
 
+                        owner.navigate("$origin/")
+                        owner.waitForFunction("() => window.__startupGate.held")
+                        assertFalse(owner.locator("#app-view").isVisible)
                         val initialStatus = owner.waitForResponse("**/api/status") {
-                            owner.navigate("$origin/")
+                            owner.evaluate("() => window.__startupGate.release()")
                         }
                         assertEquals(200, initialStatus.status())
+                        owner.locator("#app-view").waitFor()
                         assertThat(owner.locator("#app-view")).isVisible()
                         owner.waitForFunction("() => document.querySelectorAll('#provider-select option').length === 1")
                         assertEquals("ollama", owner.locator("#provider-select").inputValue())
@@ -1395,6 +1416,9 @@ class BrowserAcceptanceTest {
             val sessionA = createChatSession(page)
             val seedResponse = submitChatQuestion(page, "auto-memory-seed session-A")
             assertLongTurnCitation(page, seedResponse)
+            page.waitForFunction(
+                "() => document.querySelector('#shared-memory-list')?.textContent.includes('Shared synthetic preference')",
+            )
             assertThat(page.locator("#shared-memory-list")).containsText("Shared synthetic preference")
             assertThat(page.locator("#chat-view")).not().containsText("Факты этой сессии")
             assertEquals(0, page.locator("#session-memory-list").count())
@@ -1464,6 +1488,62 @@ class BrowserAcceptanceTest {
             assertThat(page.locator("#chat-messages")).containsText("session-B shared memory")
             assertThat(page.locator("#shared-memory-list")).containsText("Shared synthetic preference")
             assertEquals("Goal B", page.locator("#task-goal").inputValue())
+        }
+    }
+
+    @Test
+    fun chatReportsFastTurnFailureAfterInitialRefresh() {
+        withChatBrowser { page, _, fake ->
+            page.locator("#chat-tab").click()
+            val sessionId = createChatSession(page)
+            selectLocalChatModel(page)
+            fake.failLocalGeneration.set(true)
+            page.evaluate(
+                """
+                sessionId => {
+                  const gate = window.__chatFailureGate = {
+                    detailPath: `/api/chat/sessions/${sessionId}`,
+                    armed: false,
+                    held: false,
+                    release: null
+                  };
+                  const originalFetch = window.fetch.bind(window);
+                  window.fetch = async (input, init = {}) => {
+                    const url = typeof input === "string" ? input : input.url;
+                    const method = (init.method || (typeof input === "string" ? "GET" : input.method)).toUpperCase();
+                    const path = new URL(url, location.href).pathname;
+                    if (method === "POST" && path.endsWith("/turns")) {
+                      const response = await originalFetch(input, init);
+                      gate.armed = true;
+                      return response;
+                    }
+                    if (method === "GET" && gate.armed && path === gate.detailPath && !gate.held) {
+                      gate.held = true;
+                      await new Promise(resolve => { gate.release = resolve; });
+                    }
+                    return originalFetch(input, init);
+                  };
+                }
+                """.trimIndent(),
+                sessionId,
+            )
+
+            page.locator("#chat-question").fill("Synthetic local failure")
+            val response = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-send").click()
+            }
+            assertEquals(202, response.status())
+            val turnId = Json.parseToJsonElement(response.text()).jsonObject
+                .getValue("turnId").jsonPrimitive.content
+            page.waitForFunction("() => window.__chatFailureGate.held")
+            val failedTurn = waitForChatTurn(page, sessionId, turnId)
+            assertEquals("failed", failedTurn.getValue("state").jsonPrimitive.content)
+            page.evaluate("() => window.__chatFailureGate.release()")
+            page.waitForFunction(
+                "() => { const error = document.querySelector('#chat-error'); return !error.hidden && error.textContent.includes('Ollama вернул HTTP 503'); }",
+            )
+            assertThat(page.locator("#chat-error")).containsText("Ollama вернул HTTP 503")
+            assertEquals(0, fake.cloud.chatModels.size)
         }
     }
 
@@ -1837,6 +1917,7 @@ class BrowserAcceptanceTest {
         page.waitForFunction(
             "() => { const id = new URL(location.href).searchParams.get('session'); return Boolean(id) && id !== '$previousId'; }",
         )
+        page.waitForFunction("() => !document.querySelector('#chat-question').disabled")
         return page.url().substringAfter("session=")
     }
 
