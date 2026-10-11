@@ -98,9 +98,36 @@ python3 examples/create_synthetic_corpus.py /tmp/synthetic-observatory.md
 
 - `LOCAL_RAG_DATA_DIR` — корневой каталог данных;
 - `LOCAL_RAG_PORT` — порт интерфейса, по умолчанию `8765`;
-- `LOCAL_RAG_OLLAMA_URL` — loopback Ollama для embeddings, reranking и локальной генерации, по умолчанию `http://127.0.0.1:11434`.
+- `LOCAL_RAG_OLLAMA_URL` — адрес Ollama для embeddings, reranking и локальной генерации, по умолчанию `http://127.0.0.1:11434`;
+- `LOCAL_RAG_BIND_ADDRESS` — адрес привязки сервера, по умолчанию `127.0.0.1`;
+- `LOCAL_RAG_HTTPS_KEYSTORE` и `LOCAL_RAG_HTTPS_KEYSTORE_PASSWORD` — путь к TLS keystore и его пароль для LAN-доступа;
+- `LOCAL_RAG_SHARED_SECRET` — общий секрет входа в LAN-режиме;
+- `LOCAL_RAG_PUBLIC_ORIGIN` — HTTPS origin, опубликованный пользователям LAN.
 
-Приложение привязывает HTTP-интерфейс к `127.0.0.1`; внешний хост не обслуживается. Адрес Ollama должен использовать HTTP и loopback-хост. Запросы Cloud-генерации идут по HTTPS к DeepSeek; перенаправления не выполняются. HTML- и текстовые парсеры не обращаются в сеть.
+По умолчанию HTTP-интерфейс слушает только `127.0.0.1`; внешний хост не обслуживается. Адрес Ollama должен использовать HTTP и loopback-хост. Запросы Cloud-генерации идут по HTTPS к DeepSeek; перенаправления не выполняются. HTML- и текстовые парсеры не обращаются в сеть.
+
+## Доступ из локальной сети и параллельные сессии
+
+LAN-доступ включается только вместе с HTTPS keystore и общим секретом. Сертификат должен содержать hostname из `LOCAL_RAG_PUBLIC_ORIGIN` в SAN и быть доверенным на каждом клиентском устройстве. Порт в origin должен совпадать с `LOCAL_RAG_PORT`. Для same-host входа владельца через `https://127.0.0.1:<порт>` добавьте в сертификат также IP SAN `IP:127.0.0.1` (DNS SAN с этим текстом не подходит); этот alias сервер принимает только от loopback TCP peer. LAN-участникам следует использовать публичный hostname.
+
+Создавайте секрет криптографически случайным генератором, например `openssl rand -base64 32` (32 случайных байта); передавайте результат приложению через защищённое окружение или secret manager. Не выбирайте пароль или фразу самостоятельно.
+
+```text
+LOCAL_RAG_BIND_ADDRESS=0.0.0.0
+LOCAL_RAG_PORT=8765
+LOCAL_RAG_HTTPS_KEYSTORE=/absolute/path/to/local-rag.p12
+LOCAL_RAG_HTTPS_KEYSTORE_PASSWORD=<secret from local secret manager>
+LOCAL_RAG_SHARED_SECRET=<random secret of at least 32 UTF-8 bytes>
+LOCAL_RAG_PUBLIC_ORIGIN=https://rag-host.example:8765
+```
+
+Передайте пароли и общий секрет только через окружение или secret manager. Не помещайте значения в URL, команды, shell history, репозиторий и логи. Без HTTPS, keystore, секрета длиной от 32 байт и публичного HTTPS origin запуск с LAN bind завершается ошибкой; HTTP LAN-режим не поддерживается. Все участники с общим секретом имеют одинаковые права, включая загрузку, индексацию и удаление общей LTE-коллекции. Это не индивидуальная аутентификация и не контроль доступа по ролям.
+
+После успешного входа браузер получает HttpOnly/Secure cookie с 30-дневным скользящим сроком действия. При включении LAN-режима ранее созданный в loopback HTTP cookie сам по себе не авторизует запросы: выполните вход по общему секрету. Владелец может открыть тот же браузерный cookie на HTTPS alias `127.0.0.1` и после успешного входа сохранить доступ к прежнему legacy Chat; alias доступен только на серверном loopback peer и требует IP SAN в сертификате. Обычный LAN-участник после входа получает отдельный Chat-workspace. Один browser profile использует общий Chat-workspace во всех своих вкладках; отдельные браузеры или профили получают изолированные списки сессий и память. Источники и индекс остаются общими. Очистка cookie или истечение срока без активности лишает доступа к прежнему workspace; аккаунтов и восстановления такого доступа нет.
+
+Chat-turn сохраняется сервером до запуска и проходит состояния `queued`, `running`, `completed`, `cancelled`, `failed` или `interrupted`. Интерфейс не ждёт генерацию в запросе отправки: он показывает очередь/выполнение и позволяет перейти к другой сессии. Кнопка «Отменить» отменяет ожидающий ход или прерывает активный запрос к provider; для DeepSeek прекращение уже принятой удалённой обработки и тарификации не гарантируется. После reload тот же turn восстанавливается без повторной отправки. После перезапуска приложения незавершённые turns помечаются `interrupted` и требуют ручного повтора.
+
+Chat-turn проходят через одну durable-очередь: одновременно выполняется один ход, остальные сессии ждут. Все inference POST-запросы к локальной Ollama используют общий interruptible gate; метаданные доступных моделей не блокируют этот gate. Сериализация охватывает chat generation, embeddings, retrieval/reranking и benchmark. Для локальных ChatCompletions API, embeddings и reranking приложение передаёт `options.num_thread`, равный числу доступных JVM CPU threads. Очереди и gate устраняют конкуренцию между задачами приложения, но сами по себе не ускоряют отдельную генерацию.
 
 ## Проверки
 
@@ -109,13 +136,14 @@ python3 examples/create_synthetic_corpus.py /tmp/synthetic-observatory.md
 xvfb-run -a -s '-screen 0 1440x1000x24' ./gradlew browserTest
 ```
 
-Детерминированные тесты используют временную SQLite, синтетические документы, тестовый PDF-процесс и fake HTTP-сервисы Ollama/DeepSeek на loopback. Проверяются изоляция baseline/RAG и reranker payload, безопасная перестановка локального reranker, no-fallback при ошибке, пустой enhanced retrieval с сохранением baseline, точные citations и quotes, Hit@4/MRR, максимум 30 генераций выбранной модели в benchmark и миграция старой SQLite без потери ответов, оценок и заметок. Обычные тесты не требуют секретов и не обращаются к внешним API.
+Детерминированные тесты используют временную SQLite, синтетические документы, тестовый PDF-процесс и fake HTTP-сервисы Ollama/DeepSeek на loopback. Помимо RAG и benchmark проверяются TLS/shared-secret вход, изоляция Chat-workspace между браузерами при общей коллекции, очередь параллельных сессий, отмена queued/running turns, восстановление состояния после reload/restart, сериализация Ollama inference и число JVM-доступных CPU threads в chat, embedding и reranking запросах. Обычные тесты не требуют секретов и не обращаются к внешним API.
 
-`test` не включает browser journey. `browserTest` запускает настоящее приложение и Chromium под Xvfb; на Linux нужны `xvfb-run` и зависимости Chromium, которые Playwright сообщает при первом запуске. Browser acceptance проверяет выбор DeepSeek/Ollama и модели в коллекции, независимые provider/model в Chat-сессиях, provenance/time ответа, benchmark и поведение без credential.
+`test` не включает browser journey. `browserTest` запускает настоящее приложение и Chromium под Xvfb; на Linux нужны `xvfb-run` и зависимости Chromium, которые Playwright сообщает при первом запуске. Browser acceptance проверяет основные RAG/Chat journeys и два отдельных browser contexts с приватной памятью и общей коллекцией.
 
 ### Результаты проверки
 
-- `./gradlew test` — успешно.
-- `xvfb-run -a -s '-screen 0 1440x1000x24' ./gradlew browserTest` — успешно в составе полного delivery acceptance. Playwright вывел предупреждение об отсутствующем `libavif16`; browser suite завершился успешно.
+- 2026-10-11: `xvfb-run -a -s '-screen 0 1440x1000x24' ./gradlew test browserTest` — успешно. Playwright вывел предупреждение об отсутствующем `libavif16`; полный набор завершился успешно.
+- После исправления общего тестового ожидания пустого evidence целевой браузерный сценарий также завершился успешно. Реальные провайдеры в automated suite не вызываются.
+- Synthetic live smoke через Local RAG → Ollama `qwen2.5:3b`: runner сообщил `n_threads=12`; после 2m44s turn был отменён кнопкой интерфейса, Ollama остановил задачу, частичный ответ ассистента не сохранился. Полный ответ и его скорость не измерены.
 - 2026-10-03: focused v15 browser journeys A01, A02, A05, A07 and A08 — successful under Xvfb with temporary SQLite and fake transports. Playwright reported missing `libavif16`; the test command exited successfully.
 - Отдельные live smoke-проверки использовали только synthetic baseline/RAG-вопрос и synthetic reranker-кандидаты. `deepseek-flash` вернул HTTP 200 и перестановку `[1,0,2]`; реальные документы и данные LTE не отправлялись. API key не печатался.
