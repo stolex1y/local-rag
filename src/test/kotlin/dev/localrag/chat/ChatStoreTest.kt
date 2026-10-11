@@ -16,6 +16,7 @@ import dev.localrag.index.SqliteIndexRepository
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -192,6 +193,84 @@ class ChatStoreTest {
     }
 
     @Test
+    fun `schema migration rolls back alterations and version when a later index fails`() {
+        val database = temporaryDirectory.resolve("failed-chat-migration.sqlite")
+        val sessionId = UUID.randomUUID().toString()
+        DriverManager.getConnection("jdbc:sqlite:${database.toAbsolutePath()}").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.execute(
+                    """CREATE TABLE chat_sessions(
+                        session_id TEXT PRIMARY KEY,title TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+                    )""".trimIndent(),
+                )
+                statement.execute(
+                    """CREATE TABLE chat_turn_jobs(
+                        turn_id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+                        strategy TEXT NOT NULL,top_k INTEGER,provider_id TEXT NOT NULL,model_id TEXT NOT NULL,
+                        state TEXT NOT NULL,error TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+                        UNIQUE(session_id,turn_id)
+                    )""".trimIndent(),
+                )
+                statement.execute("PRAGMA user_version=16")
+            }
+            connection.prepareStatement(
+                "INSERT INTO chat_sessions(session_id,title,created_at,updated_at) VALUES (?,?,?,?)",
+            ).use { statement ->
+                statement.setString(1, sessionId)
+                statement.setString(2, "Original session")
+                statement.setString(3, "2026-10-01T00:00:00Z")
+                statement.setString(4, "2026-10-01T00:00:00Z")
+                statement.executeUpdate()
+            }
+            connection.prepareStatement(
+                """INSERT INTO chat_turn_jobs(
+                    turn_id,workspace_id,session_id,strategy,provider_id,model_id,state,created_at,updated_at
+                ) VALUES (?,?,?,'STRUCTURAL','ollama','model','queued','created','created')""".trimIndent(),
+            ).use { statement ->
+                for (turnId in listOf("turn-one", "turn-two")) {
+                    statement.setString(1, turnId)
+                    statement.setString(2, "workspace")
+                    statement.setString(3, sessionId)
+                    statement.executeUpdate()
+                }
+            }
+        }
+
+        assertThrows(java.sql.SQLException::class.java) { ChatStore(database) }
+
+        DriverManager.getConnection("jdbc:sqlite:${database.toAbsolutePath()}").use { connection ->
+            connection.createStatement().use { statement ->
+                val sessionColumns = statement.executeQuery("PRAGMA table_info(chat_sessions)").use { rows ->
+                    buildSet { while (rows.next()) add(rows.getString("name")) }
+                }
+                assertFalse("title_generated" in sessionColumns)
+                assertFalse("workspace_id" in sessionColumns)
+                assertEquals(
+                    0,
+                    statement.executeQuery(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='chat_messages'",
+                    ).use { rows -> rows.next(); rows.getInt(1) },
+                )
+                assertEquals(16, statement.executeQuery("PRAGMA user_version").use { rows -> rows.next(); rows.getInt(1) })
+                assertEquals(
+                    "Original session",
+                    statement.executeQuery("SELECT title FROM chat_sessions WHERE session_id='$sessionId'").use { rows ->
+                        assertTrue(rows.next())
+                        rows.getString(1)
+                    },
+                )
+                assertEquals(
+                    listOf("queued", "queued"),
+                    statement.executeQuery("SELECT state FROM chat_turn_jobs ORDER BY turn_id").use { rows ->
+                        buildList { while (rows.next()) add(rows.getString(1)) }
+                    },
+                )
+            }
+        }
+    }
+
+    @Test
     fun `chat schema migration preserves existing source chunks benchmark review and selection`() {
         val database = temporaryDirectory.resolve("existing.sqlite")
         val sourceId = UUID.randomUUID().toString()
@@ -337,6 +416,29 @@ class ChatStoreTest {
             val restored = requireNotNull(store.sessionDetail(sessionId))
             assertEquals("Срок оплаты — пятнадцатое число", restored.messages.single().content)
             assertEquals(ChatTaskState(), restored.taskState)
+        }
+    }
+
+    @Test
+    fun `unfinished turns become interrupted after restart and can be retried`() {
+        val database = temporaryDirectory.resolve("interrupted-turn.sqlite")
+        val workspaceId = "workspace-test"
+        val selection = ModelSelection("ollama", "qwen2.5:3b")
+        val turnId = UUID.randomUUID().toString()
+        val question = "Сколько ресурсных блоков резервируется?"
+        val sessionId: String
+
+        ChatStore(database).use { store ->
+            sessionId = store.createSession(modelSelection = selection, workspaceId = workspaceId).session.id
+            store.enqueueTurn(workspaceId, sessionId, turnId, question, ChunkStrategy.STRUCTURAL, null, selection)
+            assertTrue(store.markTurnRunning(workspaceId, sessionId, turnId))
+        }
+
+        ChatStore(database).use { store ->
+            assertEquals("interrupted", store.turnJob(workspaceId, sessionId, turnId)?.state)
+            val retried = store.enqueueTurn(workspaceId, sessionId, turnId, question, ChunkStrategy.STRUCTURAL, null, selection)
+            assertEquals("queued", retried.state)
+            assertEquals(1, requireNotNull(store.sessionDetail(sessionId, workspaceId)).messages.size)
         }
     }
 

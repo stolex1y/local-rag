@@ -2,6 +2,10 @@ package dev.localrag.web
 
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import com.sun.net.httpserver.HttpsConfigurator
+import com.sun.net.httpserver.HttpsServer
+import dev.localrag.chat.WorkspaceStore
+import dev.localrag.chat.ChatActiveTurnException
 import dev.localrag.app.ApiException
 import dev.localrag.app.ApplicationService
 import dev.localrag.app.IndexNotReadyException
@@ -21,11 +25,16 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.io.FileInputStream
 import java.io.IOException
-import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
+import java.security.KeyStore
+import java.security.MessageDigest
 import java.util.concurrent.Executors
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLParameters
 
 @Serializable
 private data class ErrorPayload(val error: ErrorDetail)
@@ -80,13 +89,19 @@ private data class ModelSelectionRequest(val providerId: String, val modelId: St
 
 @Serializable
 private data class SavedResponse(val saved: Boolean)
+@Serializable
+data class AuthStatusResponse(val authenticated: Boolean, val requiresLogin: Boolean)
+
+@Serializable
+private data class LoginRequest(val secret: String)
 
 class LocalHttpServer(
     private val application: ApplicationService,
-    port: Int = 8765,
+    private val workspaceStore: WorkspaceStore,
+    private val config: LocalHttpServerConfig = LocalHttpServerConfig.fromEnvironment(),
 ) : AutoCloseable {
-    private val server = HttpServer.create(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 0)
-    private val workers = Executors.newFixedThreadPool(4) { task ->
+    private val server: HttpServer = createServer()
+    private val workers = Executors.newFixedThreadPool(16) { task ->
         Thread(task, "local-rag-http").apply { isDaemon = true }
     }
     private val json = Json { encodeDefaults = true }
@@ -97,18 +112,25 @@ class LocalHttpServer(
     }
 
     val port: Int get() = server.address.port
+    val origin: String? get() = config.originFor(port)
 
     fun start() = server.start()
-
     private fun handle(exchange: HttpExchange) {
         try {
-            if (!isSafeLocalRequest(exchange)) {
-                sendError(exchange, 403, "local_origin_required", "Запрос разрешён только с локального адреса приложения.")
+            if (!isSafeRequest(exchange)) {
+                sendError(exchange, 403, "origin_not_allowed", "Запрос не соответствует адресу и источнику приложения.")
                 return
             }
             val path = exchange.requestURI.path
-            if (path.startsWith("/api/")) handleApi(exchange, path)
-            else handleStatic(exchange, path)
+            when {
+                path == "/api/auth/status" && exchange.requestMethod.equals("GET", true) -> handleAuthStatus(exchange)
+                path == "/api/auth/login" && exchange.requestMethod.equals("POST", true) -> handleLogin(exchange)
+                path.startsWith("/api/") -> {
+                    val workspaceId = authenticatedWorkspace(exchange) ?: return
+                    handleApi(exchange, path, workspaceId)
+                }
+                else -> handleStatic(exchange, path)
+            }
         } catch (error: ApiException) {
             sendError(exchange, error.status, error.code, error.message)
         } catch (error: JobBusyException) {
@@ -129,6 +151,8 @@ class LocalHttpServer(
             sendError(exchange, 503, "local_model_unavailable", error.message ?: "Локальная модель недоступна.")
         } catch (error: CloudModelException) {
             sendError(exchange, 502, "cloud_model_unavailable", error.message ?: "Облачная модель недоступна.")
+        } catch (error: ChatActiveTurnException) {
+            sendError(exchange, 409, "chat_turn_active", error.message ?: "В сессии уже есть незавершённый ход.")
         } catch (error: IllegalArgumentException) {
             sendError(exchange, 400, "invalid_request", error.message ?: "Проверьте параметры запроса.")
         } catch (_: Exception) {
@@ -138,7 +162,101 @@ class LocalHttpServer(
         }
     }
 
-    private fun handleApi(exchange: HttpExchange, path: String) {
+    private fun handleAuthStatus(exchange: HttpExchange) {
+        val token = sessionToken(exchange)
+        if (config.requiresSharedSecret) {
+            val workspaceId = workspaceStore.findWorkspace(token)
+            val authenticated = workspaceId != null && workspaceStore.isAuthenticated(token)
+            if (authenticated && token != null) setWorkspaceCookie(exchange, token)
+            sendJson(exchange, 200, AuthStatusResponse(authenticated, true))
+            return
+        }
+        val session = workspaceStore.resolveOrCreate(token, exchange.remoteAddress.address.isLoopbackAddress)
+        setWorkspaceCookie(exchange, session.token)
+        sendJson(exchange, 200, AuthStatusResponse(true, false))
+    }
+
+    private fun handleLogin(exchange: HttpExchange) {
+        if (!config.requiresSharedSecret) {
+            sendError(exchange, 404, "not_found", "Вход по общему секрету не включён.")
+            return
+        }
+        requireJsonContentType(exchange)
+        val request = readJson<LoginRequest>(exchange)
+        val expected = requireNotNull(config.sharedSecret)
+        if (!MessageDigest.isEqual(expected, request.secret.toByteArray(StandardCharsets.UTF_8))) {
+            sendError(exchange, 401, "authentication_failed", "Общий секрет не принят.")
+            return
+        }
+        val loopbackPeer = exchange.remoteAddress.address.isLoopbackAddress
+        val token = sessionToken(exchange)
+        val existing = workspaceStore.findWorkspace(token)
+        val session = if (existing != null && token != null &&
+            (workspaceStore.isAuthenticated(token) || loopbackPeer)
+        ) {
+            WorkspaceStore.WorkspaceSession(existing, token)
+        } else if (loopbackPeer) {
+            workspaceStore.resolveOrCreate(null, mayClaimLegacyWorkspace = true)
+        } else {
+            workspaceStore.createRemoteWorkspace()
+        }
+        check(workspaceStore.markAuthenticated(session.token)) { "New workspace session could not be authenticated." }
+        setWorkspaceCookie(exchange, session.token)
+        sendJson(exchange, 200, AuthStatusResponse(true, true))
+    }
+
+    private fun authenticatedWorkspace(exchange: HttpExchange): String? {
+        val token = sessionToken(exchange)
+        if (config.requiresSharedSecret) {
+            val workspaceId = workspaceStore.findWorkspace(token)
+            if (workspaceId == null || token == null || !workspaceStore.isAuthenticated(token)) {
+                sendError(exchange, 401, "authentication_required", "Введите общий секрет, чтобы открыть приложение.")
+                return null
+            }
+            setWorkspaceCookie(exchange, token)
+            return workspaceId
+        }
+        val session = workspaceStore.resolveOrCreate(token, exchange.remoteAddress.address.isLoopbackAddress)
+        setWorkspaceCookie(exchange, session.token)
+        return session.workspaceId
+    }
+
+    private fun sessionToken(exchange: HttpExchange): String? =
+        exchange.requestHeaders.getFirst("Cookie")
+            ?.split(';')
+            ?.asSequence()
+            ?.map(String::trim)
+            ?.firstNotNullOfOrNull { part ->
+                part.takeIf { it.startsWith("${WorkspaceStore.SESSION_COOKIE}=") }
+                    ?.substringAfter('=')
+                    ?.removeSurrounding("\"")
+                    ?.takeIf { token ->
+                        token.length in 32..128 && token.all { character ->
+                            character in 'A'..'Z' || character in 'a'..'z' || character in '0'..'9' || character == '_' || character == '-'
+                        }
+                    }
+            }
+
+    private fun setWorkspaceCookie(exchange: HttpExchange, token: String) {
+        val secure = if (config.usesHttps) "; Secure" else ""
+        exchange.responseHeaders.add(
+            "Set-Cookie",
+            "${WorkspaceStore.SESSION_COOKIE}=$token; Path=/; HttpOnly; SameSite=Strict; Max-Age=${WorkspaceStore.SESSION_LIFETIME_DAYS * 24 * 60 * 60}$secure",
+        )
+    }
+
+    private fun isSafeRequest(exchange: HttpExchange): Boolean {
+        val remoteAddress = exchange.remoteAddress.address
+        if (!config.acceptsHost(exchange.requestHeaders.getFirst("Host"), port, remoteAddress)) return false
+        if (exchange.requestMethod.uppercase() !in MUTATING_METHODS) return true
+        val origin = exchange.requestHeaders.getFirst("Origin")
+        if (config.requiresSharedSecret || config.usesHttps || origin != null) {
+            return config.acceptsOrigin(origin, port, remoteAddress)
+        }
+        return true
+    }
+
+    private fun handleApi(exchange: HttpExchange, path: String, workspaceId: String) {
         val method = exchange.requestMethod.uppercase()
         val parts = path.split('/').filter(String::isNotEmpty)
         when {
@@ -148,46 +266,51 @@ class LocalHttpServer(
                 val request = readJson<ModelSelectionRequest>(exchange)
                 sendJson(exchange, 200, application.selectModel(ModelSelection(request.providerId, request.modelId)))
             }
-            path == "/api/chat/sessions" && method == "GET" -> sendJson(exchange, 200, application.chatSessions())
+            path == "/api/chat/sessions" && method == "GET" -> sendJson(exchange, 200, application.chatSessions(workspaceId))
             path == "/api/chat/sessions" && method == "POST" -> {
                 requireJsonContentType(exchange)
                 consumeOptionalJson(exchange)
-                sendJson(exchange, 201, application.createChatSession())
+                sendJson(exchange, 201, application.createChatSession(workspaceId))
             }
             parts.size == 4 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && method == "GET" ->
-                sendJson(exchange, 200, application.chatSession(parts[3]))
+                sendJson(exchange, 200, application.chatSession(parts[3], workspaceId))
             parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "model-selection" && method == "PUT" -> {
                 requireJsonContentType(exchange)
                 val request = readJson<ModelSelectionRequest>(exchange)
-                sendJson(exchange, 200, application.updateChatModelSelection(parts[3], ModelSelection(request.providerId, request.modelId)))
+                sendJson(exchange, 200, application.updateChatModelSelection(parts[3], ModelSelection(request.providerId, request.modelId), workspaceId))
             }
             parts.size == 4 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && method == "DELETE" -> {
                 requireJsonContentType(exchange)
                 val request = readJson<DeleteRequest>(exchange)
-                application.deleteChatSession(parts[3], request.confirm)
+                application.deleteChatSession(parts[3], request.confirm, workspaceId)
                 sendJson(exchange, 200, SavedResponse(true))
             }
-            path == "/api/chat/memory/shared" && method == "GET" -> sendJson(exchange, 200, application.sharedChatFacts())
+            path == "/api/chat/memory/shared" && method == "GET" ->
+                sendJson(exchange, 200, application.sharedChatFacts(workspaceId))
             parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "memory" && parts[3] == "shared" && method == "DELETE" -> {
                 requireJsonContentType(exchange)
                 val request = readJson<DeleteRequest>(exchange)
-                application.deleteSharedChatFact(parts[4], request.confirm)
+                application.deleteSharedChatFact(parts[4], request.confirm, workspaceId)
                 sendJson(exchange, 200, SavedResponse(true))
             }
             parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "memory" && parts[3] == "shared" && method == "PUT" -> {
                 requireJsonContentType(exchange)
                 val request = readJson<ChatMemoryFactRequest>(exchange)
-                sendJson(exchange, 200, application.updateSharedChatFact(parts[4], request.content))
+                sendJson(exchange, 200, application.updateSharedChatFact(parts[4], request.content, workspaceId))
             }
             parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "turns" && method == "POST" -> {
                 requireJsonContentType(exchange)
                 val request = readJson<ChatTurnHttpRequest>(exchange)
-                sendJson(exchange, 200, application.chatTurn(parts[3], request.turnId, request.question, request.strategy, request.topK))
+                sendJson(exchange, 202, application.enqueueChatTurn(workspaceId, parts[3], request.turnId, request.question, request.strategy, request.topK))
             }
+            parts.size == 6 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "turns" && method == "GET" ->
+                sendJson(exchange, 200, application.chatTurnJob(workspaceId, parts[3], parts[5]))
+            parts.size == 6 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "turns" && method == "DELETE" ->
+                sendJson(exchange, 200, application.cancelChatTurn(workspaceId, parts[3], parts[5]))
             parts.size == 5 && parts[0] == "api" && parts[1] == "chat" && parts[2] == "sessions" && parts[4] == "task-state" && method == "PUT" -> {
                 requireJsonContentType(exchange)
                 val state = readJson<dev.localrag.chat.ChatTaskState>(exchange)
-                sendJson(exchange, 200, application.updateChatTaskState(parts[3], state))
+                sendJson(exchange, 200, application.updateChatTaskState(parts[3], state, workspaceId))
             }
             path == "/api/status" && method == "GET" -> sendJson(exchange, 200, application.status())
             path == "/api/sources" && method == "GET" -> sendJson(exchange, 200, application.sources())
@@ -273,6 +396,7 @@ class LocalHttpServer(
             ?: throw ApiException(500, "ui_missing", "Файл локального интерфейса не найден.")
         exchange.responseHeaders.set("Content-Type", "text/html; charset=utf-8")
         exchange.responseHeaders.set("Cache-Control", "no-store")
+        if (config.usesHttps) exchange.responseHeaders.set("Strict-Transport-Security", "max-age=31536000")
         exchange.responseHeaders.set("X-Content-Type-Options", "nosniff")
         exchange.responseHeaders.set("X-Frame-Options", "DENY")
         exchange.responseHeaders.set("Referrer-Policy", "no-referrer")
@@ -284,15 +408,33 @@ class LocalHttpServer(
         exchange.responseBody.use { it.write(page) }
     }
 
-    private fun isSafeLocalRequest(exchange: HttpExchange): Boolean {
-        val expectedPort = port
-        val host = exchange.requestHeaders.getFirst("Host")?.lowercase() ?: return false
-        if (host != "127.0.0.1:$expectedPort" && host != "localhost:$expectedPort") return false
-        if (exchange.requestMethod.uppercase() in MUTATING_METHODS) {
-            val origin = exchange.requestHeaders.getFirst("Origin") ?: return true
-            if (origin != "http://127.0.0.1:$expectedPort" && origin != "http://localhost:$expectedPort") return false
+    private fun createServer(): HttpServer {
+        val address = InetSocketAddress(config.bindAddress, config.port)
+        if (!config.usesHttps) return HttpServer.create(address, 0)
+        val context = createSslContext()
+        return HttpsServer.create(address, 0).apply {
+            httpsConfigurator = object : HttpsConfigurator(context) {
+                override fun configure(parameters: com.sun.net.httpserver.HttpsParameters) {
+                    parameters.setSSLParameters(context.defaultSSLParameters.apply {
+                        protocols = arrayOf("TLSv1.3", "TLSv1.2")
+                    })
+                }
+            }
         }
-        return true
+    }
+
+    private fun createSslContext(): SSLContext {
+        val password = requireNotNull(config.keyStorePassword)
+        try {
+            val keyStore = KeyStore.getInstance("PKCS12")
+            FileInputStream(requireNotNull(config.keyStorePath).toFile()).use { keyStore.load(it, password) }
+            val keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply {
+                init(keyStore, password)
+            }
+            return SSLContext.getInstance("TLS").apply { init(keyManagers.keyManagers, null, null) }
+        } finally {
+            password.fill('\u0000')
+        }
     }
 
     private fun requireJsonContentType(exchange: HttpExchange) {
@@ -345,6 +487,7 @@ class LocalHttpServer(
         val bytes = json.encodeToString(value).toByteArray(StandardCharsets.UTF_8)
         exchange.responseHeaders.set("Content-Type", "application/json; charset=utf-8")
         exchange.responseHeaders.set("Cache-Control", "no-store")
+        if (config.usesHttps) exchange.responseHeaders.set("Strict-Transport-Security", "max-age=31536000")
         exchange.responseHeaders.set("X-Content-Type-Options", "nosniff")
         exchange.sendResponseHeaders(status, bytes.size.toLong())
         exchange.responseBody.use { it.write(bytes) }

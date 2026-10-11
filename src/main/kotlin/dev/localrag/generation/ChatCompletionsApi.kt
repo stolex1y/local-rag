@@ -3,6 +3,7 @@ package dev.localrag.generation
 import dev.localrag.domain.ChatPort
 import dev.localrag.domain.ModelSelection
 import dev.localrag.ollama.LocalModelException
+import dev.localrag.ollama.OllamaInferenceGate
 import dev.localrag.chat.ChatMemoryScope
 import dev.localrag.chat.ChatMemoryUpdate
 import dev.localrag.chat.ChatTaskStateDelta
@@ -248,26 +249,17 @@ class ChatCompletionsApi(
                     put("content", content)
                 }
             }))
-            if (structuredChatRequest != null) {
-                put(
-                    "response_format",
-                    if (local) {
-                        buildJsonObject {
-                            put("type", "json_schema")
-                            put("json_schema", buildJsonObject {
-                                put("name", "chat_turn")
-                                put("strict", true)
-                                put("schema", chatTurnResponseSchema(structuredChatRequest))
-                            })
-                        }
-                    } else {
-                        buildJsonObject { put("type", "json_object") }
-                    },
-                )
+            if (local) {
+                put("options", buildJsonObject {
+                    put("num_thread", Runtime.getRuntime().availableProcessors().coerceAtLeast(1))
+                })
+                if (structuredChatRequest != null) put("format", chatTurnResponseSchema(structuredChatRequest))
+            } else if (structuredChatRequest != null) {
+                put("response_format", buildJsonObject { put("type", "json_object") })
             }
         }.toString()
         val endpoint = try {
-            URI.create(provider.baseUrl).resolve(provider.chatCompletionsPath)
+            URI.create(provider.baseUrl).resolve(if (local) "/api/chat" else provider.chatCompletionsPath)
         } catch (_: IllegalArgumentException) {
             throw if (local) {
                 LocalModelException("Не удалось безопасно подготовить локальный запрос к Ollama.")
@@ -298,7 +290,13 @@ class ChatCompletionsApi(
             }
         }
         val response = try {
-            http.send(request, HttpResponse.BodyHandlers.ofString(UTF_8))
+            if (local) {
+                OllamaInferenceGate.withPermit {
+                    http.send(request, HttpResponse.BodyHandlers.ofString(UTF_8))
+                }
+            } else {
+                http.send(request, HttpResponse.BodyHandlers.ofString(UTF_8))
+            }
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             throw if (local) {
@@ -324,8 +322,12 @@ class ChatCompletionsApi(
         }
         val content = try {
             val root = Json.parseToJsonElement(response.body()).jsonObject
-            root.getValue("choices").jsonArray.first().jsonObject
-                .getValue("message").jsonObject.getValue("content").jsonPrimitive.contentOrNull
+            if (local) {
+                root.getValue("message").jsonObject.getValue("content").jsonPrimitive.contentOrNull
+            } else {
+                root.getValue("choices").jsonArray.first().jsonObject
+                    .getValue("message").jsonObject.getValue("content").jsonPrimitive.contentOrNull
+            }
         } catch (_: Exception) {
             throw if (local) {
                 LocalModelException("Ollama вернула ответ неожиданного формата.")

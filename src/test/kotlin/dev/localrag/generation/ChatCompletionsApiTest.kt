@@ -286,9 +286,9 @@ class ChatCompletionsApiTest {
             respond(exchange, 200, """{"choices":[{"message":{"content":"cloud"}}]}""")
         }
         fake.use {
-            it.addContext("/v1/chat/completions") { exchange ->
+            it.addContext("/api/chat") { exchange ->
                 requests += Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
-                respond(exchange, 200, """{"choices":[{"message":{"content":"local answer"}}]}""")
+                respond(exchange, 200, """{"message":{"content":"local answer"},"done":true}""")
             }
             val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
             val localSelection = ModelSelection("ollama", "qwen2.5:7b")
@@ -298,6 +298,10 @@ class ChatCompletionsApiTest {
             assertEquals(0, cloudCalls.get())
             assertEquals("qwen2.5:7b", requests.single().getValue("model").jsonPrimitive.content)
             assertFalse(requests.single().containsKey("Authorization"))
+            assertEquals(
+                Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+                requests.single().getValue("options").jsonObject.getValue("num_thread").jsonPrimitive.content.toInt(),
+            )
         }
     }
 
@@ -311,17 +315,10 @@ class ChatCompletionsApiTest {
             respond(exchange, 200, """{"choices":[{"message":{"content":"cloud fallback"}}]}""")
         }
         fake.use {
-            it.addContext("/v1/chat/completions") { exchange ->
+            it.addContext("/api/chat") { exchange ->
                 val body = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
                 requests += exchange.requestHeaders.getFirst("Authorization") to body
-                val response = kotlinx.serialization.json.buildJsonObject {
-                    put("choices", kotlinx.serialization.json.buildJsonArray {
-                        add(kotlinx.serialization.json.buildJsonObject {
-                            put("message", kotlinx.serialization.json.buildJsonObject { put("content", JsonPrimitive(content)) })
-                        })
-                    })
-                }.toString()
-                respond(exchange, 200, response)
+                respond(exchange, 200, """{"message":{"content":${JsonPrimitive(content)}},"done":true}""")
             }
             val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
             val completion = api.completeTurn(
@@ -344,11 +341,8 @@ class ChatCompletionsApiTest {
             assertEquals(null, requests.single().first)
 
             val body = requests.single().second
-            val format = body.getValue("response_format").jsonObject
-            assertEquals("json_schema", format.getValue("type").jsonPrimitive.content)
-            val jsonSchema = format.getValue("json_schema").jsonObject
-            assertEquals("chat_turn", jsonSchema.getValue("name").jsonPrimitive.content)
-            val schema = jsonSchema.getValue("schema").jsonObject
+            val schema = body.getValue("format").jsonObject
+            assertEquals("object", schema.getValue("type").jsonPrimitive.content)
             assertEquals(
                 listOf("answer", "task_state_delta", "memory_updates", "document_citation_refs", "memory_reference_refs", "session_title"),
                 schema.getValue("required").jsonArray.map { it.jsonPrimitive.content },
@@ -422,17 +416,10 @@ class ChatCompletionsApiTest {
             respond(exchange, 200, """{"choices":[{"message":{"content":"cloud fallback"}}]}""")
         }
         fake.use {
-            it.addContext("/v1/chat/completions") { exchange ->
+            it.addContext("/api/chat") { exchange ->
                 requests += Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
                 val content = """{"answer":"Нет подтверждённых сведений","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[],"terms_to_add":[]},"memory_updates":[],"document_citation_refs":[],"memory_reference_refs":[],"session_title":null}"""
-                val response = kotlinx.serialization.json.buildJsonObject {
-                    put("choices", kotlinx.serialization.json.buildJsonArray {
-                        add(kotlinx.serialization.json.buildJsonObject {
-                            put("message", kotlinx.serialization.json.buildJsonObject { put("content", JsonPrimitive(content)) })
-                        })
-                    })
-                }.toString()
-                respond(exchange, 200, response)
+                respond(exchange, 200, """{"message":{"content":${JsonPrimitive(content)}},"done":true}""")
             }
             val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
             val completion = api.completeTurn(
@@ -443,8 +430,7 @@ class ChatCompletionsApiTest {
             assertEquals("Нет подтверждённых сведений", completion.answer)
             assertEquals(emptyList(), completion.documentCitationRefs)
             assertEquals(0, cloudCalls.get())
-            val properties = requests.single().getValue("response_format").jsonObject
-                .getValue("json_schema").jsonObject.getValue("schema").jsonObject
+            val properties = requests.single().getValue("format").jsonObject
                 .getValue("properties").jsonObject
             listOf("document_citation_refs", "memory_reference_refs").forEach { key ->
                 val field = properties.getValue(key).jsonObject
@@ -462,7 +448,7 @@ class ChatCompletionsApiTest {
             respond(exchange, 200, """{"choices":[{"message":{"content":"cloud fallback"}}]}""")
         }
         fake.use {
-            it.addContext("/v1/chat/completions") { exchange ->
+            it.addContext("/api/chat") { exchange ->
                 respond(exchange, 503, """{"error":"SYNTHETIC_LOCAL_FAILURE"}""")
             }
             val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))

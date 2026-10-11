@@ -18,10 +18,26 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.util.concurrent.locks.ReentrantLock
 
 const val EMBEDDING_MODEL = "embeddinggemma:300m"
 
 class LocalModelException(message: String) : RuntimeException(message)
+
+ 
+
+object OllamaInferenceGate {
+    private val lock = ReentrantLock()
+
+    fun <T> withPermit(action: () -> T): T {
+        lock.lockInterruptibly()
+        try {
+            return action()
+        } finally {
+            lock.unlock()
+        }
+    }
+}
 
 class OllamaApi(
     baseUri: URI = URI("http://127.0.0.1:11434"),
@@ -39,6 +55,9 @@ class OllamaApi(
             put("model", model)
             put("input", JsonArray(texts.map(::JsonPrimitive)))
             put("truncate", false)
+            put("options", buildJsonObject {
+                put("num_thread", Runtime.getRuntime().availableProcessors().coerceAtLeast(1))
+            })
         }
         val response = post("/api/embed", payload.toString())
         val vectors = try {
@@ -71,19 +90,21 @@ class OllamaApi(
         val payload = buildJsonObject {
             put("model", model)
             put("stream", false)
-            put("temperature", 0)
             put("messages", JsonArray(messages.map { (role, content) ->
                 buildJsonObject {
                     put("role", role)
                     put("content", content)
                 }
             }))
-            if (jsonMode) put("response_format", buildJsonObject { put("type", "json_object") })
+            put("options", buildJsonObject {
+                put("temperature", 0)
+                put("num_thread", Runtime.getRuntime().availableProcessors().coerceAtLeast(1))
+            })
+            if (jsonMode) put("format", "json")
         }
-        val response = post("/v1/chat/completions", payload.toString())
+        val response = post("/api/chat", payload.toString())
         val content = try {
             kotlinx.serialization.json.Json.parseToJsonElement(response).jsonObject
-                .getValue("choices").jsonArray.first().jsonObject
                 .getValue("message").jsonObject.getValue("content").jsonPrimitive.content
         } catch (_: Exception) {
             throw LocalModelException("Локальная Ollama вернула ответ неожиданного формата.")
@@ -107,7 +128,14 @@ class OllamaApi(
                 .POST(HttpRequest.BodyPublishers.ofString(body))
         }
         val response = try {
-            http.send(builder.build(), HttpResponse.BodyHandlers.ofString())
+            val request = builder.build()
+            if (body == null) {
+                http.send(request, HttpResponse.BodyHandlers.ofString())
+            } else {
+                OllamaInferenceGate.withPermit {
+                    http.send(request, HttpResponse.BodyHandlers.ofString())
+                }
+            }
         } catch (error: InterruptedException) {
             Thread.currentThread().interrupt()
             throw LocalModelException("Обращение к локальной модели прервано.")

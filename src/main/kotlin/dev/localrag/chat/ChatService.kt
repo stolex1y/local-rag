@@ -18,7 +18,6 @@ class ChatService(
     private val generator: ChatTurnGenerator,
     private val embeddings: EmbeddingPort,
 ) {
-    @Synchronized
     fun turn(
         sessionId: String,
         turnId: String,
@@ -26,20 +25,22 @@ class ChatService(
         strategy: ChunkStrategy,
         selection: ModelSelection,
         topK: Int? = null,
+        workspaceId: String = ChatStore.DEFAULT_WORKSPACE_ID,
     ): ChatTurnResponse {
         val startedAt = System.nanoTime()
         require(question.isNotBlank() && question.length <= ChatStore.MAX_MESSAGE_LENGTH) {
             "Вопрос должен содержать от 1 до ${ChatStore.MAX_MESSAGE_LENGTH} символов."
         }
-        require(store.sessionExists(sessionId)) { "Сессия чата не найдена." }
-        val previous = store.recentMessages(sessionId, ChatStore.MAX_HISTORY_MESSAGES + 1)
+        require(store.sessionExists(sessionId, workspaceId)) { "Сессия чата не найдена." }
+        val previous = store.recentMessages(sessionId, ChatStore.MAX_HISTORY_MESSAGES + 1, workspaceId)
             .filterNot { it.turnId == turnId }
             .takeLast(ChatStore.MAX_HISTORY_MESSAGES)
-        store.saveUserMessage(sessionId, turnId, question)
-        val completed = store.assistantMessage(sessionId, turnId)
-        if (completed != null) return ChatTurnResponse(completed, store.taskState(sessionId))
+        store.saveUserMessage(sessionId, turnId, question, workspaceId)
+        val completed = store.assistantMessage(sessionId, turnId, workspaceId)
+        if (completed != null) return ChatTurnResponse(completed, store.taskState(sessionId, workspaceId))
         val retrieved = rag.retrieveForChat(question, strategy, topK).enhanced
-        val existingFacts = store.memoryFacts(sessionId)
+        if (Thread.currentThread().isInterrupted) throw ChatTurnCancelledException()
+        val existingFacts = store.memoryFacts(sessionId, workspaceId)
         val queryEmbedding = if (existingFacts.isEmpty()) emptyList() else embedOne(question)
         val selectedSessionFacts = selectFacts(
             existingFacts.filter { it.scope == ChatMemoryScope.SESSION },
@@ -60,8 +61,8 @@ class ChatService(
         val documentCandidates = retrieved.mapIndexed { index, chunk ->
             ChatDocumentCandidate("D${index + 1}", chunk.chunk.draft.text)
         }
-        val state = store.taskState(sessionId)
-        val generateTitle = !store.sessionTitleGenerated(sessionId)
+        val state = store.taskState(sessionId, workspaceId)
+        val generateTitle = !store.sessionTitleGenerated(sessionId, workspaceId)
         val result = generator.completeTurn(
             selection,
             ChatTurnRequest(
@@ -74,6 +75,7 @@ class ChatService(
                 generateTitle = generateTitle,
             ),
         )
+        if (Thread.currentThread().isInterrupted) throw ChatTurnCancelledException()
         validateDelta(result.taskStateDelta)
         validateMemoryUpdates(result.memoryUpdates)
         val nextState = merge(state, result.taskStateDelta)
@@ -136,13 +138,18 @@ class ChatService(
             sessionTitle = title,
             modelSelection = selection,
             elapsedMs = (System.nanoTime() - startedAt) / 1_000_000,
+            workspaceId = workspaceId,
         )
-        return ChatTurnResponse(message, store.taskState(sessionId))
+        return ChatTurnResponse(message, store.taskState(sessionId, workspaceId))
     }
 
     @Synchronized
-    fun updateTaskState(sessionId: String, state: ChatTaskState): ChatTaskState {
-        require(store.sessionExists(sessionId)) { "Сессия чата не найдена." }
+    fun updateTaskState(
+        sessionId: String,
+        state: ChatTaskState,
+        workspaceId: String = ChatStore.DEFAULT_WORKSPACE_ID,
+    ): ChatTaskState {
+        require(store.sessionExists(sessionId, workspaceId)) { "Сессия чата не найдена." }
         state.goal?.let { requireStateString(it, "Цель") }
         require(state.clarifications.size <= MAX_TASK_STATE_ITEMS && state.constraints.size <= MAX_TASK_STATE_ITEMS && state.terms.size <= MAX_TASK_STATE_ITEMS) {
             "В каждой категории состояния задачи допускается не более $MAX_TASK_STATE_ITEMS записей."
@@ -153,29 +160,38 @@ class ChatService(
             requireStateString(it.term, "Термин")
             requireStateString(it.definition, "Определение")
         }
-        val retained = store.memoryFacts(sessionId)
+        val retained = store.memoryFacts(sessionId, workspaceId)
             .filter { it.scope == ChatMemoryScope.SESSION }
             .map { ChatMemoryFactDraft(it.text, it.embedding, it.embeddingModel) }
-        store.replaceTaskState(sessionId, state, retained)
+        store.replaceTaskState(sessionId, state, retained, workspaceId)
         return state
     }
-    fun sharedFacts(): List<ChatMemoryFactSummary> = store.sharedFacts().map { it.toSummary() }
+    fun sharedFacts(workspaceId: String = ChatStore.DEFAULT_WORKSPACE_ID): List<ChatMemoryFactSummary> =
+        store.sharedFacts(workspaceId).map { it.toSummary() }
 
 
     private fun ChatMemoryFact.toSummary() = ChatMemoryFactSummary(scope, id, sessionId, text, createdAt)
 
-    fun deleteSharedFact(memoryId: String, confirmed: Boolean) {
+    fun deleteSharedFact(
+        memoryId: String,
+        confirmed: Boolean,
+        workspaceId: String = ChatStore.DEFAULT_WORKSPACE_ID,
+    ) {
         require(confirmed) { "Удаление общей памяти требует отдельного подтверждения." }
-        if (!store.deleteSharedFact(memoryId)) throw IllegalArgumentException("Общий факт не найден.")
+        if (!store.deleteSharedFact(memoryId, workspaceId)) throw IllegalArgumentException("Общий факт не найден.")
     }
 
-    fun updateSharedFact(memoryId: String, content: String): ChatMemoryFactSummary {
+    fun updateSharedFact(
+        memoryId: String,
+        content: String,
+        workspaceId: String = ChatStore.DEFAULT_WORKSPACE_ID,
+    ): ChatMemoryFactSummary {
         require(content.isNotBlank() && content.length <= ChatStore.MAX_SHARED_FACT_LENGTH)
         val embedding = embedOne(content)
-        if (!store.updateSharedFact(memoryId, content, embedding, embeddings.modelName)) {
+        if (!store.updateSharedFact(memoryId, content, embedding, embeddings.modelName, workspaceId)) {
             throw IllegalArgumentException("Общий факт не найден.")
         }
-        return store.sharedFacts().first { it.id == memoryId }.toSummary()
+        return store.sharedFacts(workspaceId).first { it.id == memoryId }.toSummary()
     }
 
     private fun selectFacts(

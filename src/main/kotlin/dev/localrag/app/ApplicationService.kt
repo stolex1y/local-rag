@@ -5,7 +5,8 @@ import dev.localrag.chat.ChatStore
 import dev.localrag.chat.ChatMemoryFactSummary
 import dev.localrag.chat.ChatService
 import dev.localrag.chat.ChatTaskState
-import dev.localrag.chat.ChatTurnResponse
+import dev.localrag.chat.ChatTurnJob
+import dev.localrag.chat.ChatTurnQueue
 
 
 import dev.localrag.benchmark.BenchmarkQuestion
@@ -106,8 +107,8 @@ class ApplicationService(
     private val modelConfiguration: ModelConfiguration,
     private val chatStore: ChatStore,
     private val chatService: ChatService,
-) {
-
+) : AutoCloseable {
+    private val chatTurnQueue = ChatTurnQueue(chatStore, chatService)
     private val operationLock = Any()
     fun status(): StatusResponse {
         val sources = catalog.sources()
@@ -132,82 +133,94 @@ class ApplicationService(
     }
 
     fun sources(): List<SourceRecord> = catalog.sources()
-    fun chatSessions(): List<ChatSession> = chatStore.sessions()
+    fun chatSessions(workspaceId: String): List<ChatSession> = chatStore.sessions(workspaceId)
 
-    fun createChatSession(): ChatSessionDetail {
+    fun createChatSession(workspaceId: String): ChatSessionDetail {
         val configuration = modelConfiguration.options()
         val selectionRequired = configuration.warning != null
         val selection = if (selectionRequired) null else {
             ModelSelection(configuration.selectedProviderId, configuration.selectedModelId)
         }
-        return chatStore.createSession(selection, selectionRequired)
+        return chatStore.createSession(selection, selectionRequired, workspaceId)
     }
 
-    fun chatSession(sessionId: String): ChatSessionDetail {
-        val detail = chatStore.sessionDetail(sessionId)
+    fun chatSession(sessionId: String, workspaceId: String): ChatSessionDetail {
+        val detail = chatStore.sessionDetail(sessionId, workspaceId)
             ?: throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
         if (detail.session.modelSelection != null || detail.session.modelSelectionRequired) return detail
         val configuration = modelConfiguration.options()
         if (configuration.warning != null) return detail
         val selection = ModelSelection(configuration.selectedProviderId, configuration.selectedModelId)
         return try {
-            chatStore.initializeModelSelection(sessionId, selection)
+            chatStore.initializeModelSelection(sessionId, selection, workspaceId)
         } catch (_: ChatStore.ChatSessionNotFoundException) {
             throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
         }
     }
 
-    fun updateChatModelSelection(sessionId: String, selection: ModelSelection): ChatSessionDetail {
-        chatSession(sessionId)
+    fun updateChatModelSelection(sessionId: String, selection: ModelSelection, workspaceId: String): ChatSessionDetail {
+        chatSession(sessionId, workspaceId)
         try {
             modelConfiguration.catalog.resolve(selection)
         } catch (error: IllegalArgumentException) {
             throw ApiException(400, "invalid_model_selection", error.message ?: "Выберите модель из каталога.")
         }
         return try {
-            chatStore.updateModelSelection(sessionId, selection)
+            chatStore.updateModelSelection(sessionId, selection, workspaceId)
         } catch (_: ChatStore.ChatSessionNotFoundException) {
             throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
         }
     }
 
-    fun deleteChatSession(sessionId: String, confirmed: Boolean) {
+    fun deleteChatSession(sessionId: String, confirmed: Boolean, workspaceId: String) {
         if (!confirmed) throw ApiException(400, "confirmation_required", "Удаление сессии требует отдельного подтверждения.")
-        if (!chatStore.deleteSession(sessionId)) throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
+        val detail = chatSession(sessionId, workspaceId)
+        detail.activeTurn?.takeIf { it.state == "queued" || it.state == "running" }?.let {
+            chatTurnQueue.cancel(workspaceId, sessionId, it.turnId)
+        }
+        if (!chatStore.deleteSession(sessionId, workspaceId)) throw ApiException(404, "chat_session_not_found", "Сессия чата не найдена.")
     }
 
-    fun chatTurn(
+    fun enqueueChatTurn(
+        workspaceId: String,
         sessionId: String,
         turnId: String,
         question: String,
         strategy: ChunkStrategy,
         topK: Int?,
-    ): ChatTurnResponse {
-        val session = chatSession(sessionId).session
+    ): ChatTurnJob {
+        val session = chatSession(sessionId, workspaceId).session
         val selection = session.modelSelection
             ?: throw ApiException(409, "chat_model_selection_required", "Выберите провайдера и модель для этой сессии.")
-        return chatService.turn(
-            sessionId,
-            turnId,
-            question,
-            strategy,
-            selection,
-            topK,
-        )
+        return chatTurnQueue.enqueue(workspaceId, sessionId, turnId, question, strategy, topK, selection)
     }
 
+    fun chatTurnJob(workspaceId: String, sessionId: String, turnId: String): ChatTurnJob =
+        chatTurnQueue.get(workspaceId, sessionId, turnId)
+            ?: throw ApiException(404, "chat_turn_not_found", "Ход чата не найден.")
 
-    fun sharedChatFacts(): List<ChatMemoryFactSummary> = chatService.sharedFacts()
+    fun cancelChatTurn(workspaceId: String, sessionId: String, turnId: String): ChatTurnJob =
+        chatTurnQueue.cancel(workspaceId, sessionId, turnId)
+            ?: throw ApiException(404, "chat_turn_not_found", "Ход чата не найден.")
 
+    fun sharedChatFacts(workspaceId: String): List<ChatMemoryFactSummary> = chatService.sharedFacts(workspaceId)
 
-    fun deleteSharedChatFact(memoryId: String, confirmed: Boolean) = chatService.deleteSharedFact(memoryId, confirmed)
-    fun updateSharedChatFact(memoryId: String, content: String): ChatMemoryFactSummary =
-        chatService.updateSharedFact(memoryId, content)
+    fun deleteSharedChatFact(memoryId: String, confirmed: Boolean, workspaceId: String) =
+        chatService.deleteSharedFact(memoryId, confirmed, workspaceId)
 
-    fun updateChatTaskState(sessionId: String, taskState: ChatTaskState): ChatTaskState {
-        chatSession(sessionId)
-        return chatService.updateTaskState(sessionId, taskState)
+    fun updateSharedChatFact(memoryId: String, content: String, workspaceId: String): ChatMemoryFactSummary =
+        chatService.updateSharedFact(memoryId, content, workspaceId)
+
+    fun updateChatTaskState(sessionId: String, taskState: ChatTaskState, workspaceId: String): ChatTaskState {
+        val detail = chatSession(sessionId, workspaceId)
+        if (detail.activeTurn?.state in setOf("queued", "running")) {
+            throw ApiException(409, "chat_turn_active", "Сначала дождитесь завершения или отмените ход чата.")
+        }
+        return chatService.updateTaskState(sessionId, taskState, workspaceId)
     }
+
+    override fun close() = chatTurnQueue.close()
+
     fun models(): ModelConfigurationResponse = modelConfiguration.options(availableModels())
 
     fun selectModel(selection: ModelSelection): ModelConfigurationResponse {

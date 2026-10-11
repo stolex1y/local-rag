@@ -1,11 +1,14 @@
 package dev.localrag.web
 
 import dev.localrag.chat.ChatStore
+import dev.localrag.chat.WorkspaceStore
 import dev.localrag.chat.ChatService
 
 import com.microsoft.playwright.BrowserType
+import com.microsoft.playwright.Browser
 import com.microsoft.playwright.Playwright
 import com.microsoft.playwright.Page
+import com.microsoft.playwright.options.Cookie
 import com.microsoft.playwright.assertions.PlaywrightAssertions.assertThat
 import dev.localrag.app.ApplicationService
 import dev.localrag.app.JobManager
@@ -60,6 +63,9 @@ import java.nio.charset.StandardCharsets.US_ASCII
 import java.sql.DriverManager
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
+import java.time.Instant
+import java.util.Base64
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
@@ -92,7 +98,11 @@ class BrowserAcceptanceTest {
             val expectedSourceId = sources.single {
                 it.getValue("name").jsonPrimitive.content == "greenhouse-chat.md"
             }.getValue("sourceId").jsonPrimitive.content
-            assertEquals("greenhouse-chat.md", citationData.getValue("source").jsonPrimitive.content)
+            assertEquals(
+                "greenhouse-chat.md",
+                citationData.getValue("source").jsonPrimitive.content,
+                "Citation did not match the requested greenhouse evidence: ${fake.cloud.chatMessages.last().last()}",
+            )
             assertEquals(expectedSourceId, citationData.getValue("sourceId").jsonPrimitive.content)
             assertEquals(1, citationData.getValue("location").jsonObject.getValue("lineStart").jsonPrimitive.content.toInt())
             assertEquals(2, citationData.getValue("location").jsonObject.getValue("lineEnd").jsonPrimitive.content.toInt())
@@ -226,6 +236,365 @@ class BrowserAcceptanceTest {
             assertEquals("Goal B", page.locator("#task-goal").inputValue())
         }
     }
+    @Test
+    fun separateBrowsersIsolateChatMemoryAndShareSourceCollection() {
+        withChatBrowser { page, app, _ ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            val ownerSession = createChatSession(page)
+            page.locator("#task-goal").fill("Workspace A private goal")
+            page.locator("#task-state-save").click()
+            assertThat(page.locator("#chat-error")).containsText("Состояние задачи сохранено.")
+            submitChatQuestion(page, "auto-memory-seed workspace A")
+            assertThat(page.locator("#shared-memory-list")).containsText("Shared synthetic preference")
+
+            val secondPage = page.context().browser().newPage()
+            secondPage.setDefaultTimeout(30_000.0)
+            try {
+                secondPage.navigate("http://127.0.0.1:${app.server.port}/")
+                secondPage.locator("#chat-tab").click()
+                assertThat(secondPage.locator("#chat-sessions")).containsText("Сессий пока нет.")
+                assertThat(secondPage.locator("#shared-memory-list")).containsText("Общая память пуста.")
+                assertThat(secondPage.locator("#task-goal")).hasValue("")
+
+                val sourceNames = Json.parseToJsonElement(
+                    secondPage.request().get("http://127.0.0.1:${app.server.port}/api/sources").text(),
+                ).jsonArray.map { it.jsonObject.getValue("name").jsonPrimitive.content }
+                assertTrue("greenhouse-chat.md" in sourceNames)
+
+                val isolatedSession = createChatSession(secondPage)
+                assertNotEquals(ownerSession, isolatedSession)
+                assertThat(secondPage.locator("#chat-messages")).containsText("Напишите первый вопрос")
+                assertThat(secondPage.locator("#shared-memory-list")).containsText("Общая память пуста.")
+
+                secondPage.locator("#collection-tab").click()
+                val sharedSource = temporaryDirectory.resolve("workspace-shared.md")
+                Files.writeString(sharedSource, "# Shared workspace fixture\nSynthetic shared source.\n")
+                secondPage.locator("#source-files").setInputFiles(sharedSource)
+                secondPage.locator("#upload-button").click()
+                assertThat(secondPage.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+                page.locator("#collection-tab").click()
+                page.locator("#refresh-sources").click()
+                assertThat(page.locator("#source-list")).containsText("workspace-shared.md")
+            } finally {
+                secondPage.close()
+            }
+        }
+    }
+
+    @Test
+    fun existingLoopbackSessionsMigrateAsUnauthenticated() {
+        val database = temporaryDirectory.resolve("legacy-browser-workspaces.sqlite")
+        val token = "synthetic-browser-token-for-migration-0123456789"
+        val tokenHash = Base64.getEncoder().encodeToString(
+            MessageDigest.getInstance("SHA-256").digest(token.toByteArray(UTF_8)),
+        )
+        val now = Instant.now().toString()
+        DriverManager.getConnection("jdbc:sqlite:$database").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.execute(
+                    "CREATE TABLE browser_workspaces(workspace_id TEXT PRIMARY KEY, created_at TEXT NOT NULL)",
+                )
+                statement.execute(
+                    """CREATE TABLE browser_workspace_sessions(
+                        token_hash TEXT PRIMARY KEY,
+                        workspace_id TEXT NOT NULL REFERENCES browser_workspaces(workspace_id) ON DELETE CASCADE,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL
+                    )""".trimIndent(),
+                )
+                statement.execute(
+                    "CREATE TABLE browser_workspace_settings(setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL)",
+                )
+            }
+            connection.prepareStatement("INSERT INTO browser_workspaces VALUES(?,?)").use { statement ->
+                statement.setString(1, ChatStore.LEGACY_OWNER_WORKSPACE_ID)
+                statement.setString(2, now)
+                statement.executeUpdate()
+            }
+            connection.prepareStatement("INSERT INTO browser_workspace_sessions VALUES(?,?,?,?)").use { statement ->
+                statement.setString(1, tokenHash)
+                statement.setString(2, ChatStore.LEGACY_OWNER_WORKSPACE_ID)
+                statement.setString(3, now)
+                statement.setString(4, Instant.now().plusSeconds(3_600).toString())
+                statement.executeUpdate()
+            }
+        }
+        WorkspaceStore(database).use { store ->
+            assertEquals(ChatStore.LEGACY_OWNER_WORKSPACE_ID, store.findWorkspace(token))
+            assertFalse(store.isAuthenticated(token))
+        }
+    }
+
+    @Test
+    fun sharedSecretHTTPSLoginIsRequiredForSeparateBrowserProfiles() {
+        val keyStore = temporaryDirectory.resolve("secure-browser-test.p12")
+        val keyStorePassword = "synthetic-keystore-password"
+        val keytool = Path.of(System.getProperty("java.home"), "bin", "keytool")
+        val keytoolProcess = ProcessBuilder(
+            keytool.toString(),
+            "-genkeypair",
+            "-alias", "local-rag-test",
+            "-keyalg", "RSA",
+            "-keysize", "2048",
+            "-validity", "1",
+            "-storetype", "PKCS12",
+            "-keystore", keyStore.toString(),
+            "-storepass", keyStorePassword,
+            "-keypass", keyStorePassword,
+            "-dname", "CN=localhost",
+            "-ext", "SAN=dns:localhost,ip:127.0.0.1",
+            "-noprompt",
+        ).redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+        assertTrue(keytoolProcess.waitFor(30, TimeUnit.SECONDS))
+        assertEquals(0, keytoolProcess.exitValue())
+
+        val sharedSecret = "synthetic-shared-secret-with-at-least-32-bytes"
+        val serverConfig = LocalHttpServerConfig(
+            java.net.InetAddress.getByName("127.0.0.1"),
+            0,
+            URI("https://localhost"),
+            keyStore,
+            keyStorePassword.toCharArray(),
+            sharedSecret,
+        )
+        FakeOllama().use { fake ->
+            val paths = LocalRagPaths(temporaryDirectory.resolve("secure-browser-app-data"))
+            Files.createDirectories(paths.dataDirectory)
+            val legacyToken = WorkspaceStore(paths.database).use {
+                it.resolveOrCreate(null, mayClaimLegacyWorkspace = true).token
+            }
+            val legacySession = ChatStore(paths.database).use { store ->
+                val session = store.createSession(workspaceId = ChatStore.LEGACY_OWNER_WORKSPACE_ID)
+                store.saveSessionFact(
+                    session.session.id,
+                    "Legacy owner private memory",
+                    listOf(1f, 0f, 0f),
+                    "synthetic-embedding",
+                    ChatStore.LEGACY_OWNER_WORKSPACE_ID,
+                )
+                session.session
+            }
+            val playwright = Playwright.create()
+            try {
+                val browser = playwright.chromium().launch(
+                    BrowserType.LaunchOptions().setHeadless(true).setArgs(listOf("--no-sandbox")),
+                )
+                val ownerContext = browser.newContext(Browser.NewContextOptions().setIgnoreHTTPSErrors(true))
+                val participantContext = browser.newContext(Browser.NewContextOptions().setIgnoreHTTPSErrors(true))
+                try {
+                    BrowserAppFixture(paths, fake, modelConfiguration(paths, fake), serverConfig).use { app ->
+                        assertTrue(
+                            serverConfig.acceptsHost(
+                                "127.0.0.1:${app.server.port}",
+                                app.server.port,
+                                java.net.InetAddress.getByName("127.0.0.1"),
+                            ),
+                        )
+                        assertFalse(
+                            serverConfig.acceptsHost(
+                                "127.0.0.1:${app.server.port}",
+                                app.server.port,
+                                java.net.InetAddress.getByName("192.0.2.10"),
+                            ),
+                        )
+                        assertTrue(
+                            serverConfig.acceptsHost(
+                                "localhost:${app.server.port}",
+                                app.server.port,
+                                java.net.InetAddress.getByName("192.0.2.10"),
+                            ),
+                        )
+                        val origin = "https://localhost:${app.server.port}"
+                        val ownerOrigin = "https://127.0.0.1:${app.server.port}"
+                        ownerContext.addCookies(
+                            listOf(
+                                Cookie(WorkspaceStore.SESSION_COOKIE, legacyToken)
+                                    .setUrl("$ownerOrigin/")
+                                    .setSecure(false)
+                                    .setHttpOnly(true),
+                            ),
+                        )
+                        val owner = ownerContext.newPage()
+                        val participant = participantContext.newPage()
+                        owner.setDefaultTimeout(30_000.0)
+                        participant.setDefaultTimeout(30_000.0)
+
+                        owner.onDialog { it.accept() }
+                        participant.onDialog { it.accept() }
+                        owner.navigate("$ownerOrigin/")
+                        assertThat(owner.locator("#login-view")).isVisible()
+                        assertEquals(401, owner.request().get("$ownerOrigin/api/chat/sessions").status())
+                        owner.locator("#auth-secret").fill("wrong synthetic secret")
+                        owner.locator("#login-form button[type=submit]").click()
+                        assertThat(owner.locator("#login-error")).containsText("Общий секрет не принят")
+                        assertEquals(401, owner.request().get("$ownerOrigin/api/chat/sessions").status())
+                        assertEquals(
+                            legacyToken,
+                            ownerContext.cookies(ownerOrigin).single { it.name == WorkspaceStore.SESSION_COOKIE }.value,
+                        )
+                        owner.locator("#auth-secret").fill(sharedSecret)
+                        owner.locator("#login-form button[type=submit]").click()
+                        assertThat(owner.locator("#app-view")).isVisible()
+                        assertEquals(
+                            legacyToken,
+                            ownerContext.cookies(ownerOrigin).single { it.name == WorkspaceStore.SESSION_COOKIE }.value,
+                        )
+                        assertTrue(owner.request().get("$ownerOrigin/api/chat/sessions").text().contains(legacySession.id))
+                        assertTrue(
+                            ChatStore(paths.database).use {
+                                it.memoryFacts(legacySession.id, ChatStore.LEGACY_OWNER_WORKSPACE_ID)
+                                    .any { fact -> fact.text == "Legacy owner private memory" }
+                            },
+                        )
+                        indexSyntheticGreenhouseSource(owner)
+                        owner.locator("#chat-tab").click()
+                        createChatSession(owner)
+
+                        participant.navigate("$origin/")
+                        assertThat(participant.locator("#login-view")).isVisible()
+                        participant.locator("#auth-secret").fill(sharedSecret)
+                        participant.locator("#login-form button[type=submit]").click()
+                        assertThat(participant.locator("#app-view")).isVisible()
+                        participant.locator("#chat-tab").click()
+                        assertThat(participant.locator("#chat-sessions")).containsText("Сессий пока нет.")
+                        assertThat(participant.locator("#task-goal")).hasValue("")
+
+                        participant.locator("#collection-tab").click()
+                        assertThat(participant.locator("#source-list")).containsText("greenhouse-chat.md")
+                        participant.locator("#source-list button[aria-label^='Удалить источник greenhouse-chat.md']").click()
+                        assertThat(participant.locator("#source-list")).not().containsText("greenhouse-chat.md")
+                        owner.locator("#collection-tab").click()
+                        owner.locator("#refresh-sources").click()
+                        assertThat(owner.locator("#source-list")).not().containsText("greenhouse-chat.md")
+                        val sharedSource = temporaryDirectory.resolve("secure-shared-source.md")
+                        Files.writeString(sharedSource, "# Shared HTTPS source\nSynthetic shared content.\n")
+                        participant.locator("#source-files").setInputFiles(sharedSource)
+                        participant.locator("#upload-button").click()
+                        assertThat(participant.locator("#upload-success")).containsText("1 файл(ов) добавлено")
+                        participant.locator("#index-button").click()
+                        assertThat(participant.locator("#index-success")).containsText("Индексация завершена")
+                        owner.locator("#collection-tab").click()
+                        owner.locator("#refresh-sources").click()
+                        assertThat(owner.locator("#source-list")).containsText("secure-shared-source.md")
+
+                        participant.locator("#refresh-sources").click()
+                        participant.locator("#source-list button[aria-label^='Удалить источник secure-shared-source.md']").click()
+                        assertThat(participant.locator("#source-list")).not().containsText("secure-shared-source.md")
+                        owner.locator("#refresh-sources").click()
+                        assertThat(owner.locator("#source-list")).not().containsText("secure-shared-source.md")
+                    }
+                } finally {
+                    participantContext.close()
+                    ownerContext.close()
+                    browser.close()
+                }
+            } finally {
+                playwright.close()
+            }
+        }
+    }
+    @Test
+    fun activeTurnsPersistAcrossReloadAndGlobalQueueCanCancelAcrossSessions() {
+        withChatBrowser { page, app, fake ->
+            page.onDialog { it.accept() }
+            indexSyntheticGreenhouseSource(page)
+            page.locator("#chat-tab").click()
+            val sessionA = createChatSession(page)
+            selectLocalChatModel(page)
+            fake.holdLocalGeneration.set(true)
+
+            val firstResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
+                page.locator("#chat-question").fill("Hold this synthetic generation")
+                page.locator("#chat-send").click()
+            }
+            assertEquals(202, firstResponse.status())
+            val firstTurnId = Json.parseToJsonElement(firstResponse.text()).jsonObject
+                .getValue("turnId").jsonPrimitive.content
+            assertTrue(fake.localGenerationStarted.await(10, TimeUnit.SECONDS))
+            assertThat(page.locator("#chat-progress")).isVisible()
+            assertThat(page.locator("#chat-cancel")).isVisible()
+            assertFalse(page.locator("#chat-new-session").isDisabled())
+
+            val secondPage = page.context().browser().newPage()
+            secondPage.setDefaultTimeout(30_000.0)
+            secondPage.onDialog { it.accept() }
+            try {
+                secondPage.navigate("http://127.0.0.1:${app.server.port}/")
+                secondPage.locator("#chat-tab").click()
+                val sessionB = createChatSession(secondPage)
+                selectLocalChatModel(secondPage)
+                val secondResponse = secondPage.waitForResponse("**/api/chat/sessions/*/turns") {
+                    secondPage.locator("#chat-question").fill("Wait behind another browser's synthetic generation")
+                    secondPage.locator("#chat-send").click()
+                }
+                assertEquals(202, secondResponse.status())
+                val secondTurnId = Json.parseToJsonElement(secondResponse.text()).jsonObject
+                    .getValue("turnId").jsonPrimitive.content
+                assertEquals(
+                    "queued",
+                    Json.parseToJsonElement(secondResponse.text()).jsonObject.getValue("state").jsonPrimitive.content,
+                )
+                assertThat(secondPage.locator("#chat-progress-label")).containsText("ожидает очереди")
+
+                secondPage.reload()
+                assertEquals(sessionB, URI(secondPage.url()).rawQuery.substringAfter("session="))
+                val persistedJob = Json.parseToJsonElement(
+                    secondPage.request().get(
+                        "http://127.0.0.1:${app.server.port}/api/chat/sessions/$sessionB/turns/$secondTurnId",
+                    ).text(),
+                ).jsonObject
+                assertEquals("queued", persistedJob.getValue("state").jsonPrimitive.content)
+                val persistedTurn = Json.parseToJsonElement(
+                    secondPage.request().get("http://127.0.0.1:${app.server.port}/api/chat/sessions/$sessionB").text(),
+                ).jsonObject.getValue("activeTurn").jsonObject
+                assertEquals(secondTurnId, persistedTurn.getValue("turnId").jsonPrimitive.content)
+                assertEquals("queued", persistedTurn.getValue("state").jsonPrimitive.content)
+                assertThat(secondPage.locator("#chat-progress")).isVisible()
+                assertThat(secondPage.locator("#chat-messages")).containsText("Wait behind another browser's synthetic generation")
+                val cancelQueued = secondPage.waitForResponse("**/api/chat/sessions/$sessionB/turns/$secondTurnId") {
+                    secondPage.locator("#chat-cancel").click()
+                }
+                assertEquals(200, cancelQueued.status())
+                assertEquals(
+                    "cancelled",
+                    Json.parseToJsonElement(cancelQueued.text()).jsonObject.getValue("state").jsonPrimitive.content,
+                )
+                assertThat(secondPage.locator(".chat-bubble.user").last().locator("button")).containsText("Повторить")
+                assertThat(secondPage.locator(".chat-bubble.assistant")).hasCount(0)
+            } finally {
+                secondPage.close()
+            }
+
+            page.reload()
+            assertEquals(sessionA, URI(page.url()).rawQuery.substringAfter("session="))
+            assertThat(page.locator("#chat-progress")).isVisible()
+            assertThat(page.locator("#chat-messages")).containsText("Hold this synthetic generation")
+            assertThat(page.locator("#chat-cancel")).isVisible()
+            val cancelRunning = page.waitForResponse("**/api/chat/sessions/$sessionA/turns/$firstTurnId") {
+                page.locator("#chat-cancel").click()
+            }
+            assertEquals(200, cancelRunning.status())
+            assertEquals(
+                "cancelled",
+                Json.parseToJsonElement(cancelRunning.text()).jsonObject.getValue("state").jsonPrimitive.content,
+            )
+            assertThat(page.locator(".chat-bubble.user").last().locator("button")).containsText("Повторить")
+            assertThat(page.locator(".chat-bubble.assistant")).hasCount(0)
+            assertEquals(1, fake.localGenerationCalls.get())
+
+            fake.releaseLocalGeneration.countDown()
+            val retried = page.waitForResponse("**/api/chat/sessions/$sessionA/turns") {
+                page.locator(".chat-bubble.user").last().locator("button").click()
+            }
+            assertEquals(202, retried.status())
+            assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Synthetic local chat answer.")
+            assertEquals(2, fake.localGenerationCalls.get())
+        }
+    }
 
     @Test
     fun chatSessionsKeepIndependentProviderAndModelChoices() {
@@ -281,11 +650,15 @@ class BrowserAcceptanceTest {
                 "benchmark_questions",
                 "benchmark_result_sources",
                 "benchmark_results",
+                "browser_workspace_sessions",
+                "browser_workspace_settings",
+                "browser_workspaces",
                 "chat_messages",
                 "chat_sessions",
                 "chat_session_facts",
                 "chat_shared_facts",
                 "chat_task_states",
+                "chat_turn_jobs",
                 "chunks",
                 "sources",
             )
@@ -295,13 +668,7 @@ class BrowserAcceptanceTest {
             assertThat(page.locator("#chat-model-select")).hasValue("deepseek-flash")
             val cloudStart = fake.cloud.chatModels.size
             val localGenerationBeforeCloudSend = fake.localGenerationCalls.get()
-            val cloudResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill(comparisonQuestion)
-                page.locator("#chat-send").click()
-            }
-            assertEquals(200, cloudResponse.status())
-            val cloudMessage = Json.parseToJsonElement(cloudResponse.text()).jsonObject
-                .getValue("message").jsonObject
+            val cloudMessage = submitChatQuestion(page, comparisonQuestion).getValue("message").jsonObject
             val cloudElapsedMs = cloudMessage.getValue("elapsedMs").jsonPrimitive.content.toLong()
             assertTrue(cloudElapsedMs >= 0)
             assertEquals("fixture", cloudMessage.getValue("modelSelection").jsonObject
@@ -338,14 +705,8 @@ class BrowserAcceptanceTest {
             val cloudCallsBeforeLocalSend = fake.cloud.chatModels.size
             val localGenerationStart = fake.localGenerationCalls.get()
             val localModelsStart = fake.localModels.size
-            val localResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill(comparisonQuestion)
-                page.locator("#chat-send").click()
-            }
-            assertEquals(200, localResponse.status())
+            val localMessage = submitChatQuestion(page, comparisonQuestion).getValue("message").jsonObject
             assertEquals(comparisonQuestion, fake.localChatPayloads.last().getValue("question").jsonPrimitive.content)
-            val localMessage = Json.parseToJsonElement(localResponse.text()).jsonObject
-                .getValue("message").jsonObject
             val localElapsedMs = localMessage.getValue("elapsedMs").jsonPrimitive.content.toLong()
             val localSelection = localMessage.getValue("modelSelection").jsonObject
             assertEquals("ollama", localSelection.getValue("providerId").jsonPrimitive.content)
@@ -354,6 +715,11 @@ class BrowserAcceptanceTest {
             assertEquals(1, fake.localGenerationCalls.get() - localGenerationStart)
             assertEquals(cloudCallsBeforeLocalSend, fake.cloud.chatModels.size)
             assertTrue(fake.localModels.drop(localModelsStart).contains("qwen2.5:7b"))
+            assertEquals(
+                Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+                fake.nativeChatRequests.last().getValue("options").jsonObject
+                    .getValue("num_thread").jsonPrimitive.content.toInt(),
+            )
             assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:7b")
             assertThat(page.locator(".chat-bubble.assistant").last())
                 .containsText("Время обработки хода: $localElapsedMs мс (retrieval + генерация).")
@@ -372,12 +738,7 @@ class BrowserAcceptanceTest {
             val cloudCallsBeforeChangedTurn = fake.cloud.chatModels.size
             val changedGenerationStart = fake.localGenerationCalls.get()
             val changedModelsStart = fake.localModels.size
-            val changedTurnResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill("Second turn after changing the session model")
-                page.locator("#chat-send").click()
-            }
-            assertEquals(200, changedTurnResponse.status())
-            val changedMessage = Json.parseToJsonElement(changedTurnResponse.text()).jsonObject
+            val changedMessage = submitChatQuestion(page, "Second turn after changing the session model")
                 .getValue("message").jsonObject
             assertEquals(
                 "qwen2.5:3b",
@@ -436,11 +797,7 @@ class BrowserAcceptanceTest {
             val sessionId = createChatSession(page)
 
             fake.cloud.failChat.set(true)
-            val failedTurn = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill("Retry after selecting a local provider")
-                page.locator("#chat-send").click()
-            }
-            assertTrue(failedTurn.status() >= 400)
+            submitFailedChatQuestion(page, "Retry after selecting a local provider")
             fake.cloud.failChat.set(false)
             val retry = page.locator(".chat-bubble.user").last().locator("button")
             assertThat(retry).isEnabled()
@@ -499,20 +856,13 @@ class BrowserAcceptanceTest {
             )
             val cloudCallsBeforeRetry = fake.cloud.chatModels.size
             val localCallsBeforeRetry = fake.localGenerationCalls.get()
-            val retryResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                retry.click()
-            }
-            assertEquals(200, retryResponse.status())
+            retryChatQuestion(page)
             assertEquals(cloudCallsBeforeRetry, fake.cloud.chatModels.size)
             assertTrue(fake.localGenerationCalls.get() > localCallsBeforeRetry)
             assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
             fake.failLocalGeneration.set(true)
             val cloudCallsBeforeLocalFailure = fake.cloud.chatModels.size
-            val localFailure = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill("Local generation failure must not route to Cloud")
-                page.locator("#chat-send").click()
-            }
-            assertTrue(localFailure.status() >= 400)
+            submitFailedChatQuestion(page, "Local generation failure must not route to Cloud")
             page.locator("#chat-error").waitFor()
             assertTrue(page.locator("#chat-error").isVisible)
             assertThat(page.locator("#chat-error")).containsText("Ollama вернул HTTP 503")
@@ -550,12 +900,7 @@ class BrowserAcceptanceTest {
             assertThat(page.locator("#chat-error")).containsText("Состояние задачи сохранено.")
             page.waitForFunction("() => !document.querySelector('#task-state-save').disabled")
             fake.cloud.failChat.set(true)
-            val failedTurn = page.waitForResponse("**/api/chat/sessions/$secondSession/turns") {
-                page.locator("#chat-question").fill("Retry this unfinished turn after changing models")
-                page.locator("#chat-send").click()
-            }
-            assertTrue(failedTurn.status() >= 400)
-            fake.cloud.failChat.set(false)
+            submitFailedChatQuestion(page, "Retry this unfinished turn after changing models")
             val retry = page.locator(".chat-bubble.user").last().locator("button")
             assertThat(retry).isEnabled()
 
@@ -654,14 +999,12 @@ class BrowserAcceptanceTest {
             assertThat(page.locator("#chat-question")).isDisabled()
             val cloudCallsBeforeNavigatedRetry = fake.cloud.chatModels.size
             val localCallsBeforeNavigatedRetry = fake.localGenerationCalls.get()
-            val navigatedRetryResponse = page.waitForResponse("**/api/chat/sessions/$secondSession/turns") {
-                page.locator(".chat-bubble.user").last().locator("button").click()
-            }
-            assertEquals(200, navigatedRetryResponse.status())
+            val navigatedRetryDetail = retryChatQuestion(page)
             assertEquals(cloudCallsBeforeNavigatedRetry, fake.cloud.chatModels.size)
             assertEquals(localCallsBeforeNavigatedRetry + 1, fake.localGenerationCalls.get())
-            val navigatedRetryMessage = Json.parseToJsonElement(navigatedRetryResponse.text()).jsonObject
-                .getValue("message").jsonObject
+            val navigatedRetryMessage = navigatedRetryDetail.getValue("messages").jsonArray
+                .single { it.jsonObject.getValue("role").jsonPrimitive.content == "ASSISTANT" }
+                .jsonObject
             assertEquals(
                 "ollama",
                 navigatedRetryMessage.getValue("modelSelection").jsonObject.getValue("providerId").jsonPrimitive.content,
@@ -944,11 +1287,7 @@ class BrowserAcceptanceTest {
 
             val cloudCallsBefore = fake.cloud.chatModels.size
             val localCallsBefore = fake.localGenerationCalls.get()
-            val response = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill("What is the greenhouse payment date?")
-                page.locator("#chat-send").click()
-            }
-            assertEquals(200, response.status())
+            submitChatQuestion(page, "What is the greenhouse payment date?")
             assertEquals(cloudCallsBefore, fake.cloud.chatModels.size)
             assertTrue(fake.localGenerationCalls.get() > localCallsBefore)
             assertThat(page.locator(".chat-bubble.assistant").last()).containsText("ollama/qwen2.5:3b")
@@ -1107,13 +1446,7 @@ class BrowserAcceptanceTest {
             page.locator("#chat-tab").click()
             page.onDialog { it.accept() }
             val sessionId = createChatSession(page)
-            val response = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill("Unsupported synthetic factual question")
-                page.locator("#chat-send").click()
-            }
-            assertEquals(200, response.status())
-            val message = Json.parseToJsonElement(response.text()).jsonObject
-                .getValue("message").jsonObject
+            val message = submitChatQuestion(page, "Unsupported synthetic factual question").getValue("message").jsonObject
             assertEquals(ChatService.ABSTENTION, message.getValue("content").jsonPrimitive.content)
             assertTrue(message.getValue("documentCitations").jsonArray.isEmpty())
             assertTrue(message.getValue("memoryReferences").jsonArray.isEmpty())
@@ -1143,11 +1476,7 @@ class BrowserAcceptanceTest {
             page.locator("#collection-tab").click()
             indexSyntheticGreenhouseSource(page)
             page.locator("#chat-tab").click()
-            val unsupportedResponse = page.waitForResponse("**/api/chat/sessions/*/turns") {
-                page.locator("#chat-question").fill("Unsupported synthetic factual question")
-                page.locator("#chat-send").click()
-            }
-            val unsupportedMessage = Json.parseToJsonElement(unsupportedResponse.text()).jsonObject
+            val unsupportedMessage = submitChatQuestion(page, "Unsupported synthetic factual question")
                 .getValue("message").jsonObject
             assertEquals(ChatService.ABSTENTION, unsupportedMessage.getValue("content").jsonPrimitive.content)
             assertTrue(unsupportedMessage.getValue("documentCitations").jsonArray.isEmpty())
@@ -1175,15 +1504,12 @@ class BrowserAcceptanceTest {
             page.locator("#task-state-save").click()
             assertThat(page.locator("#chat-error")).containsText("Состояние задачи сохранено.")
             fake.cloud.malformedStructuredResponse.set(true)
-            page.locator("#chat-question").fill("Retry this synthetic turn")
-            page.locator("#chat-send").click()
-            page.locator("#chat-error").waitFor()
+            submitFailedChatQuestion(page, "Retry this synthetic turn")
             assertEquals(1, page.locator(".chat-bubble.user").count())
             assertEquals(0, page.locator(".chat-bubble.assistant").count())
             assertThat(page.locator("#task-goal")).hasValue("Prior synthetic goal")
             assertThat(page.locator(".chat-bubble.user button")).containsText("Повторить этот ход")
-
-            page.locator(".chat-bubble.user button").click()
+            retryChatQuestion(page)
             assertEquals(
                 ChatService.ABSTENTION,
                 page.locator(".chat-bubble.assistant .answer-text").innerText(),
@@ -1338,8 +1664,32 @@ class BrowserAcceptanceTest {
                 try {
                     val page = browser.newPage()
                     page.setDefaultTimeout(30_000.0)
+                    val browserErrors = CopyOnWriteArrayList<String>()
+                    val authResponses = CopyOnWriteArrayList<Int>()
+                    page.onPageError { browserErrors.add(it) }
+                    page.onConsoleMessage { message ->
+                        if (message.type() == "error") browserErrors.add(message.text())
+                    }
+                    page.onResponse { response ->
+                        if (response.url().endsWith("/api/auth/status")) authResponses.add(response.status())
+                    }
                     BrowserAppFixture(paths, fake, modelConfiguration(paths, fake)).use { app ->
-                        page.navigate("http://127.0.0.1:${app.server.port}/")
+                        val navigation = page.navigate("http://127.0.0.1:${app.server.port}/")
+                        assertEquals(200, navigation?.status())
+                        page.setDefaultTimeout(5_000.0)
+                        try {
+                            page.waitForFunction("() => !document.querySelector('#app-view').hidden || !document.querySelector('#login-view').hidden")
+                        } catch (error: RuntimeException) {
+                            throw AssertionError(
+                                "Local RAG bootstrap did not finish; auth responses=$authResponses, browser errors=$browserErrors.",
+                                error,
+                            )
+                        }
+                        assertTrue(
+                            page.locator("#app-view").isVisible(),
+                            "The test browser must authenticate automatically in loopback mode; auth responses=$authResponses, browser errors=$browserErrors.",
+                        )
+                        page.setDefaultTimeout(30_000.0)
                         block(page, app, fake)
                     }
                 } finally {
@@ -1383,6 +1733,19 @@ class BrowserAcceptanceTest {
         assertThat(page.locator("#index-success")).containsText("Индексация завершена")
     }
 
+    private fun selectLocalChatModel(page: Page) {
+        val models = page.request().get(URI(page.url()).resolve("/api/models").toString())
+        assertEquals(200, models.status(), models.text())
+        val providerResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
+            page.locator("#chat-provider-select").selectOption("ollama")
+        }
+        assertEquals(200, providerResponse.status())
+        val modelResponse = page.waitForResponse("**/api/chat/sessions/*/model-selection") {
+            page.locator("#chat-model-select").selectOption("qwen2.5:3b")
+        }
+        assertEquals(200, modelResponse.status())
+    }
+
     private fun createChatSession(page: Page): String {
         val previousId = page.url().substringAfter("session=", "")
         page.waitForResponse("**/api/chat/sessions") {
@@ -1399,9 +1762,92 @@ class BrowserAcceptanceTest {
         val response = page.waitForResponse("**/api/chat/sessions/*/turns") {
             page.locator("#chat-send").click()
         }
-        assertThat(page.locator(".chat-bubble.assistant").last()).containsText("Synthetic chat answer.")
-        return Json.parseToJsonElement(response.text()).jsonObject
+        assertEquals(202, response.status())
+        val job = Json.parseToJsonElement(response.text()).jsonObject
+        val sessionId = URI(page.url()).rawQuery.substringAfter("session=")
+        val turnId = job.getValue("turnId").jsonPrimitive.content
+        val turn = waitForChatTurn(page, sessionId, turnId)
+        assertEquals(
+            "completed",
+            turn.getValue("state").jsonPrimitive.content,
+            "Chat turn failed: ${turn.getValue("error")}",
+        )
+        val detail = fetchChatDetail(page, sessionId)
+        val message = detail.getValue("messages").jsonArray
+            .last { it.jsonObject.getValue("role").jsonPrimitive.content == "ASSISTANT" }
+        val expectedAnswer = if (detail.getValue("session").jsonObject
+                .getValue("modelSelection").jsonObject.getValue("providerId").jsonPrimitive.content == "ollama") {
+            "Synthetic local chat answer."
+        } else {
+            "Synthetic chat answer."
+        }
+        assertThat(page.locator(".chat-bubble.assistant").last()).containsText(expectedAnswer)
+        return buildJsonObject {
+            put("message", message)
+            put("taskState", detail.getValue("taskState"))
+        }
+
     }
+    private fun waitForChatTurn(page: Page, sessionId: String, turnId: String): JsonObject {
+        val path = "/api/chat/sessions/$sessionId/turns/$turnId"
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+        var lastJob: JsonObject? = null
+        while (System.nanoTime() < deadline) {
+            val text = page.evaluate(
+                """async path => {
+                  const response = await fetch(path, { cache: "no-store" });
+                  return JSON.stringify({ status: response.status, body: await response.json() });
+                }""",
+                path,
+            ) as String
+            val envelope = Json.parseToJsonElement(text).jsonObject
+            val status = envelope.getValue("status").jsonPrimitive.content.toInt()
+            if (status == 200) {
+                val job = envelope.getValue("body").jsonObject
+                lastJob = job
+                if (job.getValue("state").jsonPrimitive.content in setOf("completed", "failed", "cancelled", "interrupted")) {
+                    return job
+                }
+            }
+            page.waitForTimeout(25.0)
+        }
+        throw AssertionError("Chat turn $turnId did not reach a terminal state; last job=$lastJob")
+    }
+
+    private fun fetchChatDetail(page: Page, sessionId: String): JsonObject {
+        val detailText = page.evaluate(
+            "async path => JSON.stringify(await (await fetch(path)).json())",
+            "/api/chat/sessions/$sessionId",
+        ) as String
+        return Json.parseToJsonElement(detailText).jsonObject
+    }
+
+    private fun submitFailedChatQuestion(page: Page, question: String): JsonObject {
+        page.locator("#chat-question").fill(question)
+        val response = page.waitForResponse("**/api/chat/sessions/*/turns") {
+            page.locator("#chat-send").click()
+        }
+        assertEquals(202, response.status())
+        val accepted = Json.parseToJsonElement(response.text()).jsonObject
+        val sessionId = URI(page.url()).rawQuery.substringAfter("session=")
+        val turn = waitForChatTurn(page, sessionId, accepted.getValue("turnId").jsonPrimitive.content)
+        assertEquals("failed", turn.getValue("state").jsonPrimitive.content)
+        assertThat(page.locator(".chat-bubble.user").last().locator("button")).isVisible()
+        return turn
+    }
+
+    private fun retryChatQuestion(page: Page): JsonObject {
+        val response = page.waitForResponse("**/api/chat/sessions/*/turns") {
+            page.locator(".chat-bubble.user").last().locator("button").click()
+        }
+        assertEquals(202, response.status())
+        val accepted = Json.parseToJsonElement(response.text()).jsonObject
+        val sessionId = URI(page.url()).rawQuery.substringAfter("session=")
+        val turn = waitForChatTurn(page, sessionId, accepted.getValue("turnId").jsonPrimitive.content)
+        assertEquals("completed", turn.getValue("state").jsonPrimitive.content)
+        return fetchChatDetail(page, sessionId)
+    }
+
 
     private fun assertLongTurnCitation(page: Page, response: JsonObject) {
         val citations = response.getValue("message").jsonObject.getValue("documentCitations").jsonArray
@@ -1421,6 +1867,7 @@ class BrowserAcceptanceTest {
                 val benchmarkStore = BenchmarkStore(paths.database)
                 try {
                     val chatStore = ChatStore(paths.database)
+                    val workspaceStore = WorkspaceStore(paths.database)
                     val jobs = JobManager()
                     try {
                         val catalog = SourceCatalog(paths.sources, index, benchmarkStore::deleteSourceReferences)
@@ -1439,9 +1886,15 @@ class BrowserAcceptanceTest {
                         )
                         val benchmark = BenchmarkRunner(rag, benchmarkStore, index)
                         val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration, chatStore, chatService)
-                        LocalHttpServer(application, 0).use { server ->
-                            server.start()
-                            exerciseUserJourney(fake, probe, server.port, paths.sources)
+                        val serverConfig = LocalHttpServerConfig(java.net.InetAddress.getByName("127.0.0.1"), 0, null, null, null, null)
+                        try {
+                            LocalHttpServer(application, workspaceStore, serverConfig).use { server ->
+                                server.start()
+                                exerciseUserJourney(fake, probe, server.port, paths.sources)
+                            }
+                        } finally {
+                            application.close()
+                            workspaceStore.close()
                         }
                     } finally {
                         jobs.close()
@@ -2874,11 +3327,15 @@ class BrowserAcceptanceTest {
         paths: LocalRagPaths,
         fake: FakeOllama,
         private val modelConfiguration: ModelConfiguration,
+        private val serverConfig: LocalHttpServerConfig = LocalHttpServerConfig(
+            java.net.InetAddress.getByName("127.0.0.1"), 0, null, null, null, null,
+        ),
     ) : AutoCloseable {
         private val databasePath = paths.database
         private val index = SqliteIndexRepository(paths.database)
         private val benchmarkStore = BenchmarkStore(paths.database)
         private val chatStore = ChatStore(paths.database)
+        private val workspaceStore = WorkspaceStore(paths.database)
         private val jobs = JobManager()
         private val ollama = OllamaApi(fake.uri)
         private val embeddings = OllamaEmbeddingPort(ollama)
@@ -2895,7 +3352,11 @@ class BrowserAcceptanceTest {
         )
         private val benchmark = BenchmarkRunner(rag, benchmarkStore, index)
         private val application = ApplicationService(index, benchmarkStore, catalog, jobs, indexing, rag, benchmark, ollama, modelConfiguration, chatStore, chatService)
-        val server = LocalHttpServer(application, 0)
+        val server = LocalHttpServer(
+            application,
+            workspaceStore,
+            serverConfig,
+        )
 
         init {
             server.start()
@@ -2916,6 +3377,8 @@ class BrowserAcceptanceTest {
 
         override fun close() {
             server.close()
+            application.close()
+            workspaceStore.close()
             chatStore.close()
             benchmarkStore.close()
             index.close()
@@ -2930,11 +3393,15 @@ class BrowserAcceptanceTest {
         val localGenerationCalls = AtomicInteger()
         val localModels = CopyOnWriteArrayList<String>()
         val localChatPayloads = CopyOnWriteArrayList<JsonObject>()
+        val nativeChatRequests = CopyOnWriteArrayList<JsonObject>()
         val embeddingInputs = CopyOnWriteArrayList<String>()
         val embeddingCalls = AtomicInteger()
         val holdPdfEmbedding = AtomicBoolean(false)
         val pdfEmbeddingStarted = CountDownLatch(1)
         val releasePdfEmbedding = CountDownLatch(1)
+        val holdLocalGeneration = AtomicBoolean(false)
+        val localGenerationStarted = CountDownLatch(1)
+        val releaseLocalGeneration = CountDownLatch(1)
         private val executor = Executors.newCachedThreadPool()
         private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             this.executor = this@FakeOllama.executor
@@ -2965,68 +3432,87 @@ class BrowserAcceptanceTest {
                 }
                 respond(exchange, 200, buildJsonObject { put("embeddings", embeddings) }.toString())
             }
-            createContext("/v1/chat/completions") { exchange ->
+            createContext("/api/chat") { exchange ->
                 val request = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
                 localModels += request.getValue("model").jsonPrimitive.content
                 val messages = request.getValue("messages").jsonArray.map {
                     it.jsonObject.getValue("content").jsonPrimitive.content
                 }
-                val isReranker = messages.firstOrNull()?.contains("локальный reranker") == true
-                val content = if (isReranker) {
+                if (messages.firstOrNull()?.contains("локальный reranker") == true) {
                     val payload = Json.parseToJsonElement(messages.last()).jsonObject
                     rerankRequests += payload
                     if (failReranker.compareAndSet(true, false)) {
                         respond(exchange, 503, """{"error":"SYNTHETIC_LOCAL_RERANK_FAILURE"}""")
                         return@createContext
                     }
-                    val count = payload.getValue("candidates").jsonArray.size
-                    buildJsonObject {
-                        put("ranked_indices", JsonArray((count - 1 downTo 0).map { JsonPrimitive(it) }))
-                    }.toString()
-                } else {
-                    localGenerationCalls.incrementAndGet()
-                    if (failLocalGeneration.compareAndSet(true, false)) {
-                        respond(exchange, 503, """{"error":"SYNTHETIC_LOCAL_GENERATION_FAILURE"}""")
+                    val rankedIndices = JsonArray(
+                        (payload.getValue("candidates").jsonArray.indices.reversed()).map(::JsonPrimitive),
+                    )
+                    val content = buildJsonObject { put("ranked_indices", rankedIndices) }.toString()
+                    respond(
+                        exchange,
+                        200,
+                        buildJsonObject {
+                            put("message", buildJsonObject { put("content", JsonPrimitive(content)) })
+                            put("done", true)
+                        }.toString(),
+                    )
+                    return@createContext
+                }
+                nativeChatRequests += request
+                localGenerationCalls.incrementAndGet()
+                if (holdLocalGeneration.compareAndSet(true, false)) {
+                    localGenerationStarted.countDown()
+                    try {
+                        if (!releaseLocalGeneration.await(120, TimeUnit.SECONDS)) {
+                            respond(exchange, 504, """{"error":"SYNTHETIC_LOCAL_GENERATION_TIMEOUT"}""")
+                            return@createContext
+                        }
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        exchange.close()
                         return@createContext
                     }
-                    if (request.containsKey("response_format")) {
-                        val payload = Json.parseToJsonElement(messages.last()).jsonObject
-                        localChatPayloads += payload
-                        val documentCandidates = payload.getValue("document_candidates").jsonArray
-                        buildJsonObject {
-                            put("answer", if (documentCandidates.isEmpty()) ChatService.ABSTENTION else "Synthetic local chat answer.")
-                            put("task_state_delta", buildJsonObject {
-                                put("goal", kotlinx.serialization.json.JsonNull)
-                                put("clarifications_to_add", buildJsonArray { })
-                                put("constraints_to_add", buildJsonArray { })
-                                put("terms_to_add", buildJsonArray { })
-                            })
-                            put("memory_updates", buildJsonArray { })
-                            put("document_citation_refs", buildJsonArray {
-                                documentCandidates.firstOrNull()?.jsonObject?.get("ref_id")?.let { add(it) }
-                            })
-                            put("memory_reference_refs", buildJsonArray { })
-                            put(
-                                "session_title",
-                                if (payload.getValue("generate_title").jsonPrimitive.content.toBoolean()) {
-                                    JsonPrimitive("Local synthetic session")
-                                } else {
-                                    kotlinx.serialization.json.JsonNull
-                                },
-                            )
-                        }.toString()
-                    } else {
-                        "Synthetic local answer."
-                    }
                 }
-                val response = buildJsonObject {
-                    put("choices", buildJsonArray {
-                        add(buildJsonObject {
-                            put("message", buildJsonObject { put("content", JsonPrimitive(content)) })
+                if (failLocalGeneration.compareAndSet(true, false)) {
+                    respond(exchange, 503, """{"error":"SYNTHETIC_LOCAL_GENERATION_FAILURE"}""")
+                    return@createContext
+                }
+                val content = if (request.containsKey("format")) {
+                    val payload = Json.parseToJsonElement(messages.last()).jsonObject
+                    localChatPayloads += payload
+                    val documentCandidates = payload.getValue("document_candidates").jsonArray
+                    buildJsonObject {
+                        put("answer", if (documentCandidates.isEmpty()) ChatService.ABSTENTION else "Synthetic local chat answer.")
+                        put("task_state_delta", buildJsonObject {
+                            put("goal", JsonNull)
+                            put("clarifications_to_add", buildJsonArray { })
+                            put("constraints_to_add", buildJsonArray { })
+                            put("terms_to_add", buildJsonArray { })
                         })
-                    })
-                }.toString()
-                respond(exchange, 200, response)
+                        put("memory_updates", buildJsonArray { })
+                        put("document_citation_refs", buildJsonArray {
+                            documentCandidates.firstOrNull()?.jsonObject?.get("ref_id")?.let { add(it) }
+                        })
+                        put("memory_reference_refs", buildJsonArray { })
+                        put(
+                            "session_title",
+                            if (payload.getValue("generate_title").jsonPrimitive.content.toBoolean()) {
+                                JsonPrimitive("Local synthetic session")
+                            } else JsonNull,
+                        )
+                    }.toString()
+                } else {
+                    "Synthetic local answer."
+                }
+                respond(
+                    exchange,
+                    200,
+                    buildJsonObject {
+                        put("message", buildJsonObject { put("content", JsonPrimitive(content)) })
+                        put("done", true)
+                    }.toString(),
+                )
             }
         }
 
@@ -3039,6 +3525,7 @@ class BrowserAcceptanceTest {
 
         override fun close() {
             server.stop(0)
+            releaseLocalGeneration.countDown()
             releasePdfEmbedding.countDown()
             executor.shutdownNow()
             cloud.close()

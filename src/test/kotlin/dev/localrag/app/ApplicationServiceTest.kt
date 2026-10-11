@@ -1,6 +1,7 @@
 package dev.localrag.app
 
 import dev.localrag.chat.ChatStore
+import dev.localrag.chat.WorkspaceStore
 import dev.localrag.chat.ChatService
 
 import com.sun.net.httpserver.HttpExchange
@@ -30,6 +31,7 @@ import dev.localrag.ollama.OllamaApi
 import dev.localrag.ollama.OllamaEmbeddingPort
 import dev.localrag.source.SourceCatalog
 import dev.localrag.web.LocalHttpServer
+import dev.localrag.web.LocalHttpServerConfig
 import dev.localrag.generation.ModelConfiguration
 import dev.localrag.generation.ModelSelectionStore
 import dev.localrag.generation.ProviderCatalog
@@ -58,6 +60,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -77,6 +80,150 @@ class ApplicationServiceTest {
 
 
     @Test
+    fun `LAN bind rejects cleartext and missing shared secret`() {
+        val externalAddress = java.net.InetAddress.getByName("0.0.0.0")
+        assertFailsWith<IllegalArgumentException> {
+            LocalHttpServerConfig(externalAddress, 8765, null, null, null, null)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            LocalHttpServerConfig(
+                externalAddress,
+                8765,
+                URI("https://localhost:8765"),
+                Path.of("not-read-by-config.p12"),
+                "synthetic-password".toCharArray(),
+                null,
+            )
+        }
+    }
+
+    @Test
+    fun `LAN server requires HTTPS secret and gives browsers isolated workspaces`() {
+        val password = "synthetic-test-password"
+        val keyStore = temporaryDirectory.resolve("local-rag-test.p12")
+        val keyTool = Path.of(System.getProperty("java.home"), "bin", "keytool").toString()
+        val process = ProcessBuilder(
+            keyTool,
+            "-genkeypair",
+            "-alias", "local-rag-test",
+            "-keyalg", "RSA",
+            "-keysize", "2048",
+            "-validity", "2",
+            "-storetype", "PKCS12",
+            "-keystore", keyStore.toString(),
+            "-storepass", password,
+            "-keypass", password,
+            "-dname", "CN=localhost",
+            "-ext", "SAN=dns:localhost",
+            "-noprompt",
+        ).redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+        assertTrue(process.waitFor(30, TimeUnit.SECONDS))
+        assertEquals(0, process.exitValue())
+
+        val secret = "synthetic-shared-secret-with-at-least-32-bytes"
+        val serverConfig = LocalHttpServerConfig(
+            java.net.InetAddress.getByName("127.0.0.1"),
+            0,
+            URI("https://localhost"),
+            keyStore,
+            password.toCharArray(),
+            secret,
+        )
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama, serverConfig)
+            try {
+                fixture.server.start()
+                val origin = "https://localhost:${fixture.server.port}"
+                val trustManager = object : javax.net.ssl.X509TrustManager {
+                    override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) = Unit
+                    override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) = Unit
+                    override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
+                }
+                val sslContext = javax.net.ssl.SSLContext.getInstance("TLS").apply {
+                    init(null, arrayOf(trustManager), java.security.SecureRandom())
+                }
+                fun client(): HttpClient {
+                    val cookies = java.net.CookieManager(null, java.net.CookiePolicy.ACCEPT_ALL)
+                    return HttpClient.newBuilder().sslContext(sslContext).cookieHandler(cookies).build()
+                }
+                fun request(
+                    client: HttpClient,
+                    method: String,
+                    path: String,
+                    body: String? = null,
+                ): HttpResponse<String> {
+                    val builder = HttpRequest.newBuilder(URI("$origin$path"))
+                        .header("Origin", origin)
+                    if (body != null) builder.header("Content-Type", "application/json")
+                    val publisher = body?.let(HttpRequest.BodyPublishers::ofString)
+                        ?: HttpRequest.BodyPublishers.noBody()
+                    return client.send(
+                        builder.method(method, publisher).build(),
+                        HttpResponse.BodyHandlers.ofString(),
+                    )
+                }
+
+                val unauthenticated = client()
+                val status = request(unauthenticated, "GET", "/api/auth/status")
+                assertEquals(200, status.statusCode())
+                assertFalse(json(status.body()).jsonObject.getValue("authenticated").jsonPrimitive.content.toBoolean())
+                assertEquals(401, request(unauthenticated, "GET", "/api/chat/sessions").statusCode())
+                val wrongLogin = request(unauthenticated, "POST", "/api/auth/login", """{"secret":"wrong"}""")
+                assertEquals(401, wrongLogin.statusCode())
+
+                val owner = client()
+                val loginBody = Json.encodeToString(buildJsonObject { put("secret", secret) })
+                assertEquals(200, request(owner, "POST", "/api/auth/login", loginBody).statusCode())
+                val created = request(owner, "POST", "/api/chat/sessions", "{}")
+                assertEquals(201, created.statusCode(), created.body())
+                val sessionId = json(created.body()).jsonObject.getValue("session").jsonObject.getValue("id").jsonPrimitive.content
+
+                val participant = client()
+                assertEquals(200, request(participant, "POST", "/api/auth/login", loginBody).statusCode())
+                assertTrue(json(request(participant, "GET", "/api/chat/sessions").body()).jsonArray.isEmpty())
+                assertEquals(404, request(participant, "GET", "/api/chat/sessions/$sessionId").statusCode())
+                assertEquals(1, json(request(owner, "GET", "/api/chat/sessions").body()).jsonArray.size)
+                assertEquals(
+                    json(request(owner, "GET", "/api/sources").body()),
+                    json(request(participant, "GET", "/api/sources").body()),
+                )
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
+    fun `loopback workspace cookie is renewed on active status and API responses`() {
+        FakeOllama().use { ollama ->
+            val fixture = LocalRagFixture(temporaryDirectory, ollama)
+            try {
+                fixture.server.start()
+                val api = ApiClient(fixture.server.port)
+                val initial = api.get("/api/auth/status")
+                assertEquals(200, initial.statusCode())
+                val firstCookie = initial.headers().allValues("Set-Cookie").single()
+                val token = firstCookie.substringBefore(';')
+                assertTrue(firstCookie.contains("Max-Age=2592000"))
+
+                val refreshed = api.get("/api/auth/status")
+                assertEquals(200, refreshed.statusCode())
+                val refreshedCookie = refreshed.headers().allValues("Set-Cookie").single()
+                assertEquals(token, refreshedCookie.substringBefore(';'))
+                assertTrue(refreshedCookie.contains("Max-Age=2592000"))
+
+                val sessions = api.get("/api/chat/sessions")
+                assertEquals(200, sessions.statusCode())
+                assertEquals(token, sessions.headers().allValues("Set-Cookie").single().substringBefore(';'))
+            } finally {
+                fixture.close()
+            }
+        }
+    }
+
+    @Test
     fun `chat session routes create list restore and require delete confirmation`() {
         FakeOllama().use { ollama ->
             val fixture = LocalRagFixture(temporaryDirectory, ollama)
@@ -85,6 +232,8 @@ class ApplicationServiceTest {
                 val api = ApiClient(fixture.server.port)
                 val created = api.postJson("/api/chat/sessions", "{}")
                 assertEquals(201, created.statusCode())
+                assertTrue(api.hasWorkspaceCookie(), "The server must issue a browser workspace cookie.")
+                assertTrue(api.willSendWorkspaceCookie(), "The client must send its workspace cookie on the next same-origin request.")
                 val sessionId = json(created.body()).jsonObject.getValue("session").jsonObject
                     .getValue("id").jsonPrimitive.content
                 val detail = api.get("/api/chat/sessions/$sessionId")
@@ -133,13 +282,16 @@ class ApplicationServiceTest {
                 val firstTurnId = java.util.UUID.randomUUID().toString()
                 val firstRequest = """{"turnId":"$firstTurnId","question":"First session question","strategy":"STRUCTURAL"}"""
                 val firstResponse = api.postJson("/api/chat/sessions/$firstSessionId/turns", firstRequest)
-                assertEquals(200, firstResponse.statusCode(), firstResponse.body())
-                val firstMessage = json(firstResponse.body()).jsonObject.getValue("message").jsonObject
+                assertEquals(202, firstResponse.statusCode(), firstResponse.body())
+                assertEquals("completed", api.awaitChatTurn(firstSessionId, firstTurnId).getValue("state").jsonPrimitive.content)
+                val firstMessage = api.assistantMessage(firstSessionId, firstTurnId)
                 assertEquals("fixture-chat", firstMessage.getValue("modelSelection").jsonObject
                     .getValue("modelId").jsonPrimitive.content)
                 assertTrue(firstMessage.getValue("elapsedMs").jsonPrimitive.content.toLong() >= 0)
                 val retry = api.postJson("/api/chat/sessions/$firstSessionId/turns", firstRequest)
-                val retryMessage = json(retry.body()).jsonObject.getValue("message").jsonObject
+                assertEquals(202, retry.statusCode())
+                assertEquals("completed", api.awaitChatTurn(firstSessionId, firstTurnId).getValue("state").jsonPrimitive.content)
+                val retryMessage = api.assistantMessage(firstSessionId, firstTurnId)
                 assertEquals(firstMessage.getValue("id"), retryMessage.getValue("id"))
                 assertEquals(firstMessage.getValue("elapsedMs"), retryMessage.getValue("elapsedMs"))
 
@@ -148,8 +300,9 @@ class ApplicationServiceTest {
                     "/api/chat/sessions/$secondSessionId/turns",
                     """{"turnId":"$secondTurnId","question":"Second session question","strategy":"STRUCTURAL"}""",
                 )
-                assertEquals(200, secondResponse.statusCode(), secondResponse.body())
-                val secondMessage = json(secondResponse.body()).jsonObject.getValue("message").jsonObject
+                assertEquals(202, secondResponse.statusCode(), secondResponse.body())
+                assertEquals("completed", api.awaitChatTurn(secondSessionId, secondTurnId).getValue("state").jsonPrimitive.content)
+                val secondMessage = api.assistantMessage(secondSessionId, secondTurnId)
                 val secondModel = secondMessage.getValue("modelSelection").jsonObject
                 assertEquals("ollama", secondModel.getValue("providerId").jsonPrimitive.content)
                 assertEquals("qwen2.5:7b", secondModel.getValue("modelId").jsonPrimitive.content)
@@ -253,15 +406,17 @@ class ApplicationServiceTest {
                 val turnId = java.util.UUID.randomUUID().toString()
                 val body = """{"turnId":"$turnId","question":"Какая дата оплаты?","strategy":"STRUCTURAL"}"""
                 val first = api.postJson("/api/chat/sessions/$sessionId/turns", body)
-                assertEquals(200, first.statusCode(), first.body())
-                val firstMessage = json(first.body()).jsonObject.getValue("message").jsonObject
+                assertEquals(202, first.statusCode(), first.body())
+                assertEquals("completed", api.awaitChatTurn(sessionId, turnId).getValue("state").jsonPrimitive.content)
+                val firstMessage = api.assistantMessage(sessionId, turnId)
                 assertEquals(dev.localrag.chat.ChatService.ABSTENTION, firstMessage.getValue("content").jsonPrimitive.content)
                 assertEquals(0, firstMessage.getValue("documentCitations").jsonArray.size)
                 assertEquals(0, firstMessage.getValue("memoryReferences").jsonArray.size)
 
                 val retried = api.postJson("/api/chat/sessions/$sessionId/turns", body)
-                assertEquals(200, retried.statusCode())
-                val retriedMessage = json(retried.body()).jsonObject.getValue("message").jsonObject
+                assertEquals(202, retried.statusCode())
+                assertEquals("completed", api.awaitChatTurn(sessionId, turnId).getValue("state").jsonPrimitive.content)
+                val retriedMessage = api.assistantMessage(sessionId, turnId)
                 assertEquals(firstMessage.getValue("id"), retriedMessage.getValue("id"))
                 val detail = json(api.get("/api/chat/sessions/$sessionId").body()).jsonObject
                 assertEquals(2, detail.getValue("messages").jsonArray.size)
@@ -846,7 +1001,8 @@ class ApplicationServiceTest {
                 )
                 assertEquals(202, indexed.statusCode(), indexed.body())
                 val jobId = json(indexed.body()).jsonObject.getValue("jobId").jsonPrimitive.content
-                assertEquals(1, api.awaitCompleted(jobId).getValue("succeeded").jsonPrimitive.content.toInt())
+                val completedIndex = api.awaitCompleted(jobId)
+                assertEquals(1, completedIndex.getValue("succeeded").jsonPrimitive.content.toInt(), completedIndex.toString())
 
                 val questions = (1..10).map { number ->
                     BenchmarkQuestion(
@@ -1037,7 +1193,13 @@ class ApplicationServiceTest {
 
     private fun json(raw: String) = Json.parseToJsonElement(raw)
 
-    private class LocalRagFixture(directory: Path, ollama: FakeOllama) : AutoCloseable {
+    private class LocalRagFixture(
+        directory: Path,
+        ollama: FakeOllama,
+        serverConfig: LocalHttpServerConfig = LocalHttpServerConfig(
+            java.net.InetAddress.getByName("127.0.0.1"), 0, null, null, null, null,
+        ),
+    ) : AutoCloseable {
         val database = directory.resolve("v11.sqlite")
         val sourcesDirectory = directory.resolve("sources")
         val credentialConfigured = AtomicBoolean(true)
@@ -1046,6 +1208,7 @@ class ApplicationServiceTest {
         val index = SqliteIndexRepository(database)
         val store = BenchmarkStore(database)
         private val chatStore = ChatStore(database)
+        private val workspaceStore = WorkspaceStore(database)
         private val jobs = JobManager()
         private val api = ollama.client()
         private val embeddings = OllamaEmbeddingPort(api)
@@ -1099,7 +1262,11 @@ class ApplicationServiceTest {
         private val benchmark = BenchmarkRunner(rag, store, index)
         private val chatService = ChatService(chatStore, rag, chat, embeddings)
         private val application = ApplicationService(index, store, catalog, jobs, indexing, rag, benchmark, api, modelConfiguration, chatStore, chatService)
-        val server = LocalHttpServer(application, port = 0)
+        val server = LocalHttpServer(
+            application,
+            workspaceStore,
+            serverConfig,
+        )
         fun seedSparsePdf(): String {
             val record = SourceRecord(
                 sourceId = java.util.UUID.randomUUID().toString(),
@@ -1132,6 +1299,8 @@ class ApplicationServiceTest {
 
         override fun close() {
             server.close()
+            application.close()
+            workspaceStore.close()
             jobs.close()
             chatStore.close()
             store.close()
@@ -1141,9 +1310,36 @@ class ApplicationServiceTest {
 
     private class ApiClient(port: Int) {
         private val origin = "http://127.0.0.1:$port"
-        private val client = HttpClient.newHttpClient()
+        private val cookieManager = java.net.CookieManager(null, java.net.CookiePolicy.ACCEPT_ALL)
+        private val client = HttpClient.newBuilder().cookieHandler(cookieManager).build()
+
+        fun hasWorkspaceCookie(): Boolean =
+            cookieManager.cookieStore.cookies.any { it.name == WorkspaceStore.SESSION_COOKIE }
+
+        fun willSendWorkspaceCookie(): Boolean =
+            cookieManager.get(URI("$origin/api/chat/sessions"), emptyMap())
+                .values.flatten().any { it.startsWith("${WorkspaceStore.SESSION_COOKIE}=") }
 
         fun get(path: String): HttpResponse<String> = send("GET", path, null, null, null)
+        fun awaitChatTurn(sessionId: String, turnId: String): kotlinx.serialization.json.JsonObject {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
+            while (System.nanoTime() < deadline) {
+                val response = get("/api/chat/sessions/$sessionId/turns/$turnId")
+                if (response.statusCode() == 200) {
+                    val job = Json.parseToJsonElement(response.body()).jsonObject
+                    if (job.getValue("state").jsonPrimitive.content !in setOf("queued", "running")) return job
+                }
+                Thread.sleep(20)
+            }
+            error("Chat turn $turnId did not finish within the test deadline.")
+        }
+
+        fun assistantMessage(sessionId: String, turnId: String): kotlinx.serialization.json.JsonObject =
+            Json.parseToJsonElement(get("/api/chat/sessions/$sessionId").body()).jsonObject
+                .getValue("messages").jsonArray
+                .single { it.jsonObject.getValue("turnId").jsonPrimitive.content == turnId &&
+                    it.jsonObject.getValue("role").jsonPrimitive.content == "ASSISTANT" }
+                .jsonObject
 
         fun postJson(path: String, body: String, requestOrigin: String = origin): HttpResponse<String> =
             send("POST", path, body.toByteArray(), "application/json", requestOrigin)

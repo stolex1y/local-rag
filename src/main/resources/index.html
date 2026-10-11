@@ -153,6 +153,13 @@
       .rating-form { grid-template-columns: 1fr; }
       .rating-note { grid-column: auto; }
     }
+    .login-panel { max-width: 34rem; margin: 2rem auto; }
+    .login-form { display: grid; gap: .75rem; }
+    .chat-progress { display: flex; align-items: center; gap: .65rem; margin: .75rem 0; color: var(--accent-dark); font-weight: 600; }
+    #chat-progress[hidden] { display: none; }
+    .chat-spinner { width: 1.1rem; height: 1.1rem; flex: 0 0 auto; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: chat-spin .8s linear infinite; }
+    @keyframes chat-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { .chat-spinner { animation-duration: 2s; } }
   </style>
 </head>
 <body>
@@ -162,7 +169,19 @@
       <h1>Соберите коллекцию и задавайте вопросы по источникам</h1>
     </div>
   </header>
-  <main class="wrap">
+  <section id="login-view" class="wrap" hidden>
+    <div class="panel login-panel">
+      <h2>Доступ к Local RAG</h2>
+      <p class="muted">Введите общий секрет владельца приложения. Работает только через доверенный HTTPS-адрес.</p>
+      <form id="login-form" class="login-form">
+        <label for="auth-secret">Общий секрет</label>
+        <input id="auth-secret" type="password" autocomplete="current-password" required>
+        <button type="submit">Войти</button>
+      </form>
+      <p id="login-error" class="error" role="alert" hidden></p>
+    </div>
+  </section>
+  <main id="app-view" class="wrap" hidden>
     <section class="panel" aria-labelledby="status-heading">
       <div class="panel-head">
         <div><h2 id="status-heading">Состояние коллекции и модели</h2></div>
@@ -279,6 +298,10 @@
           </div>
         </div>
         <p id="chat-status" class="notice" role="status" aria-live="polite">Выберите или создайте сессию.</p>
+        <div id="chat-progress" class="chat-progress" role="status" aria-live="polite" hidden>
+          <span class="chat-spinner" aria-hidden="true"></span>
+          <span id="chat-progress-label">Запрос ожидает выполнения…</span>
+        </div>
         <div class="chat-model-grid">
           <div class="field">
             <label for="chat-provider-select">Провайдер</label>
@@ -306,6 +329,7 @@
                 <label for="chat-question">Сообщение</label>
                 <textarea id="chat-question" maxlength="4000" required placeholder="Задайте вопрос, уточните цель или добавьте ограничение"></textarea>
                 <button id="chat-send" type="submit" disabled>Отправить</button>
+                <button id="chat-cancel" class="danger" type="button" hidden>Отменить</button>
               </form>
             </section>
             <div class="chat-workspace">
@@ -332,7 +356,7 @@
 
       const $ = (selector, root = document) => root.querySelector(selector);
       const state = { modelsAvailable: false, embeddingAvailable: false, rerankerAvailable: false, modelConfiguration: null, modelSelectionPending: false, activeJob: null, sources: [], benchmark: null, results: [] };
-      const chatState = { sessionId: null, detail: null, sessions: [], sharedFacts: [], pendingTurn: null, busy: false, loadingSession: false, modelSelectionPending: false, modelSelectionPendingSessionId: null, modelSelectionUncertain: false, sessionLoadGeneration: 0, refreshGeneration: 0, activeTab: "collection" };
+      const chatState = { sessionId: null, detail: null, sessions: [], sharedFacts: [], pendingTurn: null, pollingTurns: new Set(), busy: false, loadingSession: false, modelSelectionPending: false, modelSelectionPendingSessionId: null, modelSelectionUncertain: false, sessionLoadGeneration: 0, refreshGeneration: 0, activeTab: "collection" };
       const MAX_FILE_BYTES = 256 * 1024 * 1024;
       const MAX_IMPORT_BYTES = 512 * 1024 * 1024;
       const MAX_BENCHMARK_FILE_BYTES = 1024 * 1024;
@@ -1254,7 +1278,58 @@
         const pending = [...detail.messages].reverse().find(
           item => item.role === "USER" && !completedTurns.has(item.turnId),
         );
-        return pending ? { turnId: pending.turnId, question: pending.content } : null;
+        if (!pending) return null;
+        const turn = detail.activeTurn?.turnId === pending.turnId ? detail.activeTurn : null;
+        return {
+          turnId: pending.turnId,
+          question: pending.content,
+          state: turn?.state || "interrupted",
+          error: turn?.error || null,
+        };
+      }
+
+      const isTurnActive = turn => turn?.state === "queued" || turn?.state === "running";
+
+      function updateChatProgress() {
+        const turn = chatState.pendingTurn;
+        const active = isTurnActive(turn);
+        $("#chat-progress").hidden = !active;
+        if (active) {
+          $("#chat-progress-label").textContent = turn.state === "queued"
+            ? "Запрос ожидает очереди…"
+            : "Модель формирует ответ…";
+        }
+      }
+
+      function ensureTurnPolling(sessionId, turn) {
+        if (!isTurnActive(turn)) return;
+        const key = `${sessionId}:${turn.turnId}`;
+        if (chatState.pollingTurns.has(key)) return;
+        chatState.pollingTurns.add(key);
+        void pollChatTurn(sessionId, turn).finally(() => chatState.pollingTurns.delete(key));
+      }
+
+      async function pollChatTurn(sessionId, initialTurn) {
+        let turn = initialTurn;
+        while (isTurnActive(turn)) {
+          await new Promise(resolve => window.setTimeout(resolve, 800));
+          try {
+            turn = await request(`/api/chat/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turn.turnId)}`);
+          } catch (error) {
+            if (chatState.sessionId === sessionId) message("chat-error", error.message);
+            return;
+          }
+          if (chatState.sessionId === sessionId) {
+            chatState.pendingTurn = { ...chatState.pendingTurn, ...turn };
+            updateChatProgress();
+            updateChatControls();
+          }
+        }
+        if (chatState.sessionId === sessionId) {
+          await refreshChat(sessionId);
+          if (turn.state === "completed") message("chat-error", "");
+          else message("chat-error", turn.error || "Ход прерван. Его можно повторить.");
+        }
       }
 
       async function refreshChat(sessionId = chatState.sessionId) {
@@ -1293,8 +1368,10 @@
         renderSharedFacts();
         renderChatMessages();
         renderTaskState();
+        updateChatProgress();
         updateChatControls();
         renderChatModelSelection();
+        if (chatState.sessionId && chatState.pendingTurn) ensureTurnPolling(chatState.sessionId, chatState.pendingTurn);
       }
 
       function renderChatSessions() {
@@ -1370,11 +1447,20 @@
           bubble.append(node("strong", role), node("p", item.content, "answer-text"));
           bubble.append(node("div", `Сохранено ${item.createdAt}`, "chat-meta"));
           if (item.role === "USER" && !completedTurns.has(item.turnId)) {
-            const retry = node("button", "Повторить этот ход", "secondary");
-            retry.type = "button";
-            retry.disabled = chatState.busy || chatState.modelSelectionPending || chatState.modelSelectionUncertain;
-            retry.addEventListener("click", () => sendChatTurn(item.turnId, item.content));
-            bubble.append(retry);
+            const turn = chatState.pendingTurn?.turnId === item.turnId ? chatState.pendingTurn : null;
+            if (isTurnActive(turn)) {
+              bubble.append(node("div", turn.state === "queued" ? "В очереди…" : "Генерируется…", "chat-meta"));
+            } else {
+              const stateLabel = turn?.state === "cancelled" ? "Ход отменён."
+                : turn?.state === "failed" ? `Ошибка: ${turn.error || "не удалось выполнить ход."}`
+                  : "Ход прерван.";
+              bubble.append(node("div", stateLabel, "chat-meta"));
+              const retry = node("button", "Повторить этот ход", "secondary");
+              retry.type = "button";
+              retry.disabled = chatState.busy || chatState.modelSelectionPending || chatState.modelSelectionUncertain;
+              retry.addEventListener("click", () => sendChatTurn(item.turnId, item.content));
+              bubble.append(retry);
+            }
           }
           if (item.role === "ASSISTANT") {
             const model = item.modelSelection
@@ -1430,17 +1516,22 @@
       }
 
       function updateChatControls() {
+        const activeTurn = isTurnActive(chatState.pendingTurn);
         const locked = chatState.busy || chatState.loadingSession || chatState.modelSelectionPending;
+        const turnLocked = locked || activeTurn;
         const hasSession = Boolean(chatState.sessionId && chatState.detail);
         const selection = chatState.detail?.session?.modelSelection;
         const provider = state.modelConfiguration?.providers.find(item => item.id === selection?.providerId);
         const selectedModel = provider?.models.find(item => item.id === selection?.modelId);
         const modelAvailable = selectedModel?.available === true;
-        const canEditTaskState = hasSession && !locked;
+        const canEditTaskState = hasSession && !turnLocked;
         $("#chat-new-session").disabled = locked;
         $("#chat-delete-session").disabled = !hasSession || locked;
-        $("#chat-provider-select").disabled = !hasSession || locked || !state.modelConfiguration;
-        $("#chat-model-select").disabled = !hasSession || locked || !state.modelConfiguration;
+        $("#chat-provider-select").disabled = !hasSession || turnLocked || !state.modelConfiguration;
+        $("#chat-model-select").disabled = !hasSession || turnLocked || !state.modelConfiguration;
+        $("#chat-send").hidden = activeTurn;
+        $("#chat-cancel").hidden = !activeTurn;
+        $("#chat-cancel").disabled = locked || chatState.pendingTurn?.accepted === false;
         $("#chat-send").disabled = !hasSession || locked || Boolean(chatState.pendingTurn) || !modelAvailable ||
           chatState.modelSelectionUncertain || Boolean(chatState.detail?.session?.modelSelectionRequired) ||
           Boolean(state.modelConfiguration?.warning && !selection);
@@ -1449,9 +1540,9 @@
         $("#task-clarifications").disabled = !canEditTaskState;
         $("#task-constraints").disabled = !canEditTaskState;
         $("#task-terms").disabled = !canEditTaskState;
-        $("#chat-question").disabled = locked || Boolean(chatState.pendingTurn);
+        $("#chat-question").disabled = turnLocked || Boolean(chatState.pendingTurn);
         $("#chat-question").placeholder = chatState.pendingTurn
-          ? "Сначала повторите незавершённый ход выше."
+          ? "Сначала завершите или повторите незавершённый ход."
           : "Задайте вопрос, уточните цель или добавьте ограничение";
       }
 
@@ -1519,31 +1610,58 @@
         if (chatState.pendingTurn && !retryTurnId) return;
         const question = pending?.question || $("#chat-question").value.trim();
         if (!question) return;
+        const sessionId = chatState.sessionId;
         const turnId = pending?.turnId || crypto.randomUUID();
-        chatState.pendingTurn = { turnId, question };
-        chatState.busy = true;
+        chatState.pendingTurn = { turnId, question, state: "queued", error: null, accepted: false };
         updateChatControls();
-        $("#chat-status").textContent = "Ищем по документам и изолированной памяти сессии…";
+        updateChatProgress();
         message("chat-error", "");
         try {
-          await request(`/api/chat/sessions/${encodeURIComponent(chatState.sessionId)}/turns`, jsonOptions("POST", {
+          const job = await request(`/api/chat/sessions/${encodeURIComponent(sessionId)}/turns`, jsonOptions("POST", {
             turnId,
             question,
             strategy: "STRUCTURAL",
           }));
-          chatState.pendingTurn = null;
-          $("#chat-question").value = "";
-          await refreshChat();
-          message("chat-error", "");
+          const acceptedTurn = { turnId, question, state: job.state, error: job.error || null, accepted: true };
+          if (chatState.sessionId === sessionId) chatState.pendingTurn = acceptedTurn;
+          else ensureTurnPolling(sessionId, acceptedTurn);
+          if (!retryTurnId) $("#chat-question").value = "";
+          if (chatState.sessionId === sessionId) {
+            await refreshChat(sessionId);
+            $("#chat-status").textContent = `Сессия: ${chatState.detail.session.title}`;
+          }
         } catch (error) {
-          try { await refreshChat(); } catch { }
+          if (chatState.sessionId === sessionId) {
+            try { await refreshChat(sessionId); } catch { }
+            message("chat-error", error.message);
+          }
+        }
+      }
+
+      async function cancelChatTurn() {
+        const turn = chatState.pendingTurn;
+        const sessionId = chatState.sessionId;
+        if (!sessionId || !isTurnActive(turn) || turn.accepted === false) return;
+        $("#chat-cancel").disabled = true;
+        try {
+          const result = await request(
+            `/api/chat/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turn.turnId)}`,
+            { method: "DELETE" },
+          );
+          if (chatState.sessionId === sessionId) {
+            chatState.pendingTurn = { ...turn, ...result };
+            updateChatProgress();
+            updateChatControls();
+            if (result.state === "cancelled") {
+              await refreshChat(sessionId);
+              message("chat-error", "Запрос отменён. Его можно повторить.");
+            } else if (result.state === "completed") {
+              await refreshChat(sessionId);
+            }
+          }
+        } catch (error) {
           message("chat-error", error.message);
-        } finally {
-          chatState.busy = false;
-          renderChatSessions();
-          renderChatMessages();
           updateChatControls();
-          $("#chat-status").textContent = chatState.detail ? `Сессия: ${chatState.detail.session.title}` : "Выберите или создайте сессию.";
         }
       }
 
@@ -1614,10 +1732,35 @@
         $("#chat-new-session").addEventListener("click", createChatSession);
         $("#chat-delete-session").addEventListener("click", deleteChatSession);
         $("#chat-form").addEventListener("submit", event => { event.preventDefault(); sendChatTurn(); });
+        $("#chat-cancel").addEventListener("click", cancelChatTurn);
         $("#task-state-form").addEventListener("submit", saveTaskState);
         window.addEventListener("popstate", () => loadChatFromUrl().catch(error => message("chat-error", error.message)));
         await loadChatFromUrl();
       }
+
+      async function showAuthenticatedApp() {
+        $("#login-view").hidden = true;
+        $("#app-view").hidden = false;
+        await initializeTabs();
+        await refresh();
+      }
+
+      $("#login-form").addEventListener("submit", async event => {
+        event.preventDefault();
+        const button = event.currentTarget.querySelector("button[type=submit]");
+        button.disabled = true;
+        message("login-error", "");
+        try {
+          await request("/api/auth/login", jsonOptions("POST", { secret: $("#auth-secret").value }));
+          $("#auth-secret").value = "";
+          await showAuthenticatedApp();
+        } catch (error) {
+          message("login-error", error.message);
+        } finally {
+          button.disabled = false;
+        }
+      });
+
       $("#refresh-button").addEventListener("click", refresh);
       $("#refresh-sources").addEventListener("click", refreshSources);
       $("#source-files").addEventListener("change", renderUploadSelection);
@@ -1629,8 +1772,19 @@
       $("#benchmark-upload").addEventListener("click", uploadBenchmark);
       $("#benchmark-run").addEventListener("click", runBenchmark);
       $("#benchmark-refresh").addEventListener("click", refresh);
-      initializeTabs().catch(error => message("chat-error", error.message));
-      refresh();
+      (async () => {
+        try {
+          const auth = await request("/api/auth/status");
+          if (auth.authenticated) await showAuthenticatedApp();
+          else {
+            $("#login-view").hidden = false;
+            $("#auth-secret").focus();
+          }
+        } catch (error) {
+          $("#login-view").hidden = false;
+          message("login-error", error.message);
+        }
+      })();
     })();
   </script>
 </body>

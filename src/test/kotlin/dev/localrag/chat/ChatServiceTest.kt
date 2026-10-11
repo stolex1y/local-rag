@@ -228,57 +228,6 @@ class ChatServiceTest {
     }
 
 
-    @Test
-    fun `turn generation serializes state updates within the service`() {
-        val database = temporaryDirectory.resolve("serialized-turns.sqlite")
-        ChatStore(database).use { store ->
-            SqliteIndexRepository(database).use { index ->
-                val embeddings = FixtureEmbeddings()
-                val firstEntered = java.util.concurrent.CountDownLatch(1)
-                val secondEntered = java.util.concurrent.CountDownLatch(1)
-                val secondStarted = java.util.concurrent.CountDownLatch(1)
-                val releaseFirst = java.util.concurrent.CountDownLatch(1)
-                val generator = object : ChatTurnGenerator {
-                    override fun completeTurn(selection: ModelSelection, request: ChatTurnRequest): ChatTurnCompletion {
-                        if (request.question == "First") {
-                            firstEntered.countDown()
-                            check(releaseFirst.await(5, java.util.concurrent.TimeUnit.SECONDS))
-                        } else {
-                            secondEntered.countDown()
-                        }
-                        return ChatTurnCompletion(
-                            request.question,
-                            ChatTaskStateDelta(clarificationsToAdd = listOf(request.question)),
-                            sessionTitle = if (request.generateTitle) "Synthetic chat" else null,
-                        )
-                    }
-                }
-                val service = ChatService(store, RagService(index, embeddings, EmptyChatPort, EmptyReranker), generator, embeddings)
-                val sessionId = store.createSession().session.id
-                val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
-                try {
-                    val first = executor.submit {
-                        service.turn(sessionId, UUID.randomUUID().toString(), "First", ChunkStrategy.STRUCTURAL, SELECTION)
-                    }
-                    assertTrue(firstEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
-                    val second = executor.submit {
-                        secondStarted.countDown()
-                        service.turn(sessionId, UUID.randomUUID().toString(), "Second", ChunkStrategy.STRUCTURAL, SELECTION)
-                    }
-                    assertTrue(secondStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
-                    assertFalse(secondEntered.await(100, java.util.concurrent.TimeUnit.MILLISECONDS))
-                    releaseFirst.countDown()
-                    first.get(5, java.util.concurrent.TimeUnit.SECONDS)
-                    second.get(5, java.util.concurrent.TimeUnit.SECONDS)
-
-                    assertEquals(setOf("First", "Second"), store.taskState(sessionId).clarifications.toSet())
-                } finally {
-                    releaseFirst.countDown()
-                    executor.shutdownNow()
-                }
-            }
-        }
-    }
 
     private class FixtureEmbeddings : EmbeddingPort {
         override val modelName = "fixture-embedding"
