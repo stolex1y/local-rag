@@ -59,7 +59,7 @@ class ModelSelectionStoreTest {
         assertEquals("http://127.0.0.1:11434", ollama.baseUrl)
         assertEquals(ProviderKind.OLLAMA, ollama.kind)
         assertNull(ollama.credentialEnv)
-        assertEquals(listOf("qwen2.5:3b", "qwen2.5:7b"), ollama.models.map { it.id })
+        assertEquals(listOf("qwen2.5:3b", "qwen2.5:3b-instruct-q5_K_M", "qwen2.5:7b"), ollama.models.map { it.id })
         assertEquals(ModelSelection("deepseek", "deepseek-flash"), catalog.defaultSelection)
     }
 

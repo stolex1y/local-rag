@@ -22,6 +22,9 @@ import java.util.concurrent.locks.ReentrantLock
 
 const val EMBEDDING_MODEL = "embeddinggemma:300m"
 internal const val OLLAMA_NUM_THREADS = 8
+internal const val OLLAMA_TEMPERATURE = 0.0
+internal const val OLLAMA_NUM_PREDICT = 384
+internal const val OLLAMA_NUM_CTX = 4096
 
 class LocalModelException(message: String) : RuntimeException(message)
 

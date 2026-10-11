@@ -527,7 +527,24 @@ class BrowserAcceptanceTest {
                         )
                         indexSyntheticGreenhouseSource(owner)
                         owner.locator("#chat-tab").click()
-                        createChatSession(owner)
+                        val ownerSession = createChatSession(owner)
+                        selectLocalChatModel(owner)
+                        fake.holdLocalGeneration.set(true)
+                        val ownerQuestion = "What is the greenhouse payment date?"
+                        val ownerTurnResponse = owner.waitForResponse("**/api/chat/sessions/$ownerSession/turns") {
+                            owner.locator("#chat-question").fill(ownerQuestion)
+                            owner.locator("#chat-send").click()
+                        }
+                        assertEquals(202, ownerTurnResponse.status())
+                        val ownerTurnId = Json.parseToJsonElement(ownerTurnResponse.text()).jsonObject
+                            .getValue("turnId").jsonPrimitive.content
+                        assertTrue(fake.localGenerationStarted.await(10, TimeUnit.SECONDS))
+                        assertEquals(
+                            "running",
+                            Json.parseToJsonElement(
+                                owner.request().get("$ownerOrigin/api/chat/sessions/$ownerSession/turns/$ownerTurnId").text(),
+                            ).jsonObject.getValue("state").jsonPrimitive.content,
+                        )
 
                         participant.navigate("$origin/")
                         assertThat(participant.locator("#login-view")).isVisible()
@@ -537,6 +554,59 @@ class BrowserAcceptanceTest {
                         participant.locator("#chat-tab").click()
                         assertThat(participant.locator("#chat-sessions")).containsText("Сессий пока нет.")
                         assertThat(participant.locator("#task-goal")).hasValue("")
+
+                        val participantSession = createChatSession(participant)
+                        selectLocalChatModel(participant)
+                        val participantQuestion = "What is the greenhouse payment date for this workspace?"
+                        val participantTurnResponse =
+                            participant.waitForResponse("**/api/chat/sessions/$participantSession/turns") {
+                                participant.locator("#chat-question").fill(participantQuestion)
+                                participant.locator("#chat-send").click()
+                            }
+                        assertEquals(202, participantTurnResponse.status())
+                        val participantTurnId = Json.parseToJsonElement(participantTurnResponse.text()).jsonObject
+                            .getValue("turnId").jsonPrimitive.content
+                        assertEquals(
+                            "queued",
+                            Json.parseToJsonElement(participantTurnResponse.text()).jsonObject
+                                .getValue("state").jsonPrimitive.content,
+                        )
+                        assertEquals(1, fake.localGenerationCalls.get())
+                        assertEquals(
+                            404,
+                            owner.request().get("$ownerOrigin/api/chat/sessions/$participantSession").status(),
+                        )
+                        val cloudCallsBeforeCompletion = fake.cloud.chatModels.size
+                        fake.releaseLocalGeneration.countDown()
+                        assertEquals("completed", waitForChatTurn(owner, ownerSession, ownerTurnId)
+                            .getValue("state").jsonPrimitive.content)
+                        assertEquals("completed", waitForChatTurn(participant, participantSession, participantTurnId)
+                            .getValue("state").jsonPrimitive.content)
+                        val ownerDetail = Json.parseToJsonElement(
+                            owner.request().get("$ownerOrigin/api/chat/sessions/$ownerSession").text(),
+                        ).jsonObject
+                        val participantDetail = Json.parseToJsonElement(
+                            participant.request().get("$origin/api/chat/sessions/$participantSession").text(),
+                        ).jsonObject
+                        val ownerMessages = ownerDetail.getValue("messages").jsonArray.map { it.jsonObject }
+                        val participantMessages = participantDetail.getValue("messages").jsonArray.map { it.jsonObject }
+                        assertEquals(
+                            listOf(ownerQuestion),
+                            ownerMessages.filter { it.getValue("role").jsonPrimitive.content == "USER" }
+                                .map { it.getValue("content").jsonPrimitive.content },
+                        )
+                        assertEquals(
+                            listOf(participantQuestion),
+                            participantMessages.filter { it.getValue("role").jsonPrimitive.content == "USER" }
+                                .map { it.getValue("content").jsonPrimitive.content },
+                        )
+                        listOf(ownerMessages, participantMessages).forEach { messages ->
+                            val assistant = messages.single { it.getValue("role").jsonPrimitive.content == "ASSISTANT" }
+                            assertEquals("Synthetic local chat answer.", assistant.getValue("content").jsonPrimitive.content)
+                            assertTrue(assistant.getValue("documentCitations").jsonArray.isNotEmpty())
+                        }
+                        assertEquals(2, fake.localGenerationCalls.get())
+                        assertEquals(cloudCallsBeforeCompletion, fake.cloud.chatModels.size)
 
                         participant.locator("#collection-tab").click()
                         assertThat(participant.locator("#source-list")).containsText("greenhouse-chat.md")
@@ -3366,9 +3436,10 @@ class BrowserAcceptanceTest {
                     null,
                     listOf(
                         ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
+                        ProviderModelDefinition("qwen2.5:3b-instruct-q5_K_M", "Qwen 2.5 3B Q5_K_M"),
                         ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
                     ),
-                    ProviderKind.OLLAMA,
+                    kind = ProviderKind.OLLAMA,
                 ),
             ),
             selection,
@@ -3474,7 +3545,7 @@ class BrowserAcceptanceTest {
         private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             this.executor = this@FakeOllama.executor
             createContext("/api/tags") { exchange ->
-                val models = """{"models":[{"name":"embeddinggemma:300m"},{"name":"qwen2.5:3b"},{"name":"qwen2.5:7b"}]}"""
+                val models = """{"models":[{"name":"embeddinggemma:300m"},{"name":"qwen2.5:3b"},{"name":"qwen2.5:3b-instruct-q5_K_M"},{"name":"qwen2.5:7b"}]}"""
                 respond(exchange, 200, models)
             }
             createContext("/api/embed") { exchange ->

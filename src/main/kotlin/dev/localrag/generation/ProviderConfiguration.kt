@@ -129,7 +129,8 @@ class ProviderCatalog private constructor(
                 chatCompletionsPath = "/v1/chat/completions",
                 credentialEnv = null,
                 models = listOf(
-                    ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
+                    ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B (Q4_K_M)"),
+                    ProviderModelDefinition("qwen2.5:3b-instruct-q5_K_M", "Qwen 2.5 3B (Q5_K_M)"),
                     ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
                 ),
                 kind = ProviderKind.OLLAMA,

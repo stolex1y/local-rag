@@ -104,7 +104,7 @@ class ChatCompletionsApiTest {
         fake.use {
             val api = ChatCompletionsApi(configuration(it, ProviderCredentialSource { "synthetic-api-key" }))
             val request = ChatTurnRequest(
-                question = "Какой порог?",
+                question = "Какой порог указан для LTE?",
                 previousMessages = listOf(
                     ChatMessage("message-id-secret", "turn-id-secret", ChatMessageRole.USER, "Предыдущая реплика", createdAt = "synthetic-time"),
                 ),
@@ -124,6 +124,9 @@ class ChatCompletionsApiTest {
             assertEquals("Порог оплаты", completion.sessionTitle)
 
             val body = requests.single()
+            val systemPrompt = body.getValue("messages").jsonArray.first().jsonObject
+                .getValue("content").jsonPrimitive.content
+            assertFalse("PRACH" in systemPrompt || "не переноси числа из соседней строки" in systemPrompt)
             assertEquals("json_object", body.getValue("response_format").jsonObject.getValue("type").jsonPrimitive.content)
             val userPayload = body.getValue("messages").jsonArray.last().jsonObject.getValue("content").jsonPrimitive.content
             assertContains(userPayload, "Предыдущая реплика")
@@ -322,7 +325,7 @@ class ChatCompletionsApiTest {
             }
             val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
             val completion = api.completeTurn(
-                ModelSelection("ollama", "qwen2.5:7b"),
+                ModelSelection("ollama", "qwen2.5:3b-instruct-q5_K_M"),
                 ChatTurnRequest(
                     "Question?",
                     emptyList(),
@@ -341,6 +344,7 @@ class ChatCompletionsApiTest {
             assertEquals(null, requests.single().first)
 
             val body = requests.single().second
+            assertEquals("qwen2.5:3b-instruct-q5_K_M", body.getValue("model").jsonPrimitive.content)
             val schema = body.getValue("format").jsonObject
             assertEquals("object", schema.getValue("type").jsonPrimitive.content)
             assertEquals(
@@ -353,6 +357,13 @@ class ChatCompletionsApiTest {
                 taskDelta.getValue("required").jsonArray.map { it.jsonPrimitive.content },
             )
 
+            val options = body.getValue("options").jsonObject
+            assertEquals("8", options.getValue("num_thread").jsonPrimitive.content)
+            assertEquals("0.0", options.getValue("temperature").jsonPrimitive.content)
+            assertEquals("384", options.getValue("num_predict").jsonPrimitive.content)
+            assertEquals("4096", options.getValue("num_ctx").jsonPrimitive.content)
+            val systemPrompt = body.getValue("messages").jsonArray.first().jsonObject
+                .getValue("content").jsonPrimitive.content
             val properties = schema.getValue("properties").jsonObject
             assertEquals("4000", properties.getValue("answer").jsonObject.getValue("maxLength").jsonPrimitive.content)
 
@@ -408,6 +419,73 @@ class ChatCompletionsApiTest {
     }
 
     @Test
+    fun `LTE factual turns constrain answer and disable unsolicited state writes`() {
+        val requests = CopyOnWriteArrayList<JsonObject>()
+        val fake = FakeProvider { exchange ->
+            val body = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+            requests += body
+            val content = """{"answer":"В найденных источниках не указано","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[],"terms_to_add":[]},"memory_updates":[],"document_citation_refs":[],"memory_reference_refs":[],"session_title":"LTE question"}"""
+            respond(exchange, 200, """{"message":{"content":${JsonPrimitive(content)}},"done":true}""")
+        }
+        fake.use {
+            it.addContext("/api/chat") { exchange ->
+                val body = Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+                requests += body
+                val content = """{"answer":"В найденных источниках не указано","task_state_delta":{"goal":null,"clarifications_to_add":[],"constraints_to_add":[],"terms_to_add":[]},"memory_updates":[],"document_citation_refs":[],"memory_reference_refs":[],"session_title":"LTE question"}"""
+                respond(exchange, 200, """{"message":{"content":${JsonPrimitive(content)}},"done":true}""")
+            }
+            val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { null }))
+            val completion = api.completeTurn(
+                ModelSelection("ollama", "qwen2.5:7b"),
+                ChatTurnRequest("Какие значения указаны для LTE subcarriers?", emptyList(), ChatTaskState(), emptyList(), emptyList(), emptyList(), true),
+            )
+
+            assertEquals("LTE question", completion.sessionTitle)
+            val properties = requests.single().getValue("format").jsonObject.getValue("properties").jsonObject
+            val systemPrompt = requests.single().getValue("messages").jsonArray.first().jsonObject
+                .getValue("content").jsonPrimitive.content
+            assertContains(systemPrompt, "не переноси числа из соседней строки")
+            assertContains(systemPrompt, "Если такого объяснения в источнике нет, прямо скажи об этом")
+            assertEquals("1200", properties.getValue("answer").jsonObject.getValue("maxLength").jsonPrimitive.content)
+            val taskState = properties.getValue("task_state_delta").jsonObject.getValue("properties").jsonObject
+            assertEquals("null", taskState["goal"]?.jsonObject?.get("type")?.jsonPrimitive?.content, "Schema: $taskState")
+            listOf("clarifications_to_add", "constraints_to_add", "terms_to_add").forEach { key ->
+                assertEquals("0", taskState.getValue(key).jsonObject.getValue("maxItems").jsonPrimitive.content)
+            }
+            assertEquals("0", properties.getValue("memory_updates").jsonObject.getValue("maxItems").jsonPrimitive.content)
+            assertEquals("string", properties.getValue("session_title").jsonObject.getValue("type").jsonPrimitive.content)
+        }
+    }
+
+    @Test
+    fun `explicit LTE goal changes retain the general task state schema`() {
+        val requests = CopyOnWriteArrayList<JsonObject>()
+        val fake = FakeProvider { exchange ->
+            respond(exchange, 200, """{"choices":[{"message":{"content":"cloud fallback"}}]}""")
+        }
+        fake.use {
+            it.addContext("/api/chat") { exchange ->
+                requests += Json.parseToJsonElement(exchange.requestBody.bufferedReader(UTF_8).use { it.readText() }).jsonObject
+                val content = """{"answer":"Цель и ограничение обновлены","task_state_delta":{"goal":"Изучение LTE","clarifications_to_add":[],"constraints_to_add":["Рассматриваем только LTE"],"terms_to_add":[]},"memory_updates":[],"document_citation_refs":[],"memory_reference_refs":[],"session_title":null}"""
+                respond(exchange, 200, """{"message":{"content":${JsonPrimitive(content)}},"done":true}""")
+            }
+            val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
+            val completion = api.completeTurn(
+                ModelSelection("ollama", "qwen2.5:7b"),
+                ChatTurnRequest("Измени цель на изучение LTE и добавь ограничение: рассматриваем только LTE", emptyList(), ChatTaskState(), emptyList(), emptyList(), emptyList(), false),
+            )
+
+            assertEquals("Изучение LTE", completion.taskStateDelta.goal)
+            assertEquals("Рассматриваем только LTE", completion.taskStateDelta.constraintsToAdd.single())
+            val properties = requests.single().getValue("format").jsonObject.getValue("properties").jsonObject
+            val taskState = properties.getValue("task_state_delta").jsonObject.getValue("properties").jsonObject
+            assertEquals("20", taskState.getValue("constraints_to_add").jsonObject.getValue("maxItems").jsonPrimitive.content)
+            assertEquals("20", properties.getValue("memory_updates").jsonObject.getValue("maxItems").jsonPrimitive.content)
+            assertEquals("4000", properties.getValue("answer").jsonObject.getValue("maxLength").jsonPrimitive.content)
+        }
+    }
+
+    @Test
     fun `local structured chat forbids references when there are no candidates`() {
         val cloudCalls = AtomicInteger()
         val requests = CopyOnWriteArrayList<JsonObject>()
@@ -437,6 +515,58 @@ class ChatCompletionsApiTest {
                 assertEquals("0", field.getValue("maxItems").jsonPrimitive.content)
                 assertFalse(field.getValue("items").jsonObject.containsKey("enum"))
             }
+        }
+    }
+
+    @Test
+    fun `local token limit reports a clear error without cloud retry`() {
+        val cloudCalls = AtomicInteger()
+        val fake = FakeProvider { exchange ->
+            cloudCalls.incrementAndGet()
+            respond(exchange, 200, """{"choices":[{"message":{"content":"cloud fallback"}}]}""")
+        }
+        fake.use {
+            it.addContext("/api/chat") { exchange ->
+                exchange.requestBody.close()
+                respond(exchange, 200, """{"message":{"content":"partial"},"done":true,"done_reason":"length"}""")
+            }
+            val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
+
+            val failure = assertFailsWith<dev.localrag.ollama.LocalModelException> {
+                api.completeTurn(
+                    ModelSelection("ollama", "qwen2.5:7b"),
+                    ChatTurnRequest("Question?", emptyList(), ChatTaskState(), emptyList(), emptyList(), emptyList(), false),
+                )
+            }
+
+            assertContains(failure.message.orEmpty(), "num_predict=")
+            assertEquals(0, cloudCalls.get())
+        }
+    }
+
+    @Test
+    fun `malformed local done reason is reported as a provider format error`() {
+        val cloudCalls = AtomicInteger()
+        val fake = FakeProvider { exchange ->
+            cloudCalls.incrementAndGet()
+            respond(exchange, 200, """{"choices":[{"message":{"content":"cloud fallback"}}]}""")
+        }
+        fake.use {
+            it.addContext("/api/chat") { exchange ->
+                exchange.requestBody.close()
+                respond(exchange, 200, """{"message":{"content":"ok"},"done_reason":{}}""")
+            }
+            val api = ChatCompletionsApi(localProviderConfiguration(it, ProviderCredentialSource { "synthetic-cloud-key" }))
+
+            val failure = assertFailsWith<dev.localrag.ollama.LocalModelException> {
+                api.completeTurn(
+                    ModelSelection("ollama", "qwen2.5:7b"),
+                    ChatTurnRequest("Question?", emptyList(), ChatTaskState(), emptyList(), emptyList(), emptyList(), false),
+                )
+            }
+
+            assertContains(failure.message.orEmpty(), "ответ неожиданного формата")
+            assertEquals(0, cloudCalls.get())
         }
     }
 
@@ -480,7 +610,11 @@ class ChatCompletionsApiTest {
                     baseUrl = "http://127.0.0.1:${fake.port}",
                     chatCompletionsPath = "/v1/chat/completions",
                     credentialEnv = null,
-                    models = listOf(ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"), ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B")),
+                    models = listOf(
+                        ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
+                        ProviderModelDefinition("qwen2.5:3b-instruct-q5_K_M", "Qwen 2.5 3B Q5_K_M"),
+                        ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
+                    ),
                     kind = ProviderKind.OLLAMA,
                 ),
             ),

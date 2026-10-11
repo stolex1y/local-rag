@@ -1234,6 +1234,7 @@ class ApplicationServiceTest {
                     null,
                     listOf(
                         ProviderModelDefinition("qwen2.5:3b", "Qwen 2.5 3B"),
+                        ProviderModelDefinition("qwen2.5:3b-instruct-q5_K_M", "Qwen 2.5 3B Q5_K_M"),
                         ProviderModelDefinition("qwen2.5:7b", "Qwen 2.5 7B"),
                     ),
                     ProviderKind.OLLAMA,
@@ -1460,7 +1461,7 @@ class ApplicationServiceTest {
             this.executor = this@FakeOllama.executor
             createContext("/api/tags") { exchange ->
                 waitForGate(tagsGate)
-                val names = listOf("embeddinggemma:300m", "qwen2.5:3b", "qwen2.5:7b")
+                val names = listOf("embeddinggemma:300m", "qwen2.5:3b", "qwen2.5:3b-instruct-q5_K_M", "qwen2.5:7b")
                 respond(exchange, buildJsonObject {
                     put("models", JsonArray(names.map { name -> buildJsonObject { put("name", JsonPrimitive(name)) } }))
                 }.toString())
