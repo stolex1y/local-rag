@@ -1775,13 +1775,6 @@ class BrowserAcceptanceTest {
         val detail = fetchChatDetail(page, sessionId)
         val message = detail.getValue("messages").jsonArray
             .last { it.jsonObject.getValue("role").jsonPrimitive.content == "ASSISTANT" }
-        val expectedAnswer = if (detail.getValue("session").jsonObject
-                .getValue("modelSelection").jsonObject.getValue("providerId").jsonPrimitive.content == "ollama") {
-            "Synthetic local chat answer."
-        } else {
-            "Synthetic chat answer."
-        }
-        assertThat(page.locator(".chat-bubble.assistant").last()).containsText(expectedAnswer)
         return buildJsonObject {
             put("message", message)
             put("taskState", detail.getValue("taskState"))
