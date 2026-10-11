@@ -4,6 +4,7 @@ import dev.localrag.domain.ChatPort
 import dev.localrag.domain.ModelSelection
 import dev.localrag.ollama.LocalModelException
 import dev.localrag.ollama.OllamaInferenceGate
+import dev.localrag.ollama.OLLAMA_NUM_THREADS
 import dev.localrag.chat.ChatMemoryScope
 import dev.localrag.chat.ChatMemoryUpdate
 import dev.localrag.chat.ChatTaskStateDelta
@@ -251,7 +252,7 @@ class ChatCompletionsApi(
             }))
             if (local) {
                 put("options", buildJsonObject {
-                    put("num_thread", Runtime.getRuntime().availableProcessors().coerceAtLeast(1))
+                    put("num_thread", OLLAMA_NUM_THREADS)
                 })
                 if (structuredChatRequest != null) put("format", chatTurnResponseSchema(structuredChatRequest))
             } else if (structuredChatRequest != null) {

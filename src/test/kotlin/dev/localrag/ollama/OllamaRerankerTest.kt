@@ -40,7 +40,7 @@ class OllamaRerankerTest {
             assertEquals(0, request.getValue("options").jsonObject.getValue("temperature").jsonPrimitive.content.toInt())
             assertFalse(request.containsKey("Authorization"))
             assertEquals(
-                Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+                8,
                 request.getValue("options").jsonObject.getValue("num_thread").jsonPrimitive.content.toInt(),
             )
             val messages = request.getValue("messages").jsonArray.map { value -> value.jsonObject }
@@ -102,7 +102,7 @@ class OllamaRerankerTest {
                 assertEquals(1, maximumConcurrentRequests.get())
                 val embeddingRequest = requests.single { it.containsKey("input") }
                 assertEquals(
-                    Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+                    8,
                     embeddingRequest.getValue("options").jsonObject.getValue("num_thread").jsonPrimitive.content.toInt(),
                 )
             } finally {

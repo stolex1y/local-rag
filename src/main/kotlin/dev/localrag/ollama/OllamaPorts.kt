@@ -21,6 +21,7 @@ import java.time.Duration
 import java.util.concurrent.locks.ReentrantLock
 
 const val EMBEDDING_MODEL = "embeddinggemma:300m"
+internal const val OLLAMA_NUM_THREADS = 8
 
 class LocalModelException(message: String) : RuntimeException(message)
 
@@ -56,7 +57,7 @@ class OllamaApi(
             put("input", JsonArray(texts.map(::JsonPrimitive)))
             put("truncate", false)
             put("options", buildJsonObject {
-                put("num_thread", Runtime.getRuntime().availableProcessors().coerceAtLeast(1))
+                put("num_thread", OLLAMA_NUM_THREADS)
             })
         }
         val response = post("/api/embed", payload.toString())
@@ -98,7 +99,7 @@ class OllamaApi(
             }))
             put("options", buildJsonObject {
                 put("temperature", 0)
-                put("num_thread", Runtime.getRuntime().availableProcessors().coerceAtLeast(1))
+                put("num_thread", OLLAMA_NUM_THREADS)
             })
             if (jsonMode) put("format", "json")
         }

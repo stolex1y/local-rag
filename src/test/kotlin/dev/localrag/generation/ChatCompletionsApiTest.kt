@@ -299,7 +299,7 @@ class ChatCompletionsApiTest {
             assertEquals("qwen2.5:7b", requests.single().getValue("model").jsonPrimitive.content)
             assertFalse(requests.single().containsKey("Authorization"))
             assertEquals(
-                Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+                8,
                 requests.single().getValue("options").jsonObject.getValue("num_thread").jsonPrimitive.content.toInt(),
             )
         }

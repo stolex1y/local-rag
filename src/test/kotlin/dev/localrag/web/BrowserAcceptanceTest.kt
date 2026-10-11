@@ -716,7 +716,7 @@ class BrowserAcceptanceTest {
             assertEquals(cloudCallsBeforeLocalSend, fake.cloud.chatModels.size)
             assertTrue(fake.localModels.drop(localModelsStart).contains("qwen2.5:7b"))
             assertEquals(
-                Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+                8,
                 fake.nativeChatRequests.last().getValue("options").jsonObject
                     .getValue("num_thread").jsonPrimitive.content.toInt(),
             )

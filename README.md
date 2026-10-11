@@ -127,7 +127,7 @@ LOCAL_RAG_PUBLIC_ORIGIN=https://rag-host.example:8765
 
 Chat-turn сохраняется сервером до запуска и проходит состояния `queued`, `running`, `completed`, `cancelled`, `failed` или `interrupted`. Интерфейс не ждёт генерацию в запросе отправки: он показывает очередь/выполнение и позволяет перейти к другой сессии. Кнопка «Отменить» отменяет ожидающий ход или прерывает активный запрос к provider; для DeepSeek прекращение уже принятой удалённой обработки и тарификации не гарантируется. После reload тот же turn восстанавливается без повторной отправки. После перезапуска приложения незавершённые turns помечаются `interrupted` и требуют ручного повтора.
 
-Chat-turn проходят через одну durable-очередь: одновременно выполняется один ход, остальные сессии ждут. Все inference POST-запросы к локальной Ollama используют общий interruptible gate; метаданные доступных моделей не блокируют этот gate. Сериализация охватывает chat generation, embeddings, retrieval/reranking и benchmark. Для локальных ChatCompletions API, embeddings и reranking приложение передаёт `options.num_thread`, равный числу доступных JVM CPU threads. Очереди и gate устраняют конкуренцию между задачами приложения, но сами по себе не ускоряют отдельную генерацию.
+Chat-turn проходят через одну durable-очередь: одновременно выполняется один ход, остальные сессии ждут. Все inference POST-запросы к локальной Ollama используют общий interruptible gate; метаданные доступных моделей не блокируют этот gate. Сериализация охватывает chat generation, embeddings, retrieval/reranking и benchmark. Для Chat, embeddings и reranking Local RAG передаёт `options.num_thread=8`; это параметр каждого запроса, а не глобальная настройка `ollama serve`.
 
 ## Проверки
 
@@ -136,7 +136,7 @@ Chat-turn проходят через одну durable-очередь: одно�
 xvfb-run -a -s '-screen 0 1440x1000x24' ./gradlew browserTest
 ```
 
-Детерминированные тесты используют временную SQLite, синтетические документы, тестовый PDF-процесс и fake HTTP-сервисы Ollama/DeepSeek на loopback. Помимо RAG и benchmark проверяются TLS/shared-secret вход, изоляция Chat-workspace между браузерами при общей коллекции, очередь параллельных сессий, отмена queued/running turns, восстановление состояния после reload/restart, сериализация Ollama inference и число JVM-доступных CPU threads в chat, embedding и reranking запросах. Обычные тесты не требуют секретов и не обращаются к внешним API.
+Детерминированные тесты используют временную SQLite, синтетические документы, тестовый PDF-процесс и fake HTTP-сервисы Ollama/DeepSeek на loopback. Помимо RAG и benchmark проверяются TLS/shared-secret вход, изоляция Chat-workspace между браузерами при общей коллекции, очередь параллельных сессий, отмена queued/running turns, восстановление состояния после reload/restart, сериализация Ollama inference и точное значение `num_thread=8` для Chat, embedding и reranking запросов. Обычные тесты не требуют секретов и не обращаются к внешним API.
 
 `test` не включает browser journey. `browserTest` запускает настоящее приложение и Chromium под Xvfb; на Linux нужны `xvfb-run` и зависимости Chromium, которые Playwright сообщает при первом запуске. Browser acceptance проверяет основные RAG/Chat journeys и два отдельных browser contexts с приватной памятью и общей коллекцией.
 
@@ -146,5 +146,6 @@ xvfb-run -a -s '-screen 0 1440x1000x24' ./gradlew browserTest
 - После исправления общего тестового ожидания пустого evidence целевой браузерный сценарий также завершился успешно. Реальные провайдеры в automated suite не вызываются.
 - 2026-10-11: синтетический live smoke с временными SQLite/источником и `qwen2.5:3b`: baseline в Collection вернул `READY`; RAG корректно воздержался, поскольку единственный кандидат имел score ниже `0.20`. Ответ завершился локально; runner Ollama сообщил `n_threads=12`, `/api/chat` вернул HTTP 200 за 19.1s вместе с первоначальным запуском runner.
 - 2026-10-11: отдельный синтетический Chat-turn отменён через UI спустя 2m44s; Ollama записал остановку задачи, частичный ответ ассистента не сохранён. Это подтверждает отмену, но не измеряет завершённую задержку Chat. LTE-данные и DeepSeek не использовались.
+- 2026-10-11 (T03): изолированный Local RAG process передал запрос локальной `qwen2.5:3b`; Ollama runner запущен с `-t 8`. Самый первый synthetic Chat turn завершился `failed`, потому что модель не вернула название новой сессии; smoke подтверждает thread count, но не успешную генерацию ответа. LTE-данные и Cloud не использовались.
 - 2026-10-03: focused v15 browser journeys A01, A02, A05, A07 and A08 — successful under Xvfb with temporary SQLite and fake transports. Playwright reported missing `libavif16`; the test command exited successfully.
 - Отдельные live smoke-проверки использовали только synthetic baseline/RAG-вопрос и synthetic reranker-кандидаты. `deepseek-flash` вернул HTTP 200 и перестановку `[1,0,2]`; реальные документы и данные LTE не отправлялись. API key не печатался.
