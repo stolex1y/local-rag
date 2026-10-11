@@ -237,6 +237,81 @@ class BrowserAcceptanceTest {
         }
     }
     @Test
+    fun chatCanSwitchExistingSessionsWhileTurnRuns() {
+        withChatBrowser { page, app, fake ->
+            page.onDialog { it.accept() }
+            page.locator("#chat-tab").click()
+
+            val sessionA = createChatSession(page)
+            selectLocalChatModel(page)
+            submitChatQuestion(page, "Existing history marker for session A")
+
+            val sessionB = createChatSession(page)
+            selectLocalChatModel(page)
+            submitChatQuestion(page, "Existing history marker for session B")
+
+            val sessionAButton = page.locator("#chat-sessions button:not([aria-current='page'])").first()
+            sessionAButton.click()
+            page.waitForFunction(
+                "() => new URL(location.href).searchParams.get('session') === '$sessionA'",
+            )
+            assertThat(page.locator("#chat-messages")).containsText("Existing history marker for session A")
+
+            fake.holdLocalGeneration.set(true)
+            val activeQuestion = "Hold session A while switching to session B"
+            val activeResponse = page.waitForResponse("**/api/chat/sessions/$sessionA/turns") {
+                page.locator("#chat-question").fill(activeQuestion)
+                page.locator("#chat-send").click()
+            }
+            assertEquals(202, activeResponse.status())
+            val activeTurnId = Json.parseToJsonElement(activeResponse.text()).jsonObject
+                .getValue("turnId").jsonPrimitive.content
+            assertTrue(fake.localGenerationStarted.await(10, TimeUnit.SECONDS))
+            assertThat(page.locator("#chat-progress")).isVisible()
+            assertThat(page.locator("#chat-cancel")).isVisible()
+
+            val sessionBButton = page.locator("#chat-sessions button:not([aria-current='page'])").first()
+            assertFalse(sessionBButton.isDisabled())
+            sessionBButton.click()
+            page.waitForFunction(
+                "() => new URL(location.href).searchParams.get('session') === '$sessionB'",
+            )
+            assertThat(page.locator("#chat-messages")).containsText("Existing history marker for session B")
+            assertThat(page.locator("#chat-messages")).not().containsText(activeQuestion)
+            assertTrue(page.locator("#chat-question").isEnabled())
+            assertTrue(page.locator("#chat-send").isEnabled())
+
+            val returnToA = page.locator("#chat-sessions button:not([aria-current='page'])").first()
+            returnToA.click()
+            page.waitForFunction(
+                "() => new URL(location.href).searchParams.get('session') === '$sessionA'",
+            )
+            assertThat(page.locator("#chat-messages")).containsText(activeQuestion)
+            assertThat(page.locator("#chat-progress")).isVisible()
+            assertThat(page.locator("#chat-cancel")).isVisible()
+            val activeTurn = Json.parseToJsonElement(
+                page.request().get("http://127.0.0.1:${app.server.port}/api/chat/sessions/$sessionA").text(),
+            ).jsonObject.getValue("activeTurn").jsonObject
+            assertEquals(activeTurnId, activeTurn.getValue("turnId").jsonPrimitive.content)
+            assertEquals("running", activeTurn.getValue("state").jsonPrimitive.content)
+
+            val assistantCountBeforeCancel = page.locator(".chat-bubble.assistant").count()
+            val cancelled = page.waitForResponse("**/api/chat/sessions/$sessionA/turns/$activeTurnId") {
+                page.locator("#chat-cancel").click()
+            }
+            assertEquals(200, cancelled.status())
+            assertEquals(
+                "cancelled",
+                Json.parseToJsonElement(cancelled.text()).jsonObject.getValue("state").jsonPrimitive.content,
+            )
+            assertThat(page.locator(".chat-bubble.user").last().locator("button")).containsText("Повторить")
+            assertThat(page.locator(".chat-bubble.user").last()).containsText(activeQuestion)
+            assertEquals(assistantCountBeforeCancel, page.locator(".chat-bubble.assistant").count())
+            fake.releaseLocalGeneration.countDown()
+        }
+    }
+
+    @Test
     fun separateBrowsersIsolateChatMemoryAndShareSourceCollection() {
         withChatBrowser { page, app, _ ->
             page.onDialog { it.accept() }
