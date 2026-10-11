@@ -1736,8 +1736,8 @@
       async function showApp() {
         await request("/api/chat/sessions");
         await initializeTabs();
-        await refresh();
         $("#app-view").hidden = false;
+        await refresh();
       }
 
       async function showAppError(error) {

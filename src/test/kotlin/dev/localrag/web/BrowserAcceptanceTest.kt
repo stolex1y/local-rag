@@ -2723,6 +2723,12 @@ class BrowserAcceptanceTest {
                         assertThat(progress).containsText("страница 1")
                         assertFalse(progress.textContent().contains("0 / 1"))
                         assertEquals(null, page.locator("#job-meter").getAttribute("value"))
+                        page.reload()
+                        page.waitForFunction("() => !document.querySelector('#app-view').hidden")
+                        assertThat(page.locator("#job-progress")).containsText("Индексация")
+                        page.locator("#chat-tab").click()
+                        assertThat(page.locator("#chat-view")).isVisible()
+
 
                         fake.releasePdfEmbedding.countDown()
                         assertThat(page.locator("#index-success")).containsText("Индексация завершена")
