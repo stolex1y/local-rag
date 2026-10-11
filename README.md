@@ -144,6 +144,7 @@ xvfb-run -a -s '-screen 0 1440x1000x24' ./gradlew browserTest
 
 - 2026-10-11: `xvfb-run -a -s '-screen 0 1440x1000x24' ./gradlew test browserTest` — успешно. Playwright вывел предупреждение об отсутствующем `libavif16`; полный набор завершился успешно.
 - После исправления общего тестового ожидания пустого evidence целевой браузерный сценарий также завершился успешно. Реальные провайдеры в automated suite не вызываются.
-- Synthetic live smoke через Local RAG → Ollama `qwen2.5:3b`: runner сообщил `n_threads=12`; после 2m44s turn был отменён кнопкой интерфейса, Ollama остановил задачу, частичный ответ ассистента не сохранился. Полный ответ и его скорость не измерены.
+- 2026-10-11: синтетический live smoke с временными SQLite/источником и `qwen2.5:3b`: baseline в Collection вернул `READY`; RAG корректно воздержался, поскольку единственный кандидат имел score ниже `0.20`. Ответ завершился локально; runner Ollama сообщил `n_threads=12`, `/api/chat` вернул HTTP 200 за 19.1s вместе с первоначальным запуском runner.
+- 2026-10-11: отдельный синтетический Chat-turn отменён через UI спустя 2m44s; Ollama записал остановку задачи, частичный ответ ассистента не сохранён. Это подтверждает отмену, но не измеряет завершённую задержку Chat. LTE-данные и DeepSeek не использовались.
 - 2026-10-03: focused v15 browser journeys A01, A02, A05, A07 and A08 — successful under Xvfb with temporary SQLite and fake transports. Playwright reported missing `libavif16`; the test command exited successfully.
 - Отдельные live smoke-проверки использовали только synthetic baseline/RAG-вопрос и synthetic reranker-кандидаты. `deepseek-flash` вернул HTTP 200 и перестановку `[1,0,2]`; реальные документы и данные LTE не отправлялись. API key не печатался.
