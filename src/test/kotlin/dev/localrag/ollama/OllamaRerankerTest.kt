@@ -38,6 +38,21 @@ class OllamaRerankerTest {
             val request = requests.single()
             assertEquals(LOCAL_RERANK_MODEL, request.getValue("model").jsonPrimitive.content)
             assertEquals(0, request.getValue("options").jsonObject.getValue("temperature").jsonPrimitive.content.toInt())
+
+            val schema = request.getValue("format").jsonObject
+            assertEquals("object", schema.getValue("type").jsonPrimitive.content)
+            assertEquals(
+                setOf("ranked_indices"),
+                schema.getValue("required").jsonArray.map { it.jsonPrimitive.content }.toSet(),
+            )
+            val ranking = schema.getValue("properties").jsonObject.getValue("ranked_indices").jsonObject
+            assertEquals(2, ranking.getValue("minItems").jsonPrimitive.content.toInt())
+            assertEquals(2, ranking.getValue("maxItems").jsonPrimitive.content.toInt())
+            assertEquals(
+                listOf(0, 1),
+                ranking.getValue("items").jsonObject.getValue("enum").jsonArray
+                    .map { it.jsonPrimitive.content.toInt() },
+            )
             assertFalse(request.containsKey("Authorization"))
             assertEquals(
                 8,
@@ -132,6 +147,21 @@ class OllamaRerankerTest {
             assertContains(failure.message.orEmpty(), "reranker")
             assertFalse("SENSITIVE_QUERY" in failure.message.orEmpty())
             assertEquals(1, requests.get())
+        }
+    }
+
+    @Test
+    fun `non primitive ranking entry remains a local model error`() {
+        val server = FakeOllama { exchange ->
+            respond(exchange, 200, """{"message":{"content":"{\"ranked_indices\":[{\"index\":0},1]}"},"done":true}""")
+        }
+        server.use {
+            assertFailsWith<LocalModelException> {
+                OllamaReranker(OllamaApi(it.uri)).rerank(
+                    "question",
+                    listOf("candidate one", "candidate two"),
+                )
+            }
         }
     }
 
