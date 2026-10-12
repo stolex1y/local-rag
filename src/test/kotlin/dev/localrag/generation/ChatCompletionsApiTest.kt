@@ -360,10 +360,11 @@ class ChatCompletionsApiTest {
             val options = body.getValue("options").jsonObject
             assertEquals("8", options.getValue("num_thread").jsonPrimitive.content)
             assertEquals("0.0", options.getValue("temperature").jsonPrimitive.content)
-            assertEquals("384", options.getValue("num_predict").jsonPrimitive.content)
+            assertEquals("768", options.getValue("num_predict").jsonPrimitive.content)
             assertEquals("4096", options.getValue("num_ctx").jsonPrimitive.content)
             val systemPrompt = body.getValue("messages").jsonArray.first().jsonObject
                 .getValue("content").jsonPrimitive.content
+            assertContains(systemPrompt, "1–3 предложения")
             val properties = schema.getValue("properties").jsonObject
             assertEquals("4000", properties.getValue("answer").jsonObject.getValue("maxLength").jsonPrimitive.content)
 
